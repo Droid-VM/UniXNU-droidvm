@@ -14,6 +14,9 @@
 extern void IOSleep(unsigned milliseconds);
 extern void boot_process_capture(void);
 extern void boot_process_snapshot(void);
+extern void droidvm_export_poll(void);
+extern unsigned boot_ui_trace_role_rows(unsigned role, char rows[][120], unsigned max, unsigned detail);
+extern unsigned boot_ui_trace_hot_rows(char rows[][120], unsigned max);
 
 #define NATIVE_TOUCH_SLOTS 12
 
@@ -26,18 +29,38 @@ volatile int native_touch_xs[NATIVE_TOUCH_SLOTS], native_touch_ys[NATIVE_TOUCH_S
 char boot_progress_ext[8][48];
 
 // droidvm-monitor=<ms>: without sheng's diagnostic page nothing runs the process probe, so a worker samples it
-// every <ms> into boot_process_rows, which the host rig reads from guest RAM (tools/rig/procs.py). Called from the
-// late display probe, after bsd_autoconf, in place of sheng's touch bring-up.
+// every <ms> into boot_process_rows, which the host rig reads from guest RAM (tools/rig/procs.py), and answers the
+// host's file requests every 100 ms (DroidVMFileExport.c, tools/rig/export.py). Called from the late display probe,
+// after bsd_autoconf, in place of sheng's touch bring-up.
 volatile uint32_t droidvm_monitor_passes;
 static unsigned droidvm_monitor_interval;
+// The traced roles' threads after each pass (BootUiTraceProbe.c: main thread registers and frames, every thread group
+// with the pid of the task its Mach message goes to, the hottest threads), for tools/rig/trace.py.
+#define DROIDVM_TRACE_ROWS 96
+char droidvm_trace_rows[DROIDVM_TRACE_ROWS][120];
+volatile uint32_t droidvm_trace_count;
+
+static void droidvm_trace_publish(void) {
+    unsigned n = 0;
+    for (unsigned role = 0; role < 4 && n + 6 <= DROIDVM_TRACE_ROWS; ++role)
+        n += boot_ui_trace_role_rows(role, droidvm_trace_rows + n, DROIDVM_TRACE_ROWS - n, 1);
+    if (n < DROIDVM_TRACE_ROWS)
+        n += boot_ui_trace_hot_rows(droidvm_trace_rows + n, DROIDVM_TRACE_ROWS - n);
+    droidvm_trace_count = n;
+}
 
 static void droidvm_monitor(void *parameter, wait_result_t result) {
     (void)parameter; (void)result;
-    for (;;) {
-        boot_process_capture();
-        boot_process_snapshot();
-        droidvm_monitor_passes = droidvm_monitor_passes + 1;
-        IOSleep(droidvm_monitor_interval);
+    for (unsigned waited = droidvm_monitor_interval;; waited += 100) {
+        if (waited >= droidvm_monitor_interval) {
+            boot_process_capture();
+            boot_process_snapshot();
+            droidvm_trace_publish();
+            droidvm_monitor_passes = droidvm_monitor_passes + 1;
+            waited = 0;
+        }
+        droidvm_export_poll();
+        IOSleep(100);
     }
 }
 

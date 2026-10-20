@@ -26,6 +26,7 @@ CONFIG_XNU_DT_PANIC_REGION=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
+CONFIG_XNU_BOARD_LAUNCH_POLICY=y
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # APFS volume UUID of build/droidvm-data (prepare-owner-data-fixture.py seed.json); a new seed has a new UUID.

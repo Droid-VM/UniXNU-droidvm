@@ -126,14 +126,18 @@ kernel_args = [
   "offline-key-events=1",
   "sheng-aks=1",
   "armcpu-diagnostics=1",
+  "sheng-smp=1",
   "droidvm-monitor=1000",            # process samples for the host rig (kits/droidvm/DroidVMStubs.c)
+  # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, and the services
+  # sheng found in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md)
+  "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd",
 ]
 
 [payload.adt]
 tool = "scripts/make-droidvm-adt.py"
 dram_base = "0x80600000"             # the shim's RAM window; crosvm's own FDT lists only the boot region
 owned_memory_size = "0xb0000000"     # 2.75 GiB DarwinBoot window: the RAM run above 4 GiB of the 5 GiB VM
-cpu_regs = "0"                       # boot CPU only until SMP is tried (ArmCpu: sheng-smp=1)
+cpu_regs = "0,1,2,3"                 # the VM's 4 vCPUs (crosvm MPIDRs); ArmCpu starts the secondaries with PSCI CPU_ON (sheng-smp=1)
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the original OS volume
 packed_data_ramdisk = true
 ipad_identity = true
