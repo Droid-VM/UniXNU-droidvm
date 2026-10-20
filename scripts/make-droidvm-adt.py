@@ -13,8 +13,10 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
     boot region in the crosvm FDT; its boot shim accepts the RAM window and rewrites /memory at
     run time (console: "SHIM: /memory now BASE+SIZE"), so --dram-base and --dram-size give it.
 
-crosvm places every MMIO window below 1 GiB, so /arm-io maps child addresses 1:1 over
-[0, 1 GiB). The architected counter frequency is not in the FDT (crosvm leaves CNTFRQ_EL0 to
+crosvm places its MMIO windows (RTC 0x2000, PCI ECAM 0x10000, GIC below 1 GiB) in [0x1000, 1 GiB),
+which /arm-io covers. Its parent base must not be 0: pexpert takes that base as the SoC base
+(pe_arm_get_soc_base_phys) and pe_identify_machine returns early on 0, leaving the timebase at 0;
+wfe_timeout_configure then overflows (1 << -1) in arm_init. The architected counter frequency is not in the FDT (crosvm leaves CNTFRQ_EL0 to
 the hypervisor); --timebase supplies it, 19.2 MHz on every Qualcomm host seen so far.
 """
 from pathlib import Path
@@ -25,8 +27,8 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 
-ARMIO_BASE = 0
-ARMIO_SIZE = 0x40000000
+ARMIO_BASE = 0x1000
+ARMIO_SIZE = 0x40000000 - ARMIO_BASE
 GIC_REDIST_STRIDE = 0x20000     # GICv3 without VLPI: RD_base + SGI_base frames
 
 
@@ -165,6 +167,10 @@ def main():
                         help='Use only these FDT CPUs (comma-separated MPIDR values); the first is the boot CPU')
     parser.add_argument('--psci-method', choices=['smc', 'hvc'], default=None,
                         help='Override the FDT /psci conduit')
+    parser.add_argument('--panic-region', default='top',
+                        help='BASE:SIZE of the panic log (/pram + /chosen/embedded-panic-log-size, read by the '
+                             'XNU_DT_PANIC_REGION kernel), "top" for the last 512 KiB of guest RAM, or "none". '
+                             'The BCM2837 default 0x3c0fc000 is no RAM in a crosvm guest and faults as an external abort')
     parser.add_argument('--root-match-volume-uuid', default=None,
                         help='/chosen/root-matching: select the root by the UUID of an IOMedia')
     parser.add_argument('--unique-chip-id', type=lambda value: int(value, 16), default=None,
@@ -206,6 +212,15 @@ def main():
     if len(cpu_regs) > 8:
         cpu_regs = cpu_regs[:8]    # ArmCpu starts at most eight cores
     psci_method = args.psci_method or vm['psci_method']
+    if args.panic_region == 'none':
+        panic_region = None
+    elif args.panic_region == 'top':
+        panic_region = (dram_base + args.dram_size - 0x80000, 0x80000)
+    else:
+        base, _, size = args.panic_region.partition(':')
+        panic_region = (int(base, 0), int(size, 0))
+    if panic_region and (panic_region[0] % 0x4000 or panic_region[1] % 0x4000 or not 0x4000 <= panic_region[1] < 1 << 32):
+        parser.error('--panic-region must be 16 KiB aligned and below 4 GiB in size')
     dist, dist_size, redist, redist_size = vm['gic']
 
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
@@ -237,6 +252,7 @@ def main():
                                               args.root_match_volume_uuid.upper() + '</string></dict></dict>\0').encode())]
                           if args.root_match_volume_uuid else []),
                         ('amfi-only-platform-code', struct.pack('<I', 1)),
+                        *([('embedded-panic-log-size', struct.pack('<I', panic_region[1]))] if panic_region else []),
                         *empty_nvram_proxy()],
              [node('memory-map', ([('PackedRAMDisk' if args.packed_data_ramdisk else 'RAMDisk', bytes(16))]
                                   if (args.data_ramdisk or args.packed_data_ramdisk) else []) +
@@ -245,6 +261,7 @@ def main():
         node('cpus', children=cpus),
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', psci_method.encode() + b'\0')])] if len(cpus) > 1 else []),
         # The guest really runs under a hypervisor: XNU publishes this as kern.hv_vmm_present.
+        *([node('pram', [('reg', struct.pack('<QQ', *panic_region))])] if panic_region else []),
         node('defaults', [('sleep-disabled', struct.pack('<I', 1)), ('vmm-present', struct.pack('<I', 1))]),
         node('options', []),
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
@@ -270,7 +287,8 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
     print(f'droidvm ADT: {len(tree)} bytes, {len(cpu_regs)} cpu, gic {dist:#x}/{redist:#x}+{redist_size:#x}, '
-          f'psci {psci_method}, dram {dram_base:#x}+{args.dram_size:#x}, timebase {args.timebase}')
+          f'psci {psci_method}, dram {dram_base:#x}+{args.dram_size:#x}, timebase {args.timebase}, '
+          f'panic {"none" if not panic_region else f"{panic_region[0]:#x}+{panic_region[1]:#x}"}')
 
 
 if __name__ == '__main__':
