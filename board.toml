@@ -32,6 +32,12 @@ archives = [
   "build-arm-driver.py ArmCpu",
   "build-arm-driver.py NativeAES",
   "build-native-aes-bindings.py",
+  # NativeVirtioBlock binds to the original prelinked IOStorageFamily class. The audit reads the previous
+  # kernel/kernel.macho (kext addresses do not move between builds), so a first build from scratch needs
+  # one kernel without CONFIG_XNU_NATIVE_VIRTIO_BLOCK.
+  "audit-storage-interface-static.py",
+  "build-arm-driver.py NativeVirtioBlock",
+  "build-native-virtio-bindings.py --component NativeVirtioBlock",
   "build-libpthread-kernel.py",
 ]
 

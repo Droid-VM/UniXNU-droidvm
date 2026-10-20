@@ -1,0 +1,12 @@
+# Sources of this device repository, in addition to the feeds.toml of UniXNU.
+
+# Public Darwin 23 IOStorageFamily: the headers scripts/audit-storage-interface-static.py compiles a
+# reference IOBlockStorageDevice from, to bind NativeVirtioBlock to the original prelinked class.
+# Upstream audit-storage-interface.py pins the same commit but no feed fetches it.
+[[source]]
+name = "IOStorageFamily"
+kind = "refer"
+git = "https://github.com/apple-oss-distributions/IOStorageFamily.git"
+ref = "IOStorageFamily-315"
+commit = "e45fbe30a7879e0b16e26dddb78538f1b00e0bff"
+steps = ["kernel"]

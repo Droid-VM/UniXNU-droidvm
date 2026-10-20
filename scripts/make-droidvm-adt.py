@@ -9,6 +9,8 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
   - /cpus: one node per FDT cpu, reg = its MPIDR affinity (crosvm numbers them in Affinity0)
   - /arm-io/intc: the arm,gic-v3 distributor and redistributor windows
   - /psci: the FDT conduit (crosvm declares hvc)
+  - /arm-io/virtio-mmio-N: every "virtio,mmio" node (crosvm --virtio-mmio-block), for
+    NativeVirtioBlock: compatible exactly "virtio,mmio", reg, dma-coherent
   - /chosen dram-base, dram-size: the guest RAM. A pseudo-unprotected VM declares only its small
     boot region in the crosvm FDT; its boot shim accepts the RAM window and rewrites /memory at
     run time (console: "SHIM: /memory now BASE+SIZE"), so --dram-base and --dram-size give it.
@@ -146,8 +148,13 @@ def describe(fdt):
     if not memory:
         raise SystemExit('FDT has no memory node')
     dram_base, dram_size = min(memory)
+    virtio = sorted(reg_pairs(props['reg'])[0] for path, props in fdt.items()
+                    if 'virtio,mmio' in strings_of(props.get('compatible', b'')))
+    for address, size in virtio:
+        if not ARMIO_BASE <= address < address + size <= ARMIO_BASE + ARMIO_SIZE:
+            raise SystemExit(f'virtio-mmio window {address:#x}+{size:#x} lies outside the arm-io window')
     return dict(cpu_regs=[reg for reg, _ in cpus], gic=(dist, dist_size, redist, redist_size),
-                psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size)
+                psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size, virtio_mmio=virtio)
 
 
 def main():
@@ -282,13 +289,18 @@ def main():
                         ('ranges', struct.pack('<QQQ', 0, ARMIO_BASE, ARMIO_SIZE))],
              [node('intc', [('compatible', b'arm,gic-v3\0'),
                             ('reg', struct.pack('<4Q', dist - ARMIO_BASE, dist_size, redist - ARMIO_BASE, redist_size)),
-                            ('redistributor-stride', struct.pack('<Q', GIC_REDIST_STRIDE))])]),
+                            ('redistributor-stride', struct.pack('<Q', GIC_REDIST_STRIDE))]),
+              *[node('virtio-mmio-%d' % index, [('compatible', b'virtio,mmio\0'),
+                                                 ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                                 ('dma-coherent', b'')])
+                for index, (address, size) in enumerate(vm['virtio_mmio'])]]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
     print(f'droidvm ADT: {len(tree)} bytes, {len(cpu_regs)} cpu, gic {dist:#x}/{redist:#x}+{redist_size:#x}, '
           f'psci {psci_method}, dram {dram_base:#x}+{args.dram_size:#x}, timebase {args.timebase}, '
-          f'panic {"none" if not panic_region else f"{panic_region[0]:#x}+{panic_region[1]:#x}"}')
+          f'panic {"none" if not panic_region else f"{panic_region[0]:#x}+{panic_region[1]:#x}"}, '
+          f'virtio-mmio {[hex(a) for a, _ in vm["virtio_mmio"]]}')
 
 
 if __name__ == '__main__':
