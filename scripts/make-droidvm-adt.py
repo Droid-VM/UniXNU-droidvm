@@ -9,7 +9,9 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
   - /cpus: one node per FDT cpu, reg = its MPIDR affinity (crosvm numbers them in Affinity0)
   - /arm-io/intc: the arm,gic-v3 distributor and redistributor windows
   - /psci: the FDT conduit (crosvm declares hvc)
-  - /chosen dram-base: the FDT /memory base; dram-size is the VM RAM size
+  - /chosen dram-base, dram-size: the guest RAM. A pseudo-unprotected VM declares only its small
+    boot region in the crosvm FDT; its boot shim accepts the RAM window and rewrites /memory at
+    run time (console: "SHIM: /memory now BASE+SIZE"), so --dram-base and --dram-size give it.
 
 crosvm places every MMIO window below 1 GiB, so /arm-io maps child addresses 1:1 over
 [0, 1 GiB). The architected counter frequency is not in the FDT (crosvm leaves CNTFRQ_EL0 to
@@ -137,10 +139,11 @@ def describe(fdt):
     method = psci.get('method', b'').rstrip(b'\0').decode()
     if len(cpus) > 1 and method not in ('hvc', 'smc'):
         raise SystemExit('FDT /psci declares no hvc or smc conduit')
-    memory = [props for path, props in fdt.items() if props.get('device_type') == b'memory\0']
-    if len(memory) != 1:
-        raise SystemExit('FDT must have exactly one memory node')
-    dram_base, dram_size = reg_pairs(memory[0]['reg'])[0]
+    memory = [pair for path, props in fdt.items() if props.get('device_type') == b'memory\0'
+              for pair in reg_pairs(props['reg'])]
+    if not memory:
+        raise SystemExit('FDT has no memory node')
+    dram_base, dram_size = min(memory)
     return dict(cpu_regs=[reg for reg, _ in cpus], gic=(dist, dist_size, redist, redist_size),
                 psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size)
 
@@ -151,7 +154,9 @@ def main():
     parser.add_argument('--fdt', type=Path, default=ROOT / 'kits/droidvm/crosvm-gunyah.dtb',
                         help='FDT of the VM: crosvm --dump-device-tree-blob, or /sys/firmware/fdt of a Linux guest')
     parser.add_argument('--dram-size', type=lambda value: int(value, 0), required=True,
-                        help='VM RAM size; must not exceed the FDT /memory size')
+                        help='Guest RAM size; without --dram-base it must fit the first FDT /memory region')
+    parser.add_argument('--dram-base', type=lambda value: int(value, 0), default=None,
+                        help='Guest RAM base, for a VM whose boot shim rewrites /memory (pseudo-unprotected)')
     parser.add_argument('--owned-memory-size', type=lambda value: int(value, 0), default=None,
                         help='DarwinBoot contiguous window, 256 MiB..8 GiB in 2 MiB steps')
     parser.add_argument('--timebase', type=lambda value: int(value, 0), default=19200000,
@@ -181,8 +186,12 @@ def main():
         parser.error('--timebase must fit the DT u32 ABI')
 
     vm = describe(parse_fdt(args.fdt.read_bytes()))
-    if args.dram_size > vm['dram_size']:
-        parser.error(f'--dram-size {args.dram_size:#x} exceeds the FDT /memory size {vm["dram_size"]:#x}')
+    if args.dram_base is None and args.dram_size > vm['dram_size']:
+        parser.error(f'--dram-size {args.dram_size:#x} exceeds the FDT /memory region {vm["dram_size"]:#x}; '
+                     'a pseudo-unprotected VM needs --dram-base and --dram-size from its boot shim')
+    dram_base = vm['dram_base'] if args.dram_base is None else args.dram_base
+    if dram_base % 0x200000 or args.dram_size % 0x200000:
+        parser.error('the guest RAM base and size must be 2 MiB aligned')
     if args.owned_memory_size is not None and args.owned_memory_size > args.dram_size:
         parser.error('the DarwinBoot window cannot exceed the VM RAM')
     cpu_regs = vm['cpu_regs']
@@ -220,7 +229,7 @@ def main():
                           if args.ipad_identity else []),
                         *([('ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
                         *([('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))] if args.owned_memory_size else []),
-                        ('dram-base', struct.pack('<Q', vm['dram_base'])),
+                        ('dram-base', struct.pack('<Q', dram_base)),
                         ('dram-size', struct.pack('<Q', args.dram_size)),
                         ('crypto-hash-method', b'sha2-384\0'),
                         *([('root-matching', ('<dict><key>IOProviderClass</key><string>IOMedia</string>'
@@ -261,7 +270,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
     print(f'droidvm ADT: {len(tree)} bytes, {len(cpu_regs)} cpu, gic {dist:#x}/{redist:#x}+{redist_size:#x}, '
-          f'psci {psci_method}, dram {vm["dram_base"]:#x}+{args.dram_size:#x}, timebase {args.timebase}')
+          f'psci {psci_method}, dram {dram_base:#x}+{args.dram_size:#x}, timebase {args.timebase}')
 
 
 if __name__ == '__main__':

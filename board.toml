@@ -83,7 +83,7 @@ volume = "DROIDVMESP"
 size_mib = 192
 loader = "driver"
 title = "DroidVM first boot: source 4K XNU to console"
-dram_size = "0x100000000"            # VM RAM (memory_mb = 4096); must not exceed the FDT /memory size
+dram_size = "0xff600000"             # guest RAM of the 4096 MiB pseudo-unprotected VM: "SHIM: /memory now 0x80600000+0xff600000"
 kernel_args = [
   "-v",
   "debug=0x14e",
@@ -95,5 +95,6 @@ kernel_args = [
 
 [payload.adt]
 tool = "scripts/make-droidvm-adt.py"
+dram_base = "0x80600000"             # the shim's RAM window; crosvm's own FDT lists only the boot region
 owned_memory_size = "0x80000000"     # 2 GiB DarwinBoot window inside the 4 GiB VM
 cpu_regs = "0"                       # boot CPU only until SMP is tried (ArmCpu: sheng-smp=1)
