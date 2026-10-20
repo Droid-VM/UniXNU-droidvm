@@ -29,8 +29,11 @@ settings) and writes the `.adt` sidecar: CPUs, the GICv3 windows, the PSCI condu
 
 | Stage | State |
 | --- | --- |
-| Kernel build | in progress |
-| DarwinBoot hand-off in the VM | not tried |
+| Kernel build | done on macOS 27 / Xcode 27.1 (with the UniXNU bootstrap and link fixes of branch droidvm) |
+| UEFI -> UniXNU -> DarwinBoot -> XNU | works on SM8650 (8 Gen 3) and SM8850 (8 Elite Gen 5), 4 KiB pages |
+| XNU bring-up | reaches "Still waiting for root device", then the expected "Failed to mount root device" panic |
+| Kernel log / panic log | read from the host through guest RAM (tools/rig) |
+| Video console | XNU does not draw its -v text on the GOP framebuffer yet |
 | Storage (virtio-pci block) | missing: NativeVirtioBlock is virtio-mmio only, crosvm aarch64 offers virtio-pci |
 | Input (virtio-input) | missing |
 | GPU | missing: NativeAdreno drives the real Adreno; a VM needs a virtio-gpu native-context path |
