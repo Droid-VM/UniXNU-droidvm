@@ -1,0 +1,20 @@
+# Kernel configuration of the DroidVM first boot. CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build.
+#
+# First milestone: DarwinBoot hands off inside a DroidVM guest (crosvm on Gunyah), the generic device tree
+# platform publishes the GIC, ArmCpu starts the boot CPU and the architected timer, and the kernel reaches the
+# video console. No storage, input or GPU driver yet: the expected end is the missing-root panic on screen.
+
+CONFIG_XNU_SOURCE_CORECRYPTO14=y
+CONFIG_XNU_SOURCE_PTHREAD=y
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+CONFIG_XNU_NATIVE_AES=y
+CONFIG_XNU_TRUST_CACHE_RUNTIME=y
+CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+CONFIG_XNU_NATIVE_PAN=y
+
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+CONFIG_XNU_BOOT_PROGRESS=n
