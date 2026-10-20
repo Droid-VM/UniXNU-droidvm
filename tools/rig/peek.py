@@ -18,6 +18,15 @@ PHONE = __import__('os').environ['PHONE']   # the adb serial of the phone
 NM = __import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'out', 'kernel.nm')
 KERNEL_VA = 0xFFFFFFF00427C000
 KERNEL_PA = 0x84A7C000
+try:   # written by reboot-vm.sh from the last DarwinBoot hand-off
+    for line in open(__import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'out', 'handoff.env')):
+        key, _, value = line.strip().partition('=')
+        if key == 'KERNEL_VA':
+            KERNEL_VA = int(value, 16)
+        elif key == 'KERNEL_PA':
+            KERNEL_PA = int(value, 16)
+except FileNotFoundError:
+    pass
 MEMFD_GUEST_BASE = 0x80000000          # crosvm_guest memfd offset 0 is guest PA 0x80000000
 
 

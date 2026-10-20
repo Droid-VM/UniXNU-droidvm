@@ -1,22 +1,41 @@
-# Kernel configuration of the DroidVM first boot. CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build.
+# Kernel configuration of the DroidVM image. CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build.
 #
-# First milestone: DarwinBoot hands off inside a DroidVM guest (crosvm on Gunyah), the generic device tree
-# platform publishes the GIC, ArmCpu starts the boot CPU and the architected timer, and the kernel reaches the
-# video console. No storage, input or GPU driver yet: the expected end is the missing-root panic on screen.
+# The CPU-rendered desktop path sheng reached before its GPU worked, over what a DroidVM guest has: the GOP
+# framebuffer (legacy display, CPU copy), read-only original OS and SystemOS images on virtio-mmio disks
+# (verified owner root), and the Data volume as a packed RAM disk. Nothing of sheng's hardware (UFS, PMGR,
+# Adreno, touch) is linked.
 
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
 CONFIG_XNU_SOURCE_PTHREAD=y
 CONFIG_XNU_ARM_DT_PLATFORM=y
 CONFIG_XNU_ARMCPU=y
 CONFIG_XNU_NATIVE_AES=y
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
 CONFIG_XNU_TRUST_CACHE_RUNTIME=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
+CONFIG_XNU_VERIFIED_ROOT_PROBE=y
+CONFIG_XNU_OWNER_ROOT_AUDIT=y
+CONFIG_XNU_OWNER_ROOT_TRUST=y
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+CONFIG_XNU_DT_PANIC_REGION=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
-CONFIG_XNU_DT_PANIC_REGION=y
-CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
-CONFIG_XNU_ARMVIRT_PLATFORM=n
-CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+# APFS volume UUID of build/droidvm-data (prepare-owner-data-fixture.py seed.json); a new seed has a new UUID.
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="6359A5F5-8C9B-4373-A7C3-EDDCC3261A61"
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a"
+CONFIG_XNU_VERIFIED_ROOT_ARCHIVE="{tree}/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a"
+CONFIG_XNU_EXTRA_LD_ARCHIVES=""
+CONFIG_XNU_NATIVE_UFS=n
+CONFIG_XNU_SHENG_PMGR=n
+CONFIG_XNU_NATIVE_ADRENO=n
 CONFIG_XNU_BOOT_PROGRESS=n
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+CONFIG_XNU_ARMVIRT_PLATFORM=n

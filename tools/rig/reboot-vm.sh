@@ -22,4 +22,16 @@ python3 $IPC $P $T vm_console_clear "{\"vm_id\":\"$VM\"}" >/dev/null 2>&1
 $A shell 'input keyevent KEYCODE_WAKEUP' >/dev/null
 python3 $IPC $P $T vm_start "{\"vm_id\":\"$VM\"}" | grep -q '"success": true' || echo "vm_start failed"
 sleep "$WAIT"
-python3 $(dirname "$0")/console.py $P $T $VM serial1
+python3 $(dirname "$0")/console.py $P $T $VM serial1 | tee /tmp/reboot-vm-console.txt
+# The last DarwinBoot hand-off of this console: where the kernel and the framebuffer are (peek.py, fbgrab.sh).
+RIG_OUT="$(dirname "$0")/out" python3 - <<'PY'
+import re
+text = open('/tmp/reboot-vm-console.txt').read()
+arm = re.findall(r'DARWINBOOT: ARM64 va=0x([0-9A-F]+) pa=0x([0-9A-F]+)', text)
+video = re.findall(r'DARWINBOOT: video base=0x([0-9A-F]+) display=\d+ row=(\d+) width=(\d+) height=(\d+)', text)
+if arm and video:
+    va, pa = arm[-1]
+    base, row, width, height = video[-1]
+    open(__import__('os').environ['RIG_OUT'] + '/handoff.env', 'w').write(
+        f'KERNEL_VA=0x{va}\nKERNEL_PA=0x{pa}\nFB_BASE=0x{base}\nFB_STRIDE={row}\nFB_WIDTH={width}\nFB_HEIGHT={height}\n')
+PY

@@ -32,9 +32,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'kits/NativePrelink'))
 import native_prelink as np
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument('--candidate', type=Path, default=ROOT.parent / 'kernel/kernel.macho',
-                    help='prelinked kernel whose .json prelink report sits next to it')
+parser.add_argument('--candidate', type=Path, default=None,
+                    help='prelinked kernel whose .json prelink report sits next to it (default: the board\'s reference '
+                         'candidate build/reference-candidate/kernel.macho, else out/<board>/kernel/kernel.macho)')
 args = parser.parse_args()
+# The candidate must be a kernel WITHOUT the storage drivers: once they are linked, the original-class symbols
+# they bind are native exports too and the binding count no longer identifies the original dispatch.
+if args.candidate is None:
+    reference = ROOT / 'build/reference-candidate/kernel.macho'
+    args.candidate = reference if reference.exists() else ROOT.parent / 'kernel/kernel.macho'
 source = ROOT / 'refer/IOStorageFamily'
 revision = subprocess.check_output(['git', '-C', source, 'rev-parse', 'HEAD'], text=True).strip()
 if revision != 'e45fbe30a7879e0b16e26dddb78538f1b00e0bff':

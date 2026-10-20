@@ -32,13 +32,19 @@ archives = [
   "build-arm-driver.py ArmCpu",
   "build-arm-driver.py NativeAES",
   "build-native-aes-bindings.py",
-  # NativeVirtioBlock binds to the original prelinked IOStorageFamily class. The audit reads the previous
-  # kernel/kernel.macho (kext addresses do not move between builds), so a first build from scratch needs
-  # one kernel without CONFIG_XNU_NATIVE_VIRTIO_BLOCK.
+  # Storage, display and HID bind to original prelinked classes. Their audits read a reference candidate:
+  # build/reference-candidate/kernel.{macho,json}, a prelinked kernel of this board built WITHOUT
+  # CONFIG_XNU_NATIVE_VIRTIO_BLOCK / RAM_BLOCK / LEGACY_DISPLAY (original kext addresses do not move between
+  # builds). A build from scratch therefore links one such kernel first and copies it there.
   "audit-storage-interface-static.py",
-  "build-arm-driver.py NativeVirtioBlock",
-  "build-native-virtio-bindings.py --component NativeVirtioBlock",
+  # Owner root: OS + SystemOS policies (build-owner-os-policy.py, build-owner-systemos-policy.py) must exist.
+  "build-verified-root-probe.py --component os --include-systemos",
+  "build-arm-driver.py NativeVirtioBlock --verified-root --verified-root-bundle",
+  "build-native-virtio-bindings.py --component NativeVirtioBlock --directory build/native-virtio-block-verified-bundle",
+  "build-arm-driver.py NativeRamBlock",
+  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
   "build-libpthread-kernel.py",
+  "build-native-legacy-display.py",
 ]
 
 [kernel.prelink]
@@ -82,25 +88,54 @@ roots = [
   "com.apple.iokit.IOHIDEventDriver",
 ]
 
-# The FAT volume attached to the VM as a disk: UniXNU's config, the kernel and its device tree.
-# loader = "driver" makes UniXNU load Payloads/DarwinBoot.efi itself, since edk2-gunyah does not carry it.
+# The FAT volume attached to the VM as a disk: UniXNU's config, the kernel, its device tree, the trust caches
+# and the packed Data seed. loader = "driver" makes UniXNU load Payloads/DarwinBoot.efi itself, since
+# edk2-gunyah does not carry it. Build with:
+#   unixnu build payload --trust-cache <tree>/build/original-static-system-trust/original-static-system.bundle \
+#     --data-ramdisk <tree>/build/droidvm-data/data-2g-skip.dbr --unique-chip-id <16 hex digits>
 [payload]
 volume = "DROIDVMESP"
 size_mib = 192
 loader = "driver"
-title = "DroidVM first boot: source 4K XNU to console"
-dram_size = "0xff600000"             # guest RAM of the 4096 MiB pseudo-unprotected VM: "SHIM: /memory now 0x80600000+0xff600000"
+title = "DroidVM: iPadOS 17.7.11, CPU-rendered desktop"
+dram_size = "0x13f600000"            # guest RAM of the 5120 MiB pseudo-unprotected VM: "SHIM: /memory now 0x80600000+0x13f600000"
+skip_setup_tool = "scripts/seed-data-skip-setup.py"
+trust_cache_sha256 = [
+  "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
+]
 kernel_args = [
-  "-v",
   "debug=0x14e",
   "kt_fixed_zones=120",
-  "armcpu-diagnostics=1",
   "-no_slto_panic",
   "ml-timeout-lock-panic-scale=40",
+  "-apfs_shared_datavolume",
+  "offline-apfs-load=1",
+  "offline-mobile-graphics-load=1",
+  "offline-mobile-graphics-client=1",
+  "offline-legacy-register=1",
+  "offline-legacy-gop=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-unit-scale=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "offline-hid-input=1",
+  "offline-hid-home=1",
+  "sheng-touch-hid=1",
+  "offline-key-events=1",
+  "sheng-aks=1",
+  "armcpu-diagnostics=1",
+  "droidvm-monitor=1000",            # process samples for the host rig (kits/droidvm/DroidVMStubs.c)
 ]
 
 [payload.adt]
 tool = "scripts/make-droidvm-adt.py"
 dram_base = "0x80600000"             # the shim's RAM window; crosvm's own FDT lists only the boot region
-owned_memory_size = "0x80000000"     # 2 GiB DarwinBoot window inside the 4 GiB VM
+owned_memory_size = "0xb0000000"     # 2.75 GiB DarwinBoot window: the RAM run above 4 GiB of the 5 GiB VM
 cpu_regs = "0"                       # boot CPU only until SMP is tried (ArmCpu: sheng-smp=1)
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the original OS volume
+packed_data_ramdisk = true
+ipad_identity = true
+unique_chip_id = "required"
+chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id

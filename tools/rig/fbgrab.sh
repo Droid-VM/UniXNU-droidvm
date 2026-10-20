@@ -2,7 +2,10 @@
 # Coherent framebuffer capture of the UniXNU VM (memgrab: mmap the guest memfd + dc civac), saved as PNG.
 #   fbgrab.sh OUT.png [WIDTH HEIGHT STRIDE MEMFD_OFFSET]
 set -euo pipefail
-OUT=$1; W=${2:-1280}; H=${3:-800}; STRIDE=${4:-5120}; OFF=${5:-0xffc00000}
+OUT=$1
+[ -f $(dirname "$0")/out/handoff.env ] && . $(dirname "$0")/out/handoff.env
+W=${2:-${FB_WIDTH:-1280}}; H=${3:-${FB_HEIGHT:-800}}; STRIDE=${4:-${FB_STRIDE:-5120}}
+OFF=${5:-$(printf '0x%x' $(( ${FB_BASE:-0x17fc00000} - 0x80000000 )))}
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}
 cat > /tmp/fbgrab-phone.sh <<PHONE_EOF
 pid=\$(for p in \$(pidof crosvm); do tr '\0' ' ' < /proc/\$p/cmdline | grep -q UniXNU && echo \$p; done | head -1)
