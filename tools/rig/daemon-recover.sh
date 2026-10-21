@@ -19,6 +19,8 @@ fi
 P=$($A shell "su -c 'cat $RUN/droidvmd-port.txt'" | tr -dc 0-9)
 T=$($A shell "su -c 'cat $RUN/droidvmd-token.txt'" | tr -dc 0-9a-f)
 $A forward tcp:$P tcp:$P >/dev/null
+# A daemon that has just started takes a few seconds to answer; asking earlier ends in EOFError, not in an answer.
+for i in $(seq 1 15); do python3 $IPC $P $T vm_list >/dev/null 2>&1 && break; sleep 2; done
 id=$(python3 -c "import json;print(json.load(open('$CONFIG'))['config']['id'])")
 if python3 $IPC $P $T vm_get "{\"vm_id\":\"$id\"}" | grep -q '"success": false'; then
   python3 $IPC $P $T vm_create "$(cat $CONFIG)" | grep -E '"success"'
