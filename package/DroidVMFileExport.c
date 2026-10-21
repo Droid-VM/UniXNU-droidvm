@@ -23,7 +23,8 @@
 // final. kind 0 reads up to DROIDVM_EXPORT_BYTES of a regular file from offset (total = its size); kind 1 lists a
 // directory as "<d_type> <name>\n" lines from entry offset (total = entries listed, length = bytes); kind 2 lists the
 // processes as "<pid> <ppid> <name>\n" lines (path unused; total = processes); kind 3 sends signal `length` to process
-// `offset` (not to launchd or the kernel).
+// `offset` (not to launchd or the kernel); kind 4 copies `length` bytes (at most DROIDVM_EXPORT_BYTES) of the user memory of
+// process <path, in decimal> from address `offset` (length = bytes copied).
 struct droidvm_export {
 	volatile uint32_t request, done;
 	uint32_t kind;
@@ -98,6 +99,30 @@ static int droidvm_export_directory(const char *path, uint64_t first, uint64_t *
 	return error;
 }
 
+extern vm_map_t get_task_map_reference(task_t);
+extern kern_return_t vm_map_read_user(vm_map_t, vm_map_address_t, void *, vm_size_t);
+extern void vm_map_deallocate(vm_map_t);
+
+static int droidvm_export_memory(const char *pid_text, uint64_t address, uint64_t *length) {
+	int pid = 0;
+	for (const char *c = pid_text; *c; ++c) {
+		if (*c < '0' || *c > '9' || pid > 1000000) return EINVAL;
+		pid = pid * 10 + (*c - '0');
+	}
+	uint64_t size = MIN(*length, (uint64_t)DROIDVM_EXPORT_BYTES);
+	*length = 0;
+	proc_t p = pid > 0 ? proc_find(pid) : PROC_NULL;
+	if (p == PROC_NULL) return ESRCH;
+	vm_map_t map = get_task_map_reference(proc_task(p));
+	proc_rele(p);
+	if (!map) return ESRCH;
+	kern_return_t kr = vm_map_read_user(map, (vm_map_address_t)address, droidvm_export_data, (vm_size_t)size);
+	vm_map_deallocate(map);
+	if (kr != KERN_SUCCESS) return EFAULT;
+	*length = size;
+	return 0;
+}
+
 struct droidvm_export_cursor {
 	uint64_t used, count;
 };
@@ -121,7 +146,11 @@ void droidvm_export_poll(void) {
 	path[sizeof(path) - 1] = 0;
 	uint64_t length = 0, total = 0;
 	int status = EINVAL;
-	if (droidvm_export_box.kind == 3) {
+	if (droidvm_export_box.kind == 4) {
+		length = droidvm_export_box.length;
+		status = droidvm_export_memory(path, droidvm_export_box.offset, &length);
+		total = length;
+	} else if (droidvm_export_box.kind == 3) {
 		int pid = (int)droidvm_export_box.offset, signal = (int)droidvm_export_box.length;
 		proc_t target = pid > 1 && signal > 0 && signal < NSIG ? proc_find(pid) : PROC_NULL;
 		status = ESRCH;

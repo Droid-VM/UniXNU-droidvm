@@ -6,6 +6,7 @@
   export.py get /private/var/db/file OUTPUT        (the whole file, in 1 MiB requests)
   export.py ps                                     (pid, parent pid, name of every process)
   export.py kill PID [SIGNAL]                      (default 9; launchd restarts what it keeps alive)
+  export.py mem PID ADDRESS [LENGTH]               (hex dump of a process's user memory)
 
 The request is written into droidvm_export_box through crosvm's /proc/<pid>/mem; the droidvm-monitor worker answers
 within ~100 ms. Paths are in the guest's namespace (Data is mounted at /private/var)."""
@@ -64,12 +65,17 @@ def request(kind, path, offset=0, length=0):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=['ls', 'cat', 'get', 'ps', 'kill'])
+    parser.add_argument('command', choices=['ls', 'cat', 'get', 'ps', 'kill', 'mem'])
     parser.add_argument('path', nargs='?', default='')
     parser.add_argument('output', nargs='?')
+    parser.add_argument('length', nargs='?')
     parser.add_argument('--offset', type=int, default=0)
     args = parser.parse_args()
-    if args.command == 'kill':
+    if args.command == 'mem':
+        body, _ = request(4, args.path, int(args.output, 16), int(args.length, 0) if args.length else 64)
+        for at in range(0, len(body), 16):
+            print(f'{int(args.output, 16) + at:016x}: {body[at:at + 16].hex(" ")}')
+    elif args.command == 'kill':
         request(3, '', int(args.path), int(args.output or 9))
         print(f'signal {args.output or 9} sent to {args.path}')
     elif args.command == 'ps':

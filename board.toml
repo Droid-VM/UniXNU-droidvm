@@ -125,6 +125,9 @@ kernel_args = [
   "sheng-touch-hid=1",
   "offline-key-events=1",
   "sheng-aks=1",
+  # the keybag of a guest without a passcode: MobileKeyBag "Disabled", so SpringBoard neither revokes authentication at
+  # boot nor waits for a passcode that does not exist (default 0 reads as a passcode set and unlocked)
+  "sheng-aks-sls=3",
   "armcpu-diagnostics=1",
   "sheng-smp=1",
   "droidvm-monitor=1000",            # process samples for the host rig (kits/droidvm/DroidVMStubs.c)

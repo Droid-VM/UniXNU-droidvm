@@ -24,6 +24,8 @@ environment: `PHONE`, `VM`); adjust before use elsewhere.
 | `load-modules.sh` | Load the DroidVM app's kernel modules after the phone itself restarted |
 | `show-vm.sh` | Bring the app's display of the VM to the front of the phone (a VM restart closes it) |
 | `export.py kill PID [SIGNAL]` | Signal a guest process, e.g. a SpringBoard deadlocked at launch (launchd restarts it) |
+| `export.py mem PID ADDRESS [LENGTH]`, `umem.py` | Read a guest process's user memory (hex dump; `umem.read`/`umem.q` for scripted pointer walks) |
+| `logarchive.py OUT` | Mirror the guest's unified log (diagnostics + uuidtext) for a tracev3 parser such as mandiant/macos-UnifiedLogs (`unifiedlog_iterator -m log-archive`); reruns fetch only what changed |
 | `make-data-store.sh [GIB]` | Make the labelled sparse disk of the persistent Data store on the phone |
 | `daemon-recover.sh` | Restart droidvmd the way the app does and recreate the VM from its saved config |
 

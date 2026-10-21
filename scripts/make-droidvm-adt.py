@@ -196,6 +196,8 @@ def main():
     parser.add_argument('--trust-cache', action='store_true', help='Zeroed TrustCache sidecar handoff placeholder')
     parser.add_argument('--data-store-mmio', type=lambda value: int(value, 0), default=None,
                         help='Base of the FDT virtio-mmio window that holds the persistent Data store (/arm-io/data-store)')
+    parser.add_argument('--display-gamut', choices=['P3', 'sRGB'], default='P3',
+                        help='/product artwork-display-gamut: P3 is the iPad7,1 panel; sRGB keeps UIKit on 8-bit sRGB surfaces')
     parser.add_argument('--input-mmio', default='',
                         help='Bases of the FDT virtio-mmio windows of the input devices, comma-separated (/arm-io/input-N)')
     args = parser.parse_args()
@@ -301,7 +303,7 @@ def main():
                             ('artwork-device-idiom', b'pad\0'),
                             ('artwork-device-subtype', struct.pack('<I', 2732)),
                             ('artwork-scale-factor', struct.pack('<I', 2)),
-                            ('artwork-display-gamut', b'P3\0'),
+                            ('artwork-display-gamut', args.display_gamut.encode() + b'\0'),
                             ('compatible-device-fallback', b'iPad6,7\0'),
                             ('thin-bezel', struct.pack('<I', 1))] if args.ipad_identity else [])]),
         node('arm-io', [('device_type', b'arm-io\0'),
