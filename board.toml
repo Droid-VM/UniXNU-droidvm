@@ -145,9 +145,11 @@ kernel_args = [
   # union view over /Applications, since the Data seed carries no copy for the first boot's migration to install (UniXNU
   # patches/xnu/zzy-owner-staged-apps-mount.patch)
   "owner-staged-apps=1",
-  # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, and the services sheng found
-  # in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md)
-  "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd",
+  # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, the services sheng found
+  # in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md), and fairplayd, which exits at once
+  # without the FairPlayIOKit kext (it does not prelink against this kernel); its MachServices stay registered meanwhile, so
+  # lockdownd's first FairPlay call waited forever, and with it accountsd and every app that asks it (Notes, Photos stayed blank)
+  "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd,com.apple.fairplayd.A2",
   # the host phone's GPU through crosvm --droidvm-gpu (kits/droidvm/DroidVMGpu.cpp): NativeAdreno's service over KGSL, after one
   # CP_MEM_WRITE through it
   "droidvm-gpu=1",
