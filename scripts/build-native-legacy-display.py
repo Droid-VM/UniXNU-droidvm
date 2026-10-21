@@ -253,6 +253,10 @@ run(policy_cmd,cwd=er['directory'])
 export_source=ROOT/'kits/droidvm/DroidVMFileExport.c'
 export_obj=OUT/'DroidVMFileExport.o'
 run([str(export_source) if arg==str(policy_source) else str(export_obj) if arg==str(policy_obj) else arg for arg in policy_cmd],cwd=er['directory'])
+# The Data disk's persistent store window (native_ufs_store_*) over the writable virtio-mmio disk, in the Mach universe.
+store_source=ROOT/'kits/droidvm/DroidVMDataStore.c'
+store_obj=OUT/'DroidVMDataStore.o'
+run([str(store_source) if arg==str(process_source) else str(store_obj) if arg==str(process_obj) else arg for arg in process_cmd],cwd=pr['directory'])
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end='')
 hid_dir=ROOT/'build/native-hid-input'
@@ -265,11 +269,11 @@ run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func',
 require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/'NativeKeyStoreEvents.o').read_bytes()))==
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned event-service instructions unchanged by late init staging')
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDisplayProbe.o',hid_obj,keystore_obj,process_obj,trace_obj,
-     hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',keyevents_late,stub_obj,policy_obj,export_obj])
+     hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',keyevents_late,stub_obj,policy_obj,export_obj,store_obj])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',
          ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,hid_source,keystore_source,process_source,trace_source,ROOT/'kits/droidvm/BootUiTraceCore.h',ROOT/'kits/droidvm/BootUiTraceDetails.h',
          ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',
-         ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',stub_source,policy_source,export_source]
+         ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',stub_source,policy_source,export_source,store_source]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

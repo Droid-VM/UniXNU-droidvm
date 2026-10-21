@@ -75,9 +75,9 @@ void native_touch_probe(void) {
 void sheng_cpufreq_probe(void) {}
 void sheng_gpu_power_probe(void) {}
 
-// The shared probes and NativeRamBlock declare sheng's diagnostic page (BootProgress.c) and UFS store window
-// (BootLog.c) weak and test for them, but a static kernel link still needs a definition. These keep the
-// behaviour of a board without them: no diagnostic writer to yield to, no anchor, and the volatile Data disk.
+// The shared probes declare sheng's diagnostic page (BootProgress.c) weak and test for it, but a static kernel link
+// still needs a definition. These keep the behaviour of a board without it: no diagnostic writer to yield to and no
+// anchor. (NativeRamBlock's store window is DroidVMDataStore.c.)
 int boot_progress_prepare_scanout(void) { return 1; }
 void boot_progress_cancel_scanout(void) {}
 int boot_progress_pulse_anchor(uintptr_t base, uint64_t bytes, unsigned width, unsigned height, unsigned row) {
@@ -87,16 +87,6 @@ int boot_progress_pulse_anchor(uintptr_t base, uint64_t bytes, unsigned width, u
 // The one message the display probe would put on the diagnostic page goes to the kernel log instead.
 void boot_progress_stage(const char *message) { printf("boot-progress: %s\n", message); }
 
-unsigned native_ufs_store_mode(void) { return 0; }
-int native_ufs_store_open(uint64_t blocks, uint64_t *first, const char **why) {
-    (void)blocks; (void)first;
-    *why = "no store on this board";
-    return 0;
-}
-int native_ufs_store_read(uint64_t block, uint32_t count, void *data) { (void)block; (void)count; (void)data; return 0; }
-int native_ufs_store_write(uint64_t block, uint32_t count, const void *data) { (void)block; (void)count; (void)data; return 0; }
-int native_ufs_store_sync(void) { return 0; }
-unsigned native_ufs_store_gpt_check(void) { return 0; }
 // NativeVirtioBlock asks NativeUfs whether a provider is a UFS window; -1 says it is not.
 int native_ufs_block_authenticates(void *provider, const char *uuid, uint8_t *digest) {
     (void)provider; (void)uuid; (void)digest;

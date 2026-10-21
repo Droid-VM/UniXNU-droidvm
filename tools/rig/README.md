@@ -15,6 +15,17 @@ environment: `PHONE`, `VM`); adjust before use elsewhere.
 | `fbgrab.sh OUT.png` | Coherent framebuffer capture (`memgrab`: mmap the guest memfd, `dc civac`, copy) |
 | `memgrab.c` | The phone-side helper of `fbgrab.sh` (static aarch64 build) |
 | `swap-adt.sh` | Regenerate only the ADT on the boot disk |
+| `console-watch.sh [SECONDS]` | Keep the newest serial console on this machine while the VM boots, stamped with host time (survives a phone that goes down) |
+| `procs.py`, `trace.py` | The droidvm-monitor worker's process samples and UI thread traces (`droidvm-monitor=<ms>`) |
+| `export.py ls\|cat\|get\|ps` | Read guest files, directories and the process list through the kernel's file mailbox |
+| `dsc_sym.py CACHE_DIR SLIDE ADDR...` | Symbolize user addresses against the SystemOS dyld shared cache (run on the Mac) |
+| `home.py` | Press Home |
+| `make-data-store.sh [GIB]` | Make the labelled sparse disk of the persistent Data store on the phone |
+| `daemon-recover.sh` | Restart droidvmd the way the app does and recreate the VM from its saved config |
+
+After the phone itself restarts, open the DroidVM app once (or `insmod` the modules of its autostart set from
+`files/../usr/lib/modules/<kmi>/`): a pseudo-unprotected VM shares its RAM through `/dev/gunyah_share`, and
+without the Gunyah Host Share module crosvm exits with "failed to initialize virtual machine (os error 2)".
 
 The panic log lands in the `/pram` region of the ADT (default: the last 512 KiB of guest RAM,
 `peek.py 0x17fb80000 0x1000` for a 4 GiB pseudo-unprotected VM).

@@ -128,6 +128,8 @@ kernel_args = [
   "armcpu-diagnostics=1",
   "sheng-smp=1",
   "droidvm-monitor=1000",            # process samples for the host rig (kits/droidvm/DroidVMStubs.c)
+  # the Data disk keeps what the system writes in the store window of the third virtio-mmio disk (kits/droidvm/DroidVMDataStore.c)
+  "droidvm-data-persist=2",
   # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, and the services
   # sheng found in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md)
   "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd",
@@ -143,3 +145,5 @@ packed_data_ramdisk = true
 ipad_identity = true
 unique_chip_id = "required"
 chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
+# The third crosvm --virtio-mmio-block (tools/rig/make-data-store.sh) is the store disk, not a NativeVirtioBlock image.
+tool_args = ["--data-store-mmio", "0x0a002000"]

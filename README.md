@@ -25,15 +25,27 @@ settings) and writes the `.adt` sidecar: CPUs, the GICv3 windows, the PSCI condu
 `package/crosvm-gunyah.dtb` is the default input; it must match the VM that boots the payload
 (vCPU count, RAM size). `scripts/dump-adt.py FILE.adt` prints a generated tree.
 
+## Data disk
+
+The Data volume is a packed seed in the payload, served from guest RAM by NativeRamBlock. What the system
+writes to it persists through NativeRamBlock's store window (`PersistOverlay.h`): the changed 4 KiB pages,
+their presence bitmap and a header naming the seed. `package/DroidVMDataStore.c` provides that window over a
+writable virtio-mmio disk: a sparse file on the phone (`tools/rig/make-data-store.sh`), attached as the third
+`--virtio-mmio-block` and published by the ADT tool as `/arm-io/data-store` (`tool_args` in `board.toml`).
+`droidvm-data-persist=2` reads and writes it; 0 keeps Data volatile. Writes are on the file when they complete,
+which survives a VM stop or crash; the file is flushed (fsync) within 5 s of a write. A new seed (another
+payload's Data image) does not match the stored header, and the store starts over empty;
+`sheng-data-reset=1` empties it on purpose.
+
 ## State
 
 | Stage | State |
 | --- | --- |
-| Kernel build | done on macOS 27 / Xcode 27.1 (with the UniXNU bootstrap and link fixes of branch droidvm) |
+| Kernel build | done on macOS 27 / Xcode 27.1 (with the fixes of UniXNU branch droidvm) |
 | UEFI -> UniXNU -> DarwinBoot -> XNU | works on SM8650 (8 Gen 3) and SM8850 (8 Elite Gen 5), 4 KiB pages |
-| XNU bring-up | reaches "Still waiting for root device", then the expected "Failed to mount root device" panic |
-| Kernel log / panic log | read from the host through guest RAM (tools/rig) |
-| Video console | XNU does not draw its -v text on the GOP framebuffer yet |
-| Storage (virtio-pci block) | missing: NativeVirtioBlock is virtio-mmio only, crosvm aarch64 offers virtio-pci |
-| Input (virtio-input) | missing |
+| Root | the original OS and SystemOS images on read-only virtio-mmio disks, verified (owner root) |
+| Desktop | lock screen about a minute after boot with 4 vCPUs, home screen after a Home press; CPU-rendered (SM8650) |
+| Data | persistent through the store disk (SM8650) |
+| Kernel log / panic log / files | read from the host through guest RAM (tools/rig) |
+| Input | Home from the host; no touch yet |
 | GPU | missing: NativeAdreno drives the real Adreno; a VM needs a virtio-gpu native-context path |

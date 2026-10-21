@@ -9,10 +9,11 @@ RUN=/data/data/cn.classfun.droidvm/run
 IPC=${DVMIPC:?set DVMIPC to the path of the DroidVM daemon IPC client dvmipc.py}
 CONFIG=$(dirname "$0")/unixnu-vm.config.json
 pid=$($A shell "su -c 'cat $RUN/droidvmd.pid 2>/dev/null'" | tr -dc 0-9)
-if [ -z "$pid" ] || ! $A shell "su -c 'kill -0 $pid'" 2>/dev/null; then
+# The pid file outlives a crash of the phone, and its number may belong to another process by now.
+if [ -z "$pid" ] || ! $A shell "su -c 'grep -q cn.classfun.droidvm.daemon /proc/$pid/cmdline'" 2>/dev/null; then
   apk=$($A shell pm path cn.classfun.droidvm | sed 's/^package://' | tr -d '\r')
   lib="$(dirname "$apk")/lib/arm64:/data/data/cn.classfun.droidvm/lib"
-  $A shell "su -c 'env CLASSPATH=\"$apk\" LD_LIBRARY_PATH=\"$lib\" /data/data/cn.classfun.droidvm/bin/daemon /system/bin/app_process64 / cn.classfun.droidvm.daemon.Daemon'"
+  $A shell "su -c 'env CLASSPATH=\"$apk\" LD_LIBRARY_PATH=\"$lib\" setsid /data/data/cn.classfun.droidvm/bin/daemon /system/bin/app_process64 / cn.classfun.droidvm.daemon.Daemon </dev/null >/dev/null 2>&1 &'"
   sleep 3
 fi
 P=$($A shell "su -c 'cat $RUN/droidvmd-port.txt'" | tr -dc 0-9)

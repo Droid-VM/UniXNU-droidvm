@@ -11,6 +11,9 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
   - /psci: the FDT conduit (crosvm declares hvc)
   - /arm-io/virtio-mmio-N: every "virtio,mmio" node (crosvm --virtio-mmio-block), for
     NativeVirtioBlock: compatible exactly "virtio,mmio", reg, dma-coherent
+  - /arm-io/data-store: the "virtio,mmio" node at --data-store-mmio instead, the writable disk of the Data
+    store window (package/DroidVMDataStore.c): compatible "droidvm,data-store", so NativeVirtioBlock,
+    which serves only verified read-only images, does not bind it
   - /chosen dram-base, dram-size: the guest RAM. A pseudo-unprotected VM declares only its small
     boot region in the crosvm FDT; its boot shim accepts the RAM window and rewrites /memory at
     run time (console: "SHIM: /memory now BASE+SIZE"), so --dram-base and --dram-size give it.
@@ -189,6 +192,8 @@ def main():
     parser.add_argument('--data-ramdisk', action='store_true',
                         help='/chosen/memory-map RAMDisk placeholder; the loader fills in the real range')
     parser.add_argument('--trust-cache', action='store_true', help='Zeroed TrustCache sidecar handoff placeholder')
+    parser.add_argument('--data-store-mmio', type=lambda value: int(value, 0), default=None,
+                        help='Base of the FDT virtio-mmio window that holds the persistent Data store (/arm-io/data-store)')
     args = parser.parse_args()
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
@@ -229,6 +234,10 @@ def main():
     if panic_region and (panic_region[0] % 0x4000 or panic_region[1] % 0x4000 or not 0x4000 <= panic_region[1] < 1 << 32):
         parser.error('--panic-region must be 16 KiB aligned and below 4 GiB in size')
     dist, dist_size, redist, redist_size = vm['gic']
+    virtio_mmio = [window for window in vm['virtio_mmio'] if window[0] != args.data_store_mmio]
+    data_store = [window for window in vm['virtio_mmio'] if window[0] == args.data_store_mmio]
+    if args.data_store_mmio is not None and not data_store:
+        parser.error(f'the FDT has no virtio-mmio window at {args.data_store_mmio:#x} for --data-store-mmio')
 
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
                                    ('reg', struct.pack('<I', reg)),
@@ -293,14 +302,18 @@ def main():
               *[node('virtio-mmio-%d' % index, [('compatible', b'virtio,mmio\0'),
                                                  ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
                                                  ('dma-coherent', b'')])
-                for index, (address, size) in enumerate(vm['virtio_mmio'])]]),
+                for index, (address, size) in enumerate(virtio_mmio)],
+              *[node('data-store', [('compatible', b'droidvm,data-store\0'),
+                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                    ('dma-coherent', b'')])
+                for address, size in data_store]]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
     print(f'droidvm ADT: {len(tree)} bytes, {len(cpu_regs)} cpu, gic {dist:#x}/{redist:#x}+{redist_size:#x}, '
           f'psci {psci_method}, dram {dram_base:#x}+{args.dram_size:#x}, timebase {args.timebase}, '
           f'panic {"none" if not panic_region else f"{panic_region[0]:#x}+{panic_region[1]:#x}"}, '
-          f'virtio-mmio {[hex(a) for a, _ in vm["virtio_mmio"]]}')
+          f'virtio-mmio {[hex(a) for a, _ in virtio_mmio]}, data store {hex(data_store[0][0]) if data_store else "none"}')
 
 
 if __name__ == '__main__':
