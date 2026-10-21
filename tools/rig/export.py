@@ -5,6 +5,7 @@
   export.py cat /private/var/log/some.log [--offset N]
   export.py get /private/var/db/file OUTPUT        (the whole file, in 1 MiB requests)
   export.py ps                                     (pid, parent pid, name of every process)
+  export.py kill PID [SIGNAL]                      (default 9; launchd restarts what it keeps alive)
 
 The request is written into droidvm_export_box through crosvm's /proc/<pid>/mem; the droidvm-monitor worker answers
 within ~100 ms. Paths are in the guest's namespace (Data is mounted at /private/var)."""
@@ -37,13 +38,13 @@ def read_guest(pid, maps, pa, length):
     return peek.adb(f'dd if=/proc/{pid}/mem bs=1 skip={host} count={length} 2>/dev/null')
 
 
-def request(kind, path, offset=0):
+def request(kind, path, offset=0, length=0):
     pid, maps = peek.crosvm_maps()
     box, data = physical('droidvm_export_box'), physical('droidvm_export_data')
     current = BOX.unpack(read_guest(pid, maps, box, BOX.size))
     number = (current[0] + 1) & 0xffffffff
     # Everything but the counters first, then the request counter: the worker reads the fields after it sees it change.
-    write_guest(pid, maps, box + 8, struct.pack('<IiQQQ512s', kind, 0, offset, 0, 0, path.encode()[:511]))
+    write_guest(pid, maps, box + 8, struct.pack('<IiQQQ512s', kind, 0, offset, length, 0, path.encode()[:511]))
     write_guest(pid, maps, box, struct.pack('<I', number))
     for _ in range(100):
         answer = BOX.unpack(read_guest(pid, maps, box, BOX.size))
@@ -63,12 +64,15 @@ def request(kind, path, offset=0):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=['ls', 'cat', 'get', 'ps'])
+    parser.add_argument('command', choices=['ls', 'cat', 'get', 'ps', 'kill'])
     parser.add_argument('path', nargs='?', default='')
     parser.add_argument('output', nargs='?')
     parser.add_argument('--offset', type=int, default=0)
     args = parser.parse_args()
-    if args.command == 'ps':
+    if args.command == 'kill':
+        request(3, '', int(args.path), int(args.output or 9))
+        print(f'signal {args.output or 9} sent to {args.path}')
+    elif args.command == 'ps':
         body, _ = request(2, '')
         sys.stdout.write(body.decode(errors='replace'))
     elif args.command == 'ls':

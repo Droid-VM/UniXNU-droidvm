@@ -37,6 +37,16 @@ which survives a VM stop or crash; the file is flushed (fsync) within 5 s of a w
 payload's Data image) does not match the stored header, and the store starts over empty;
 `sheng-data-reset=1` empties it on purpose.
 
+## Input
+
+crosvm `--virtio-mmio-input` (DroidVM crosvm branch `wip/virtio-mmio`) puts the input devices the app attaches -- mouse,
+multi-touch screen, absolute pointer, keyboard -- on the virtio-mmio transport after the disks; `tool_args`
+(`--input-mmio`) names their windows for the ADT. `package/DroidVMVirtioInput.c` drives the touch screen and the
+pointer and feeds NativeHidInput's digitizer; it resets the other two. A touch that starts in the bottom 4% of the
+screen starts at the edge, so that the Home gesture can be made from a phone whose own gesture area covers that edge.
+Every virtio-mmio device crosvm offers must be in the ADT: the two phone crashes seen so far (a vCPU stuck in the
+hypervisor ~15 s after start, watchdog reset) both came with devices the guest did not know about.
+
 ## State
 
 | Stage | State |
@@ -47,5 +57,5 @@ payload's Data image) does not match the stored header, and the store starts ove
 | Desktop | lock screen about a minute after boot with 4 vCPUs, home screen after a Home press; CPU-rendered (SM8650) |
 | Data | persistent through the store disk (SM8650) |
 | Kernel log / panic log / files | read from the host through guest RAM (tools/rig) |
-| Input | Home from the host; no touch yet |
+| Input | the app's touch screen (and its absolute pointer) over virtio-input on virtio-mmio (crosvm `--virtio-mmio-input`); Home from the host |
 | GPU | missing: NativeAdreno drives the real Adreno; a VM needs a virtio-gpu native-context path |

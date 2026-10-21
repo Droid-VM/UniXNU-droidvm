@@ -32,6 +32,10 @@ extern void IOSleep(unsigned milliseconds);
 #define DROIDVM_TOUCH_FINGERS 10       // NativeHidInput's report
 #define DROIDVM_TOUCH_AXIS_X 30480
 #define DROIDVM_TOUCH_AXIS_Y 20320
+// A finger that comes down within this share (percent) of the screen's bottom starts at the bottom edge. iPadOS takes a swipe
+// as the Home gesture only from the edge band (NativeHidInput: 48 of 2032 rows, ~19 px of 800), and on the phone that band
+// lies in Android's own navigation gesture area, which keeps those touches for itself.
+#define DROIDVM_TOUCH_BOTTOM_SNAP 4
 
 enum { EV_SYN = 0, EV_KEY = 1, EV_ABS = 3 };
 enum { SYN_REPORT = 0, ABS_X = 0, ABS_Y = 1, ABS_MT_SLOT = 0x2f, ABS_MT_POSITION_X = 0x35, ABS_MT_POSITION_Y = 0x36,
@@ -68,19 +72,24 @@ char droidvm_input_names[DROIDVM_INPUT_DEVICES][48];
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
 extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 
+// Register accesses are single loads and stores with a plain base register: the hypervisor emulates a trapped MMIO access
+// from the syndrome, and a post-indexed or paired access (what a byte loop compiles to) has none -- the guest gets a
+// synchronous external abort instead.
 static uint32_t input_read32(const struct droidvm_input *d, unsigned offset) {
-    return *(volatile uint32_t *)(d->registers + offset);
+    uint32_t value;
+    __asm__ volatile("ldr %w0, [%1]" : "=r"(value) : "r"(d->registers + offset) : "memory");
+    return value;
 }
 static uint8_t input_read8(const struct droidvm_input *d, unsigned offset) {
-    return *(volatile uint8_t *)(d->registers + offset);
+    uint32_t value;
+    __asm__ volatile("ldrb %w0, [%1]" : "=r"(value) : "r"(d->registers + offset) : "memory");
+    return (uint8_t)value;
 }
 static void input_write32(const struct droidvm_input *d, unsigned offset, uint32_t value) {
-    *(volatile uint32_t *)(d->registers + offset) = value;
-    __asm__ volatile("dsb oshst" ::: "memory");
+    __asm__ volatile("str %w0, [%1]\n\tdsb oshst" :: "r"(value), "r"(d->registers + offset) : "memory");
 }
 static void input_write8(const struct droidvm_input *d, unsigned offset, uint8_t value) {
-    *(volatile uint8_t *)(d->registers + offset) = value;
-    __asm__ volatile("dsb oshst" ::: "memory");
+    __asm__ volatile("strb %w0, [%1]\n\tdsb oshst" :: "r"((uint32_t)value), "r"(d->registers + offset) : "memory");
 }
 static void input_write64(const struct droidvm_input *d, unsigned offset, uint64_t value) {
     input_write32(d, offset, (uint32_t)value);
@@ -191,7 +200,7 @@ static unsigned input_identify(struct droidvm_input *d) {
 }
 
 // The fingers in the order they were published: device, slot (DROIDVM_INPUT_SLOTS for a pointer) and HID identifier.
-struct droidvm_finger { uint8_t device, slot, id; int32_t x, y; };
+struct droidvm_finger { uint8_t device, slot, id; bool fresh; int32_t x, y; };
 static struct droidvm_finger droidvm_order[DROIDVM_TOUCH_FINGERS];
 static unsigned droidvm_order_count;
 
@@ -200,7 +209,11 @@ static int32_t input_scale(int32_t value, int32_t min, int32_t span, int32_t axi
     return v < 0 ? 0 : v >= axis ? axis - 1 : (int32_t)v;
 }
 
+// The digitizer's report count when the finger set was last published.
+static uint32_t droidvm_published_at;
+
 static void touch_publish(const struct droidvm_finger *fingers, unsigned count) {
+    droidvm_published_at = native_touch_hid_reports;
     uint32_t seq = native_touch_seq & ~1u;
     native_touch_seq = seq + 1;
     __asm__ volatile("dmb ish" ::: "memory");
@@ -229,6 +242,11 @@ static bool finger_down(const struct droidvm_finger *f) {
 static void touch_frame(void) {
     struct droidvm_finger next[DROIDVM_TOUCH_FINGERS];
     unsigned n = 0;
+    // The digitizer samples every 8 ms and only sees the newest set: a finger that lifts before the set it went down in
+    // was reported would never have touched. A tap's down and up frames often arrive within one poll.
+    bool lifting = false;
+    for (unsigned i = 0; i < droidvm_order_count && !lifting; ++i) lifting = !finger_down(&droidvm_order[i]);
+    if (lifting && native_touch_hid_reports == droidvm_published_at) touch_wait_report(droidvm_published_at);
     for (;;) {
         unsigned i = 0;
         while (i < droidvm_order_count && finger_down(&droidvm_order[i])) ++i;
@@ -257,7 +275,7 @@ static void touch_frame(void) {
             if (!known) {
                 // Tracking ids grow with every new contact: successive fingers of one slot get different identifiers.
                 uint8_t id = s < DROIDVM_INPUT_SLOTS ? (uint8_t)(1 + (uint32_t)d->slots[s].id % 120) : 127;
-                next[n++] = (struct droidvm_finger){(uint8_t)k, (uint8_t)s, id, 0, 0};
+                next[n++] = (struct droidvm_finger){(uint8_t)k, (uint8_t)s, id, true, 0, 0};
             }
         }
     }
@@ -267,6 +285,9 @@ static void touch_frame(void) {
         int32_t y = next[i].slot < DROIDVM_INPUT_SLOTS ? d->slots[next[i].slot].y : d->pointer_y;
         next[i].x = input_scale(x, d->min_x, d->span_x, DROIDVM_TOUCH_AXIS_X);
         next[i].y = input_scale(y, d->min_y, d->span_y, DROIDVM_TOUCH_AXIS_Y);
+        if (next[i].fresh && next[i].y >= DROIDVM_TOUCH_AXIS_Y * (100 - DROIDVM_TOUCH_BOTTOM_SNAP) / 100)
+            next[i].y = DROIDVM_TOUCH_AXIS_Y - 1;
+        next[i].fresh = false;
     }
     memcpy(droidvm_order, next, n * sizeof(next[0]));
     droidvm_order_count = n;
@@ -291,20 +312,22 @@ static bool input_event(struct droidvm_input *d, const struct droidvm_input_even
     return false;
 }
 
-// Takes what the device wrote, gives the buffers back; true when a frame ended.
-static bool input_poll(struct droidvm_input *d) {
+// Takes what the device wrote, frame by frame, and gives the buffers back.
+static void input_poll(struct droidvm_input *d) {
     uint8_t *page = droidvm_input_queues[d->index][0];
     volatile uint16_t *available = (volatile uint16_t *)(page + 1024);
     volatile uint16_t *used = (volatile uint16_t *)(page + 2048);
     const volatile uint32_t *ring = (const volatile uint32_t *)(page + 2052);
-    bool frame = false;
     unsigned returned = 0;
     uint16_t head = available[1];
     while (used[1] != d->used) {
         input_barrier();
         uint32_t id = ring[(d->used % d->size) * 2];
         if (id < d->size) {
-            frame |= input_event(d, &droidvm_input_buffers[d->index][id]);
+            if (input_event(d, &droidvm_input_buffers[d->index][id])) {
+                droidvm_input_frames = droidvm_input_frames + 1;
+                touch_frame();
+            }
             available[2 + (head + returned) % d->size] = (uint16_t)id;
             ++returned;
         }
@@ -318,18 +341,12 @@ static bool input_poll(struct droidvm_input *d) {
     }
     uint32_t interrupts = input_read32(d, 0x60) & 3;
     if (interrupts) input_write32(d, 0x64, interrupts);
-    return frame;
 }
 
 static void droidvm_input_worker(void *parameter, wait_result_t result) {
     (void)parameter; (void)result;
     for (;;) {
-        bool frame = false;
-        for (unsigned k = 0; k < droidvm_input_count; ++k) frame |= input_poll(&droidvm_inputs[k]);
-        if (frame) {
-            droidvm_input_frames = droidvm_input_frames + 1;
-            touch_frame();
-        }
+        for (unsigned k = 0; k < droidvm_input_count; ++k) input_poll(&droidvm_inputs[k]);
         IOSleep(DROIDVM_INPUT_POLL_MS);
     }
 }

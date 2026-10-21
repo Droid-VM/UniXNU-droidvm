@@ -4,7 +4,8 @@
 // droidvm_export_box through guest memory (tools/rig/export.py); the droidvm-monitor worker answers it here, in
 // the kernel's VFS context, with a file's bytes or a directory's entries in droidvm_export_data.
 //
-// Read-only: files are opened FREAD and O_NOFOLLOW, nothing is created or changed.
+// Files are only read (FREAD, O_NOFOLLOW), nothing is created or changed; the one action is a signal to a process, for a
+// userland that hangs where launchd would restart it (a SpringBoard deadlocked at launch).
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
@@ -14,13 +15,15 @@
 #include <sys/dirent.h>
 #include <sys/fcntl.h>
 #include <sys/kauth.h>
+#include <sys/signal.h>
 
 #define DROIDVM_EXPORT_BYTES (1u << 20)
 
 // request: the host bumps it after writing kind, offset and path; done: set to request once data and status are
 // final. kind 0 reads up to DROIDVM_EXPORT_BYTES of a regular file from offset (total = its size); kind 1 lists a
 // directory as "<d_type> <name>\n" lines from entry offset (total = entries listed, length = bytes); kind 2 lists the
-// processes as "<pid> <ppid> <name>\n" lines (path unused; total = processes).
+// processes as "<pid> <ppid> <name>\n" lines (path unused; total = processes); kind 3 sends signal `length` to process
+// `offset` (not to launchd or the kernel).
 struct droidvm_export {
 	volatile uint32_t request, done;
 	uint32_t kind;
@@ -118,7 +121,16 @@ void droidvm_export_poll(void) {
 	path[sizeof(path) - 1] = 0;
 	uint64_t length = 0, total = 0;
 	int status = EINVAL;
-	if (droidvm_export_box.kind == 2) {
+	if (droidvm_export_box.kind == 3) {
+		int pid = (int)droidvm_export_box.offset, signal = (int)droidvm_export_box.length;
+		proc_t target = pid > 1 && signal > 0 && signal < NSIG ? proc_find(pid) : PROC_NULL;
+		status = ESRCH;
+		if (target != PROC_NULL) {
+			psignal(target, signal);
+			proc_rele(target);
+			status = 0;
+		}
+	} else if (droidvm_export_box.kind == 2) {
 		struct droidvm_export_cursor cursor = {0, 0};
 		proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, droidvm_export_process, &cursor, NULL, NULL);
 		length = cursor.used;

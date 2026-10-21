@@ -20,6 +20,10 @@ environment: `PHONE`, `VM`); adjust before use elsewhere.
 | `export.py ls\|cat\|get\|ps` | Read guest files, directories and the process list through the kernel's file mailbox |
 | `dsc_sym.py CACHE_DIR SLIDE ADDR...` | Symbolize user addresses against the SystemOS dyld shared cache (run on the Mac) |
 | `home.py` | Press Home |
+| `touch.py tap X Y`, `touch.py swipe X0 Y0 X1 Y1` | Touch the guest screen (pixels of the 1280x800 framebuffer) by writing NativeHidInput's finger set |
+| `load-modules.sh` | Load the DroidVM app's kernel modules after the phone itself restarted |
+| `show-vm.sh` | Bring the app's display of the VM to the front of the phone (a VM restart closes it) |
+| `export.py kill PID [SIGNAL]` | Signal a guest process, e.g. a SpringBoard deadlocked at launch (launchd restarts it) |
 | `make-data-store.sh [GIB]` | Make the labelled sparse disk of the persistent Data store on the phone |
 | `daemon-recover.sh` | Restart droidvmd the way the app does and recreate the VM from its saved config |
 
