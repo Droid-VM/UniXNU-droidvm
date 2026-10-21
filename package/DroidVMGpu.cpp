@@ -255,7 +255,8 @@ int32_t call(uint32_t op, const void *a, uint32_t a_bytes, const void *b, uint32
     droidvm_gpu_stats[0] = droidvm_gpu_stats[0] + 1;
     droidvm_gpu_stats[8] = op;
     droidvm_gpu_stats[9] = uint32_t(status);
-    if (status) droidvm_gpu_stats[1] = droidvm_gpu_stats[1] + 1;
+    if (status && !(op == DROIDVM_GPU_OP_WAIT && status == -110 /* ETIMEDOUT: the normal answer of a wait */))
+        droidvm_gpu_stats[1] = droidvm_gpu_stats[1] + 1;
     return status;
 }
 

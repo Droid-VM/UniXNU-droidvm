@@ -12,6 +12,7 @@ the environment wins):
 | `VM` | id of the UniXNU VM in the DroidVM daemon (`vm_list`) |
 | `DVMIPC` | path of the DroidVM daemon's IPC client, `dvmipc.py` |
 | `BUILD_HOST`, `BUILD_OUT` | `deploy.sh`: the build Mac (`user@host`) and `out/droidvm` of its UniXNU checkout |
+| `REPO` | `deploy.sh`, `swap-adt.sh`: the device repository, when the rig is not its `tools/rig` |
 
 | Tool | Use |
 | --- | --- |

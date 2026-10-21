@@ -150,6 +150,9 @@ kernel_args = [
   # mounted over /System/Library/Extensions
   "droidvm-gpu-metal=1",
   "sheng-gpu-addon=1",
+  # the processes besides backboardd that get a Metal device of their own (DroidVMLaunchPolicy.c writes the plugin's clients file):
+  # WidgetRenderer draws the widgets through RenderBox, PosterBoard the wallpaper
+  "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard",
 ]
 
 [payload.adt]

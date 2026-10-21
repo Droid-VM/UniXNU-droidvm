@@ -2,9 +2,10 @@
 """Build the DroidVM guest's paravirtual Adreno (kits/droidvm/DroidVMGpu.cpp) with the parts of NativeAdreno it keeps.
 
 NativeAdreno's user client, IOKit surface, execbuf and memory (NativeAdrenoUserClient, NativeAdrenoPublish, NativeAdrenoSubmit,
-NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled unchanged, except for one line of
-NativeAdrenoPublish.cpp: its client windows are absolute addresses of sheng's GPU address space (0x20000000..), and here the
-space is the KGSL VBO the host reserved, so a staged copy offsets them from droidvm_gpu_window_base() (the VBO's start). The
+NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled unchanged, except for one line each of two
+files, compiled from staged copies: NativeAdrenoPublish.cpp's client windows are absolute addresses of sheng's GPU address space
+(0x20000000..), and here the space is the KGSL VBO the host reserved, so they are offset from droidvm_gpu_window_base() (the VBO's
+start); NativeAdrenoUserClient.cpp's setScope() refuses a new connection while the render server has jobs in flight (below). The
 hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer) come from DroidVMGpu.cpp instead of their own sources.
 The staged AGXAccelerator (build-native-adreno-accelerator.py) rides along for droidvm-gpu-metal=1.
 
@@ -63,15 +64,25 @@ publish = publish.replace(anchor, anchor + '/* DroidVM: the clients\' windows st
 staged = OUT / 'NativeAdrenoPublish.cpp'
 staged.write_text(publish)
 
+# A new connection's setScope() also asks whether its current queue range has jobs outstanding, and an unscoped core's range is 0,
+# the render server's: while the render server has a job in flight every other process's open fails with kIOReturnBusy (a listed
+# client then keeps the software renderer for good). The old range matters only once the core was scoped.
+client = (ADRENO / 'NativeAdrenoUserClient.cpp').read_text()
+check = 'if(liveObjects() || submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues) ||'
+if client.count(check) != 1:
+    sys.exit('NativeAdrenoUserClient.cpp no longer checks the old queue range in setScope exactly once')
+client = client.replace(check, 'if(liveObjects() || (window_bytes_ && submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues)) ||')
+staged_client = OUT / 'NativeAdrenoUserClient.cpp'
+staged_client.write_text(client)
+
 cxx = recipe('iokit/DEVELOPMENT/IOPlatformExpert.cpo.json')
 c = recipe('bsd/DEVELOPMENT/bsd_init.o.json')
 includes = ['-I', str(ADRENO), '-I', str(ROOT / 'kits/ArmSmmu4K'), '-I', str(ROOT / 'kits/AdrenoPM4'), '-I', str(ROOT / 'kits/droidvm'),
             '-I', str(ROOT / '.cache/xnu-work/osfmk')]
 warnings = ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-incompatible-sysroot', '-Wno-c99-designator',
             '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion', '-Wno-unnecessary-virtual-specifier']
-sources = [ADRENO / name for name in ('NativeAdrenoUserClient.cpp', 'NativeAdrenoSubmit.cpp', 'NativeAdrenoMemory.cpp',
-                                      'NativeAdrenoCpu.cpp')]
-sources += [staged, ROOT / 'kits/droidvm/DroidVMGpu.cpp']
+sources = [ADRENO / name for name in ('NativeAdrenoSubmit.cpp', 'NativeAdrenoMemory.cpp', 'NativeAdrenoCpu.cpp')]
+sources += [staged_client, staged, ROOT / 'kits/droidvm/DroidVMGpu.cpp']
 objects = []
 for source in sources:
     obj = OUT / (source.stem + '.o')
@@ -95,7 +106,8 @@ if missing:
     sys.exit('Definitions absent: ' + ', '.join(missing))
 (OUT / 'objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in objects], indent=2) + '\n')
 (OUT / 'sources.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in
-                                              sources[:-2] + [ADRENO / 'NativeAdrenoPublish.cpp', sources[-1],
+                                              sources[:-3] + [ADRENO / 'NativeAdrenoUserClient.cpp',
+                                                              ADRENO / 'NativeAdrenoPublish.cpp', sources[-1],
                                                               ROOT / 'kits/droidvm/DroidVMGpuWire.h',
                                                               ROOT / 'kits/AdrenoPM4/AdrenoPM4.c',
                                                               ADRENO / 'NativeAdrenoAccelerator.cpp']], indent=2) + '\n')

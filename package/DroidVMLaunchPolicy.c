@@ -24,7 +24,7 @@ static char policy[768],jobs[200];
 volatile int droidvm_launch_policy_status=-1;
 volatile unsigned droidvm_launch_policy_calls;
 
-int native_board_launch_policy(void *process, uint64_t scratch) {
+static int write_overrides(void *process, uint64_t scratch) {
  proc_t p=process;
  int error=0,fd=-1;int32_t result=0;
  droidvm_launch_policy_calls=droidvm_launch_policy_calls+1;
@@ -84,5 +84,51 @@ int native_board_launch_policy(void *process, uint64_t scratch) {
  }
  droidvm_launch_policy_status=error;
  printf("droidvm launchd overrides (%s): %d\n",jobs,error);
+ return error;
+}
+
+// droidvm-gpu-clients=<name>[,<name>...] ("*" = every process): the processes besides the render server that the Adreno Metal plugin
+// gives a native Metal device. The plugin reads NativeAdrenoMetal.clients beside its bundle, which is this Data directory in the addon
+// mount's view of /System/Library/Extensions (sheng-gpu-addon=1), so the list changes with a boot argument instead of a new Data seed.
+// Written before every launchd attempt like the overrides; without the argument the file the Data seed carries stays. A failure is
+// recorded, never fatal (the hook's errors panic): the processes then keep the software renderer.
+static char clients[200];
+volatile int droidvm_gpu_clients_status=-1;
+static int write_gpu_clients(proc_t p, uint64_t scratch) {
+ if(!PE_parse_boot_argn("droidvm-gpu-clients",clients,sizeof(clients)))return 0;
+ clients[sizeof(clients)-2]=0;
+ size_t length=strlen(clients);
+ for(size_t i=0;i<length;++i) {
+  const char c=clients[i];
+  if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='.'||c=='-'||c=='_'||c=='*'||c==','))return EINVAL;
+  if(c==',')clients[i]='\n';
+ }
+ clients[length++]='\n';clients[length]=0;
+ const char *path="/private/var/ngpu/addons/NativeAdrenoMetal.clients";
+ int error=0,fd=-1;int32_t result=0;
+ if((error=copyout(path,scratch,strlen(path)+1)))return error;
+ struct open_args op={.path=scratch,.flags=O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW,.mode=0644};
+ if((error=open(p,&op,&result)))return error;
+ fd=result;
+ if((error=copyout(clients,scratch+0x200,length)))goto done;
+ struct write_args wr={.fd=fd,.cbuf=scratch+0x200,.nbyte=length};
+ user_ssize_t written=0;
+ if((error=write(p,&wr,&written)))goto done;
+ if(written!=(user_ssize_t)length){error=EIO;goto done;}
+ struct fchown_args owner={.fd=fd,.uid=0,.gid=0};
+ if((error=fchown(p,&owner,&result)))goto done;
+ struct fchmod_args mode={.fd=fd,.mode=0644};
+ if((error=fchmod(p,&mode,&result)))goto done;
+ struct fsync_args sync={.fd=fd};
+ error=fsync(p,&sync,&result);
+ done:
+ {struct close_args cl={.fd=fd};int e=sys_close(p,&cl,&result);if(!error)error=e;}
+ return error;
+}
+
+int native_board_launch_policy(void *process, uint64_t scratch) {
+ const int error=write_overrides(process,scratch);
+ droidvm_gpu_clients_status=write_gpu_clients(process,scratch);
+ if(clients[0])printf("droidvm GPU clients: %d\n",droidvm_gpu_clients_status);
  return error;
 }
