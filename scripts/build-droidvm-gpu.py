@@ -2,12 +2,13 @@
 """Build the DroidVM guest's paravirtual Adreno (kits/droidvm/DroidVMGpu.cpp) with the parts of NativeAdreno it keeps.
 
 NativeAdreno's user client, IOKit surface, execbuf and memory (NativeAdrenoUserClient, NativeAdrenoPublish, NativeAdrenoSubmit,
-NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled unchanged, except for one line each of two
+NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled unchanged, except for a few lines of two
 files, compiled from staged copies: NativeAdrenoPublish.cpp's client windows are absolute addresses of sheng's GPU address space
 (0x20000000..), and here the space is the KGSL VBO the host reserved, so they are offset from droidvm_gpu_window_base() (the VBO's
-start); NativeAdrenoUserClient.cpp's setScope() refuses a new connection while the render server has jobs in flight (below). The
-hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer) come from DroidVMGpu.cpp instead of their own sources.
-The staged AGXAccelerator (build-native-adreno-accelerator.py) rides along for droidvm-gpu-metal=1.
+start), and there are six of them instead of three (below); NativeAdrenoUserClient.cpp's setScope() refuses a new connection
+while the render server has jobs in flight (below). The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer)
+come from DroidVMGpu.cpp instead of their own sources. The staged AGXAccelerator (build-native-adreno-accelerator.py) rides
+along for droidvm-gpu-metal=1.
 
 The objects land in build/droidvm-gpu; build-native-legacy-display.py archives them into the late display archive, which the
 kernel force-loads (this board does not select CONFIG_XNU_NATIVE_ADRENO, the sheng GPU)."""
@@ -61,6 +62,18 @@ if publish.count(anchor) != 1:
     sys.exit('NativeAdrenoPublish.cpp include anchor not found')
 publish = publish.replace(anchor, anchor + '/* DroidVM: the clients\' windows start at the VBO (kits/droidvm/DroidVMGpu.cpp). */\n'
                           'extern "C" uint64_t droidvm_gpu_window_base(void);\n')
+# Six connections instead of three: the render server, the widget renderer and the wallpaper already take three, and iconservicesagent
+# (the app icons) needs a fourth. The added windows follow the others (256 MiB each), still inside the 3 GiB of the VBO that
+# DroidVMGpu.cpp requires; sheng's aperture ends at the third.
+table = ('enum : unsigned {NativeAdrenoMaxClients=3};\n'
+         'static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={\n'
+         '    {0x20000000ull,0x40000000ull},{0x60000000ull,0x10000000ull},{0x70000000ull,0x10000000ull}};')
+if publish.count(table) != 1:
+    sys.exit('NativeAdrenoPublish.cpp no longer declares the three client windows')
+publish = publish.replace(table, 'enum : unsigned {NativeAdrenoMaxClients=6};\n'
+                          'static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={\n'
+                          '    {0x20000000ull,0x40000000ull},{0x60000000ull,0x10000000ull},{0x70000000ull,0x10000000ull},\n'
+                          '    {0x80000000ull,0x10000000ull},{0x90000000ull,0x10000000ull},{0xa0000000ull,0x10000000ull}};')
 staged = OUT / 'NativeAdrenoPublish.cpp'
 staged.write_text(publish)
 

@@ -113,6 +113,9 @@ kernel_args = [
   "kt_fixed_zones=120",
   "-no_slto_panic",
   "ml-timeout-lock-panic-scale=40",
+  # no ticket lock timeout (default 0.125 s): a vCPU the busy host does not run for that long held a workqueue lock while another
+  # waited, and the waiter panicked the guest
+  "tlto_us=0",
   "-apfs_shared_datavolume",
   "offline-apfs-load=1",
   "offline-mobile-graphics-load=1",
@@ -138,10 +141,13 @@ kernel_args = [
   "droidvm-monitor=1000",            # process samples for the host rig (kits/droidvm/DroidVMStubs.c)
   # the Data disk keeps what the system writes in the store window of the third virtio-mmio disk (kits/droidvm/DroidVMDataStore.c)
   "droidvm-data-persist=2",
-  # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, the services sheng found
-  # in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md), and iconservicesagent, whose CoreImage
-  # context falls back to OpenGL ES without a Metal device of its own and crashes in CI::GLContext on every icon (sheng disables it too)
-  "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd,com.apple.iconservices.iconservicesagent",
+  # the deletable system apps (Weather, Calendar, Notes, Maps, ...): the OS volume's /private/var/staged_system_apps as a read-only
+  # union view over /Applications, since the Data seed carries no copy for the first boot's migration to install (UniXNU
+  # patches/xnu/zzy-owner-staged-apps-mount.patch)
+  "owner-staged-apps=1",
+  # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, and the services sheng found
+  # in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md)
+  "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd",
   # the host phone's GPU through crosvm --droidvm-gpu (kits/droidvm/DroidVMGpu.cpp): NativeAdreno's service over KGSL, after one
   # CP_MEM_WRITE through it
   "droidvm-gpu=1",
@@ -151,14 +157,18 @@ kernel_args = [
   "droidvm-gpu-metal=1",
   "sheng-gpu-addon=1",
   # the processes besides backboardd that get a Metal device of their own (DroidVMLaunchPolicy.c writes the plugin's clients file):
-  # WidgetRenderer draws the widgets through RenderBox, PosterBoard the wallpaper
-  "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard",
+  # WidgetRenderer draws the widgets through RenderBox, PosterBoard the wallpaper, and iconservicesagent the app icons, whose
+  # CoreImage context otherwise falls back to OpenGL ES and crashes in CI::GLContext on every icon (sheng disables the job)
+  "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent",
 ]
 
 [payload.adt]
 tool = "scripts/make-droidvm-adt.py"
 dram_base = "0x80600000"             # the shim's RAM window; crosvm's own FDT lists only the boot region
-owned_memory_size = "0xb0000000"     # 2.75 GiB DarwinBoot window: the RAM run above 4 GiB of the 5 GiB VM
+# DarwinBoot's window only holds what it loads (kernel, device tree, Data seed, trust caches); with --reclaim-memory below the kernel
+# also gets the RAM after it that the firmware frees at ExitBootServices, up to the panic region at the top of guest RAM. The
+# window alone had to fit one free run of the firmware's map, which left the kernel 2.75 GiB of the 5 GiB VM (the run above 4 GiB).
+owned_memory_size = "0x20000000"
 cpu_regs = "0,1,2,3"                 # the VM's 4 vCPUs (crosvm MPIDRs); ArmCpu starts the secondaries with PSCI CPU_ON (sheng-smp=1)
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the original OS volume
 packed_data_ramdisk = true
@@ -169,4 +179,4 @@ chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
 # --virtio-mmio-input puts the app's four input devices (mouse, multi-touch, absolute mouse, keyboard) after the disks, and
 # --droidvm-gpu its GPU after them.
 tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000",
-             "--gpu-mmio", "0x0a007000"]
+             "--gpu-mmio", "0x0a007000", "--reclaim-memory"]

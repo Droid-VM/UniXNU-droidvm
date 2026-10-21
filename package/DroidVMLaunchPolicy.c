@@ -126,9 +126,34 @@ static int write_gpu_clients(proc_t p, uint64_t scratch) {
  return error;
 }
 
+// owner-staged-apps=1 shows the deletable system apps in /Applications through a bindfs view (UniXNU patches/xnu), which is a volume
+// of its own. The first time lsd starts after a boot it drops the apps of every volume but the system's own
+// (_LSServerCleanEphemeralMobileContainersForFirstBoot), and only the first boot of a Data store registers them, so they would be gone
+// from the second boot on. lsd skips that first-boot work when the POSIX named semaphore com.apple.lsd.firstboot exists (it makes it
+// once the work is done; the semaphore lives until the next boot), so it is made here, readable by lsd's user (mobile). Never fatal.
+volatile int droidvm_lsd_firstboot_status=-1;
+static int mark_lsd_first_boot_done(proc_t p, uint64_t scratch) {
+ uint32_t staged=0;
+ if(!PE_parse_boot_argn("owner-staged-apps",&staged,sizeof(staged)) || staged!=1)return 0;
+ const char *name="com.apple.lsd.firstboot";
+ int error=copyout(name,scratch,strlen(name)+1);
+ if(error)return error;
+ struct sem_open_args op={.name=scratch,.oflag=O_CREAT,.mode=0444,.value=0};
+ user_addr_t sem=0;
+ int32_t result=0;
+ if((error=sem_open(p,&op,&sem)))return error;
+ struct sem_close_args cl={.sem=sem};
+ return sem_close(p,&cl,&result);
+}
+
+// The calendar clock from the host before launchd and everything it starts read the time (DroidVMClock.c); never fatal.
+extern void droidvm_rtc_set_calendar(void);
+
 int native_board_launch_policy(void *process, uint64_t scratch) {
+ droidvm_rtc_set_calendar();
  const int error=write_overrides(process,scratch);
  droidvm_gpu_clients_status=write_gpu_clients(process,scratch);
+ droidvm_lsd_firstboot_status=mark_lsd_first_boot_done(process,scratch);
  if(clients[0])printf("droidvm GPU clients: %d\n",droidvm_gpu_clients_status);
  return error;
 }

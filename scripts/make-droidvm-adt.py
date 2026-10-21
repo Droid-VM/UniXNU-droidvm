@@ -18,6 +18,8 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
     --virtio-mmio-input (package/DroidVMVirtioInput.c), compatible "droidvm,virtio-input"
   - /arm-io/gpu: the "virtio,mmio" node at --gpu-mmio instead, crosvm's --droidvm-gpu device
     (package/DroidVMGpu.cpp, the host's KGSL), compatible "droidvm,gpu"
+  - /chosen darwinboot-memory-limit (--reclaim-memory): DarwinBoot also gives the kernel the RAM after its window that the
+    firmware frees at ExitBootServices, up to this address (the panic region); /defaults kern.maxvnodes is sized for it
   - /chosen dram-base, dram-size: the guest RAM. A pseudo-unprotected VM declares only its small
     boot region in the crosvm FDT; its boot shim accepts the RAM window and rewrites /memory at
     run time (console: "SHIM: /memory now BASE+SIZE"), so --dram-base and --dram-size give it.
@@ -204,6 +206,9 @@ def main():
                         help='Bases of the FDT virtio-mmio windows of the input devices, comma-separated (/arm-io/input-N)')
     parser.add_argument('--gpu-mmio', type=lambda value: int(value, 0), default=None,
                         help='Base of the FDT virtio-mmio window of the droidvm-gpu device (/arm-io/gpu)')
+    parser.add_argument('--reclaim-memory', action='store_true',
+                        help='/chosen/darwinboot-memory-limit: DarwinBoot also hands the kernel the RAM after its window that the '
+                             'firmware frees at ExitBootServices, up to the panic region (or the end of guest RAM)')
     args = parser.parse_args()
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
@@ -241,6 +246,12 @@ def main():
     else:
         base, _, size = args.panic_region.partition(':')
         panic_region = (int(base, 0), int(size, 0))
+    # The end of the kernel's memory when DarwinBoot extends its window: the panic region, which the kernel maps as I/O, stays out.
+    memory_limit = None
+    if args.reclaim_memory:
+        memory_limit = (panic_region[0] if panic_region else dram_base + args.dram_size) & ~0x1fffff
+    # The memory the kernel manages: its window, or about everything up to the limit when the window is extended.
+    kernel_memory = memory_limit - dram_base if memory_limit else (args.owned_memory_size or args.dram_size)
     if panic_region and (panic_region[0] % 0x4000 or panic_region[1] % 0x4000 or not 0x4000 <= panic_region[1] < 1 << 32):
         parser.error('--panic-region must be 16 KiB aligned and below 4 GiB in size')
     dist, dist_size, redist, redist_size = vm['gic']
@@ -281,6 +292,7 @@ def main():
                           if args.ipad_identity else []),
                         *([('ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
                         *([('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))] if args.owned_memory_size else []),
+                        *([('darwinboot-memory-limit', struct.pack('<Q', memory_limit))] if memory_limit else []),
                         ('dram-base', struct.pack('<Q', dram_base)),
                         ('dram-size', struct.pack('<Q', args.dram_size)),
                         ('crypto-hash-method', b'sha2-384\0'),
@@ -299,7 +311,11 @@ def main():
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', psci_method.encode() + b'\0')])] if len(cpus) > 1 else []),
         # The guest really runs under a hypervisor: XNU publishes this as kern.hv_vmm_present.
         *([node('pram', [('reg', struct.pack('<QQ', *panic_region))])] if panic_region else []),
-        node('defaults', [('sleep-disabled', struct.pack('<I', 1)), ('vmm-present', struct.pack('<I', 1))]),
+        # kern.maxvnodes: the vnode limit XNU sizes from memory, (bytes / 64 KiB) + 1024, over the memory the kernel manages. Without it
+        # the BCM2837 configuration this 4K kernel is built from clips the limit to its CONFIG_VNODES (1024, a Raspberry Pi 3), and the
+        # vnode jetsam then kills every idle process, an app's prewarmed instance among them, as soon as the system holds ~2000 vnodes.
+        node('defaults', [('sleep-disabled', struct.pack('<I', 1)), ('vmm-present', struct.pack('<I', 1)),
+                          ('kern.maxvnodes', struct.pack('<I', kernel_memory // 0x10000 + 1024))]),
         node('options', []),
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
                             ('button-names', b'hold\0voldown\0volup\0'),
