@@ -2,8 +2,15 @@
 
 A DroidVM guest has no XNU serial console, but the host can read guest RAM: crosvm maps it from a memfd,
 and the guest PA of a byte is its memfd offset plus 0x80000000. These tools read the running kernel from
-the phone over adb (root). They assume the lab setup (phone, VM id and paths in each script's header or
-environment: `PHONE`, `VM`); adjust before use elsewhere.
+the phone over adb (root). Run them from this directory; they keep their working files in `out/` next to
+them, and take the setup from the environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `PHONE` | adb serial of the phone (`adb devices`) |
+| `VM` | id of the UniXNU VM in the DroidVM daemon (`vm_list`) |
+| `DVMIPC` | path of the DroidVM daemon's IPC client, `dvmipc.py` |
+| `BUILD_HOST`, `BUILD_OUT` | `deploy.sh`: the build Mac (`user@host`) and `out/droidvm` of its UniXNU checkout |
 
 | Tool | Use |
 | --- | --- |
