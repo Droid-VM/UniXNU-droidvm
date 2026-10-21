@@ -3,6 +3,7 @@
 # unixnu-vm.config.json: the VM was created over IPC, so it is not in files/vms.json and a new daemon forgets it.
 # The daemon can abort on a VM stop (fdsan: it closes a descriptor a FileOutputStream owns; app bug, seen 2026-10-21).
 set -euo pipefail
+. "$(dirname "$0")/rigenv.sh"
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}
 A="adb -s $PHONE"
 RUN=/data/data/cn.classfun.droidvm/run

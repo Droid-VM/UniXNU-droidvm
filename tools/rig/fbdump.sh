@@ -2,6 +2,7 @@
 # Read the UniXNU VM's simplefb straight out of crosvm's guest memory and save it as PNG.
 #   fbdump.sh OUT.png [WIDTH HEIGHT STRIDE FBOFFSET]
 set -euo pipefail
+. "$(dirname "$0")/rigenv.sh"
 OUT=$1; W=${2:-1280}; H=${3:-800}; STRIDE=${4:-5120}; OFF=${5:-ffc00000}
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}
 cat > /tmp/fbdump-phone.sh <<PHONE_EOF

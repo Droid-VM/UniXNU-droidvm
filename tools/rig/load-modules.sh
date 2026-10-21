@@ -3,6 +3,7 @@
 # phone that rebooted and whose app UI has not been opened since. Without the Gunyah Host Share module a pseudo-unprotected
 # VM dies at once: "failed to initialize virtual machine (os error 2)".
 set -euo pipefail
+. "$(dirname "$0")/rigenv.sh"
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}
 A="adb -s $PHONE"
 $A shell "su -c '

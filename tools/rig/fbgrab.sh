@@ -2,6 +2,7 @@
 # Coherent framebuffer capture of the UniXNU VM (memgrab: mmap the guest memfd + dc civac), saved as PNG.
 #   fbgrab.sh OUT.png [WIDTH HEIGHT STRIDE MEMFD_OFFSET]
 set -euo pipefail
+. "$(dirname "$0")/rigenv.sh"
 OUT=$1
 [ -f $(dirname "$0")/out/handoff.env ] && . $(dirname "$0")/out/handoff.env
 W=${2:-${FB_WIDTH:-1280}}; H=${3:-${FB_HEIGHT:-800}}; STRIDE=${4:-${FB_STRIDE:-5120}}

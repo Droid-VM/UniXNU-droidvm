@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 
+import rigenv  # noqa: F401  (PHONE, DVMIPC from rig.env)
 PHONE = __import__('os').environ['PHONE']   # the adb serial of the phone
 NM = __import__('os').path.join(__import__('os').path.dirname(__import__('os').path.abspath(__file__)), 'out', 'kernel.nm')
 KERNEL_VA = 0xFFFFFFF00427C000

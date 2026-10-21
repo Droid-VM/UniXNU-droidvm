@@ -1,2 +1,5 @@
 .cache/
 unixnu.lock
+tools/rig/rig.env
+tools/rig/out/
+tools/rig/__pycache__/

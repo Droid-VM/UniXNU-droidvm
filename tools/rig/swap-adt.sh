@@ -2,6 +2,7 @@
 # Regenerate the ADT of the DroidVM boot disk on Linux and push the disk to the phone (no Mac rebuild).
 #   swap-adt.sh [extra make-droidvm-adt.py args...]
 set -euo pipefail
+. "$(dirname "$0")/rigenv.sh"
 RIG=$(cd "$(dirname "$0")" && pwd)
 DISK=$RIG/out/droidvm-disk.img
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}

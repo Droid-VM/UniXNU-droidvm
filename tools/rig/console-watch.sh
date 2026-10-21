@@ -3,6 +3,7 @@
 # out/console-live.txt, and each change is stamped with the host time in out/console-live.times, so a phone that
 # goes down mid-boot still leaves the last guest line and when it came.   console-watch.sh [SECONDS, default 300]
 set -uo pipefail
+. "$(dirname "$0")/rigenv.sh"
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}
 VM=${VM:?set VM to the id of the UniXNU VM}
 O=$(dirname "$0")/out

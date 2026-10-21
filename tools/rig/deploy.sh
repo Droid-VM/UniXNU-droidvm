@@ -3,6 +3,7 @@
 # README.md), put a copy of the kernel with the early exception catcher on
 # the disk and push it to the phone.   deploy.sh [patch-early-probe.py args, e.g. --ubsan nop]
 set -euo pipefail
+. "$(dirname "$0")/rigenv.sh"
 RIG=$(cd "$(dirname "$0")" && pwd)
 O=$RIG/out
 MAC=${BUILD_HOST:?set BUILD_HOST to the build Mac, user@host}

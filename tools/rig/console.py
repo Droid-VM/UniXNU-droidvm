@@ -2,6 +2,7 @@
 """Print a DroidVM VM's serial console history (the daemon returns it URL-encoded per port)."""
 import json, subprocess, sys, urllib.parse
 port, token, vm = sys.argv[1:4]
+import rigenv  # noqa: F401  (PHONE, DVMIPC from rig.env)
 out = subprocess.run(['python3', __import__('os').environ['DVMIPC'], port, token,
                       'vm_console_history', json.dumps({'vm_id': vm})], capture_output=True, text=True, timeout=60).stdout
 data = json.loads(out[out.index('\n{') + 1:])

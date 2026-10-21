@@ -3,7 +3,8 @@
 A DroidVM guest has no XNU serial console, but the host can read guest RAM: crosvm maps it from a memfd,
 and the guest PA of a byte is its memfd offset plus 0x80000000. These tools read the running kernel from
 the phone over adb (root). Run them from this directory; they keep their working files in `out/` next to
-them, and take the setup from the environment:
+them, and take the setup from the environment, or from `rig.env` beside them (`KEY=value` lines, kept out of git;
+the environment wins):
 
 | Variable | Meaning |
 | --- | --- |

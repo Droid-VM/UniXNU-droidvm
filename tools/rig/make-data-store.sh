@@ -3,6 +3,7 @@
 # is the label "DroidVMDataStore" + version 1, the window after it. Only the blocks the guest writes take space on the phone.
 #   make-data-store.sh [SIZE_GIB, default 16]      refuses to touch an existing file (delete it by hand to start over)
 set -euo pipefail
+. "$(dirname "$0")/rigenv.sh"
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}
 FILE=${FILE:-/data/media/0/DroidVM/UniXNU/data-store.img}
 GIB=${1:-16}
