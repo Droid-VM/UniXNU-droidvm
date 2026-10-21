@@ -261,6 +261,9 @@ run([str(store_source) if arg==str(process_source) else str(store_obj) if arg==s
 input_source=ROOT/'kits/droidvm/DroidVMVirtioInput.c'
 input_obj=OUT/'DroidVMVirtioInput.o'
 run([str(input_source) if arg==str(process_source) else str(input_obj) if arg==str(process_obj) else arg for arg in process_cmd],cwd=pr['directory'])
+# The paravirtual Adreno over the host's KGSL (scripts/build-droidvm-gpu.py, an earlier archive step), with the NativeAdreno parts it keeps.
+gpu_objects=[ROOT/p for p in json.loads((ROOT/'build/droidvm-gpu/objects.json').read_text())]
+gpu_sources=[ROOT/p for p in json.loads((ROOT/'build/droidvm-gpu/sources.json').read_text())]
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end='')
 hid_dir=ROOT/'build/native-hid-input'
@@ -273,11 +276,13 @@ run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func',
 require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/'NativeKeyStoreEvents.o').read_bytes()))==
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned event-service instructions unchanged by late init staging')
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDisplayProbe.o',hid_obj,keystore_obj,process_obj,trace_obj,
-     hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',keyevents_late,stub_obj,policy_obj,export_obj,store_obj,input_obj])
+     hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',keyevents_late,stub_obj,policy_obj,export_obj,store_obj,input_obj,
+     *gpu_objects])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',
          ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,hid_source,keystore_source,process_source,trace_source,ROOT/'kits/droidvm/BootUiTraceCore.h',ROOT/'kits/droidvm/BootUiTraceDetails.h',
          ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',
-         ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',stub_source,policy_source,export_source,store_source,input_source]
+         ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',stub_source,policy_source,export_source,store_source,input_source,
+         *gpu_sources]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

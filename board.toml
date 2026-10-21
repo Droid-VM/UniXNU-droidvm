@@ -44,6 +44,8 @@ archives = [
   "build-arm-driver.py NativeRamBlock",
   "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
   "build-libpthread-kernel.py",
+  # The paravirtual Adreno over crosvm's droidvm-gpu device (the host's KGSL); its objects ride in the display archive below.
+  "build-droidvm-gpu.py",
   "build-native-legacy-display.py",
 ]
 
@@ -100,8 +102,11 @@ loader = "driver"
 title = "DroidVM: iPadOS 17.7.11, CPU-rendered desktop"
 dram_size = "0x13f600000"            # guest RAM of the 5120 MiB pseudo-unprotected VM: "SHIM: /memory now 0x80600000+0x13f600000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
+# The original static/System trust caches, and the owner trust bundle built around them with the Adreno Metal plugin's CDHashes
+# (make-owner-trust-bundle.py; it changes with every plugin build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
+  "e0321ddbe32161297142c05c3136dca556239040d22a51f21e188c0bb09ecc7c",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -133,9 +138,18 @@ kernel_args = [
   "droidvm-monitor=1000",            # process samples for the host rig (kits/droidvm/DroidVMStubs.c)
   # the Data disk keeps what the system writes in the store window of the third virtio-mmio disk (kits/droidvm/DroidVMDataStore.c)
   "droidvm-data-persist=2",
-  # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, and the services
-  # sheng found in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md)
-  "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd",
+  # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, the services sheng found
+  # in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md), and iconservicesagent, whose CoreImage
+  # context falls back to OpenGL ES without a Metal device of its own and crashes in CI::GLContext on every icon (sheng disables it too)
+  "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd,com.apple.iconservices.iconservicesagent",
+  # the host phone's GPU through crosvm --droidvm-gpu (kits/droidvm/DroidVMGpu.cpp): NativeAdreno's service over KGSL, after one
+  # CP_MEM_WRITE through it
+  "droidvm-gpu=1",
+  "droidvm-gpu-selftest=1",
+  # the AGXAccelerator for the original Metal discovery, and the plugin bundle (staged in the Data seed by add-gpu-plugin-data.py)
+  # mounted over /System/Library/Extensions
+  "droidvm-gpu-metal=1",
+  "sheng-gpu-addon=1",
 ]
 
 [payload.adt]
@@ -149,5 +163,7 @@ ipad_identity = true
 unique_chip_id = "required"
 chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
 # The third crosvm --virtio-mmio-block (tools/rig/make-data-store.sh) is the store disk, not a NativeVirtioBlock image;
-# --virtio-mmio-input puts the app's four input devices (mouse, multi-touch, absolute mouse, keyboard) after the disks.
-tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000"]
+# --virtio-mmio-input puts the app's four input devices (mouse, multi-touch, absolute mouse, keyboard) after the disks, and
+# --droidvm-gpu its GPU after them.
+tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000",
+             "--gpu-mmio", "0x0a007000"]

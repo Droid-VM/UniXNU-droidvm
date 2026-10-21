@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 //
 // Definitions the shared display/HID/key-store probes expect from sheng's board objects, which a DroidVM
-// guest does not link: there is no SPI touch panel, cpufreq or Adreno power domain to probe.
+// guest does not link: there is no SPI touch panel, cpufreq or Adreno power domain to probe (the GPU hook,
+// sheng_gpu_power_probe, is DroidVMGpu.cpp's: the host's GPU through crosvm's droidvm-gpu device).
 //
 // The touch digitizer of NativeHidInput (sheng-touch-hid=1) reads its finger set from these globals with a
 // seqlock (odd while being written). On sheng the touch probe fills them; in a DroidVM guest the app's touch
@@ -76,7 +77,6 @@ void native_touch_probe(void) {
         thread_deallocate(thread);
 }
 void sheng_cpufreq_probe(void) {}
-void sheng_gpu_power_probe(void) {}
 
 // The shared probes declare sheng's diagnostic page (BootProgress.c) weak and test for it, but a static kernel link
 // still needs a definition. These keep the behaviour of a board without it: no diagnostic writer to yield to and no
@@ -89,6 +89,13 @@ int boot_progress_pulse_anchor(uintptr_t base, uint64_t bytes, unsigned width, u
 }
 // The one message the display probe would put on the diagnostic page goes to the kernel log instead.
 void boot_progress_stage(const char *message) { printf("boot-progress: %s\n", message); }
+
+// NativeAdrenoPublish hands the render server's pipeline caches to sheng's UFS log (BootLog.c) piece by piece; this board has no
+// export area, so every piece is refused (the render server keeps its caches in memory).
+int boot_log_export_put(uint32_t generation, uint32_t total, uint32_t offset, const void *data, uint32_t size) {
+    (void)generation; (void)total; (void)offset; (void)data; (void)size;
+    return -1;
+}
 
 // NativeVirtioBlock asks NativeUfs whether a provider is a UFS window; -1 says it is not.
 int native_ufs_block_authenticates(void *provider, const char *uuid, uint8_t *digest) {
