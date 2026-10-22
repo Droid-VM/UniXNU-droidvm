@@ -106,7 +106,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "b6d0120b97fe90c9c69c06c2c0f21031a5b1bc97b75f354eaa59e08e7fec22c5",
+  "c31546bcbc92e0de0835849a49f213316fef96120cad98d7b1199288979e6689",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -157,6 +157,11 @@ kernel_args = [
   # ignores its own amfi_* boot-args, so XNU clears the error itself (patches/xnu/zzy-owner-staged-apps-mount.patch). This
   # VM is not a security boundary.
   "owner-skip-launch-constraints=1",
+  # start the owner service manager once at boot. launchd takes its jobs from the signed compiled cache and ignores an owner
+  # overlay plist's ProgramArguments, and a new label is never enumerated, so no launchd overlay launches an owner binary here;
+  # the kernel launch-policy hook posix_spawns /private/var/ngpu/bin/ownervisor itself (kits/droidvm/DroidVMLaunchPolicy.c,
+  # scripts/build-droidvm-ownervisor.py, scripts/add-ownervisor-data.py). It brings up the owner debug services and the GPU probe.
+  "owner-service-manager=1",
   # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, the services sheng found
   # in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md), and fairplayd, which exits at once
   # without the FairPlayIOKit kext (it does not prelink against this kernel); its MachServices stay registered meanwhile, so

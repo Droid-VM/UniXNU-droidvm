@@ -197,6 +197,32 @@ static int mount_app_cryptex(proc_t p, uint64_t scratch) {
  return 0;
 }
 
+// owner-service-manager=1: start the owner service manager (package/ownervisor) once at boot, from this hook. The launchd
+// overlay the GPU addon mounts does not actually launch an owner binary: launchd takes its jobs from the signed compiled cache
+// (/System/Library/xpc/launchd.plist) and ignores the on-disk plist's ProgramArguments, and a brand-new label is never
+// enumerated. This hook already runs as root with a user scratch page and calls BSD syscalls directly (mount above), so it
+// posix_spawns /private/var/ngpu/bin/ownervisor the same way. ownervisor then brings up the debug services (an ssh server, an
+// IPv6 keepalive) and the GPU probe, so one spawn stands in for a whole launchd job set. Best-effort and never fatal: a failure
+// only leaves the guest without the manager. Retried on each hook call until it succeeds once -- launchd is loaded a few times
+// early in boot, and the first attempt can be too early for a new userspace process.
+volatile int droidvm_service_manager_status=-2;
+static int spawn_service_manager(proc_t p, uint64_t scratch) {
+ static int started;
+ uint32_t enabled=0;
+ if(started || !PE_parse_boot_argn("owner-service-manager",&enabled,sizeof(enabled)) || enabled!=1)return droidvm_service_manager_status;
+ static const char path[]="/private/var/ngpu/bin/ownervisor";
+ user_addr_t argv[2]={scratch,0}, envp[1]={0};
+ int error;
+ if((error=copyout(path,scratch,sizeof(path))) ||
+    (error=copyout(argv,scratch+0x40,sizeof(argv))) ||
+    (error=copyout(envp,scratch+0x60,sizeof(envp))))return error;
+ struct posix_spawn_args request={.pid=scratch+0x68,.path=scratch,.adesc=USER_ADDR_NULL,.argv=scratch+0x40,.envp=scratch+0x60};
+ int32_t result=0;
+ error=posix_spawn(p,&request,&result);
+ if(!error)started=1;
+ return error;
+}
+
 // The calendar clock from the host before launchd and everything it starts read the time (DroidVMClock.c); never fatal.
 extern void droidvm_rtc_set_calendar(void);
 
@@ -207,7 +233,9 @@ int native_board_launch_policy(void *process, uint64_t scratch) {
  droidvm_lsd_firstboot_status=mark_lsd_first_boot_done(process,scratch);
  const int cryptex=mount_app_cryptex(process,scratch);
  if(cryptex || droidvm_app_cryptex_status<0)droidvm_app_cryptex_status=cryptex;
+ droidvm_service_manager_status=spawn_service_manager(process,scratch);
  if(clients[0])printf("droidvm GPU clients: %d\n",droidvm_gpu_clients_status);
  if(droidvm_app_cryptex_status)printf("droidvm App cryptex: %d\n",droidvm_app_cryptex_status);
+ if(droidvm_service_manager_status>0)printf("droidvm service manager: %d\n",droidvm_service_manager_status);
  return error;
 }
