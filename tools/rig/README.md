@@ -16,6 +16,11 @@ the environment wins):
 
 | Tool | Use |
 | --- | --- |
+| `vm.sh restart\|start\|stop\|attach\|health` | Restart the VM (killing its crosvm, which a daemon that aborts on `vm_stop` survives), wait for the first frame or a panic, put its display on the phone until a touch reaches the guest, unlock, print `health.py` |
+| `health.py` | One line each for the kernel (panic?), Data, userland, display and input, the network (en0, the guest's addresses on the phone's wlan0) and new crash reports |
+| `panic.py [--raw]` | Whether the kernel has panicked, and its panic log with kernel addresses symbolized: a panic does not stop this VM, only the panicking vCPU spins |
+| `crashes.py [--all\|--list] [NAME...]` | The guest's new crash reports (ReportCrash's .ips), fetched to `out/crashes/` and summarized: exception, where an uncaught exception was thrown, the crashed thread; a JetsamEvent's killed processes and their reasons |
+| `input.py tap\|long\|swipe\|unlock\|text` | Touch the guest screen through the app's display (Android `input`, real timing), in pixels of the 1280x800 framebuffer; the mapping comes from SurfaceFlinger |
 | `deploy.sh [--ubsan keep\|nop]` | Fetch the kernel built on the Mac, add the early probes, regenerate the ADT, refresh the boot disk, push it |
 | `reboot-vm.sh [WAIT]` | Restart the VM through the DroidVM daemon and print the serial console (UEFI, UniXNU, DarwinBoot) |
 | `peek.py SYMBOL\|0xPA\|va:VA [LEN] [--q\|--str]` | Read guest memory by kernel symbol, physical or kernel virtual address |
@@ -26,12 +31,13 @@ the environment wins):
 | `swap-adt.sh` | Regenerate only the ADT on the boot disk |
 | `console-watch.sh [SECONDS]` | Keep the newest serial console on this machine while the VM boots, stamped with host time (survives a phone that goes down) |
 | `procs.py`, `trace.py` | The droidvm-monitor worker's process samples and UI thread traces (`droidvm-monitor=<ms>`) |
+| `trace.py --focus NAME [--symbolize]` | Trace any process's threads (role T) while the guest runs, e.g. an app that hangs; `--symbolize` names the frames with `dsc_sym.py` on `BUILD_HOST` |
 | `export.py ls\|cat\|get\|ps` | Read guest files, directories and the process list through the kernel's file mailbox |
 | `dsc_sym.py CACHE_DIR SLIDE ADDR...` | Symbolize user addresses against the SystemOS dyld shared cache (run on the Mac) |
 | `home.py` | Press Home |
 | `touch.py tap X Y`, `touch.py swipe X0 Y0 X1 Y1` | Touch the guest screen (pixels of the 1280x800 framebuffer) by writing NativeHidInput's finger set |
 | `load-modules.sh` | Load the DroidVM app's kernel modules after the phone itself restarted |
-| `show-vm.sh` | Bring the app's display of the VM to the front of the phone (a VM restart closes it) |
+| `show-vm.sh` | Bring a fresh display of the VM to the front of the phone (a VM restart closes it; `vm.sh attach` also checks that input arrives) |
 | `export.py kill PID [SIGNAL]` | Signal a guest process, e.g. a SpringBoard deadlocked at launch (launchd restarts it) |
 | `export.py mem PID ADDRESS [LENGTH]`, `umem.py` | Read a guest process's user memory (hex dump; `umem.read`/`umem.q` for scripted pointer walks) |
 | `logarchive.py OUT` | Mirror the guest's unified log (diagnostics + uuidtext) for a tracev3 parser such as mandiant/macos-UnifiedLogs (`unifiedlog_iterator -m log-archive`); reruns fetch only what changed |
@@ -42,5 +48,5 @@ After the phone itself restarts, open the DroidVM app once (or `insmod` the modu
 `files/../usr/lib/modules/<kmi>/`): a pseudo-unprotected VM shares its RAM through `/dev/gunyah_share`, and
 without the Gunyah Host Share module crosvm exits with "failed to initialize virtual machine (os error 2)".
 
-The panic log lands in the `/pram` region of the ADT (default: the last 512 KiB of guest RAM,
-`peek.py 0x17fb80000 0x1000` for a 4 GiB pseudo-unprotected VM).
+The panic log lands in the `/pram` region of the ADT (default: the last 512 KiB of guest RAM); `panic.py` finds it
+from crosvm's RAM mapping and prints it.
