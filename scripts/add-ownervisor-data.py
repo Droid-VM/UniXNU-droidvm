@@ -60,6 +60,13 @@ def main():
             for name in ('ownervisor', 'ownerctl', 'ownertest'):
                 shutil.copyfile(OV / name, bin_dir / name)
                 os.chmod(bin_dir / name, 0o755)
+            # toybox: ~137 coreutils applets + a shell in one trusted multicall binary (scripts/build-droidvm-toybox.py),
+            # so the run verb has real tools on an otherwise bare iPadOS (/bin holds only df and ps). Called as
+            # `toybox <applet> ...`; no symlinks needed. Optional -- staged only when it has been built.
+            toybox = ROOT / 'build/toybox/toybox'
+            if toybox.is_file():
+                shutil.copyfile(toybox, bin_dir / 'toybox')
+                os.chmod(bin_dir / 'toybox', 0o755)
             # The managed services. ownervisor creates run/log/state/control at startup; the seed carries the
             # definitions and the enable markers so they autostart from the first boot.
             services = {
