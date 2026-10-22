@@ -47,6 +47,18 @@ screen starts at the edge, so that the Home gesture can be made from a phone who
 Every virtio-mmio device crosvm offers must be in the ADT: the two phone crashes seen so far (a vCPU stuck in the
 hypervisor ~15 s after start, watchdog reset) both came with devices the guest did not know about.
 
+## Network
+
+The VM config's `networks` entry (the app's br-wifi network, MAC `02:00:00:aa:bb:01`) gives crosvm a `--net` tap, and
+crosvm `--virtio-mmio-net` (branch `wip/virtio-mmio`) puts that device on the virtio-mmio transport after the GPU;
+`tool_args` (`--net-mmio`) publishes it as `/arm-io/net`. `package/DroidVMVirtioNet.c` drives its virtqueues, and
+`package/DroidVMVirtioEthernet.cpp` makes it an IOEthernetController on Apple's IONetworkingFamily, which the kernel does
+not otherwise have: `scripts/build-native-legacy-display.py` fetches IONetworkingFamily-177 (the Darwin 23 release, at a
+pinned commit) and compiles it in. configd names the interface en0 and IPConfiguration leases an address over DHCP. The
+Data seed's network service (`seed-data-skip-setup.py`) is bound to en0, and the seeded interface entry that reserves en0
+matches by MAC, so a different MAC brings the interface up as en1 with no service. br-wifi is a proxy bridge: the guest's
+IPv4 and IPv6 addresses show on the phone's `wlan0` (`ip addr show wlan0`, as /32 and /128).
+
 ## State
 
 | Stage | State |
@@ -58,4 +70,5 @@ hypervisor ~15 s after start, watchdog reset) both came with devices the guest d
 | Data | persistent through the store disk (SM8650) |
 | Kernel log / panic log / files | read from the host through guest RAM (tools/rig) |
 | Input | the app's touch screen (and its absolute pointer) over virtio-input on virtio-mmio (crosvm `--virtio-mmio-input`); Home from the host |
+| Network | en0 over virtio-net on virtio-mmio, bridged to the phone's wifi; DHCP IPv4 and IPv6 (SM8650) |
 | GPU | missing: NativeAdreno drives the real Adreno; a VM needs a virtio-gpu native-context path |

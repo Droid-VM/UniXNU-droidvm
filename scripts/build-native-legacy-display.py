@@ -265,6 +265,65 @@ run([str(store_source) if arg==str(process_source) else str(store_obj) if arg==s
 input_source=ROOT/'kits/droidvm/DroidVMVirtioInput.c'
 input_obj=OUT/'DroidVMVirtioInput.o'
 run([str(input_source) if arg==str(process_source) else str(input_obj) if arg==str(process_obj) else arg for arg in process_cmd],cwd=pr['directory'])
+# The guest's network over virtio-net (virtio-mmio): the virtqueue transport, in the Mach universe.
+net_source=ROOT/'kits/droidvm/DroidVMVirtioNet.c'
+net_obj=OUT/'DroidVMVirtioNet.o'
+run([str(net_source) if arg==str(process_source) else str(net_obj) if arg==str(process_obj) else arg for arg in process_cmd],cwd=pr['directory'])
+# Above the transport, an IOEthernetController from Apple's IONetworkingFamily, which configd needs to name and configure an
+# interface (IONetworkStack, IONetworkInterface) and which the kernel otherwise lacks. Tag 177 is the macOS 14.6 / Darwin 23
+# release (Info.plist 3.4, the version the stock iOS 17 kernelcache carries), fetched at its pinned commit. It and the classes
+# using it are built in the IOKit driver universe (the IOPlatformExpert compile command the Native* drivers use), where bsd and
+# osfmk headers coexist, with every static initializer staged for a late call (DroidVMVirtioNetIf.cpp makes them).
+iokit_record=json.loads((ROOT/'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json').read_text().strip().rstrip(','))
+def iokit_command(source,obj):
+    cmd=[];ia=iokit_record['arguments'];j=0
+    while j<len(ia):
+        v=ia[j]
+        if v==iokit_record['file']:cmd.append(str(source))
+        elif v=='-o':cmd+=['-o',str(obj)];j+=1
+        elif v=='-Xclang' and ia[j+1].startswith('-W'):j+=1
+        elif not v.startswith('-W'):cmd.append(v)
+        j+=1
+    return cmd+['-DLIBKERN_CONSUMED=','-DLIBKERN_RETURNS_RETAINED=','-DLIBKERN_RETURNS_NOT_RETAINED=','-DLIBKERN_CONSUMES_THIS=']
+def stage_late(obj,stem):
+    staged=obj.with_suffix('.late.o')
+    run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func',f'--globalize-symbol=__GLOBAL__sub_I_{stem}.cpp',obj,staged])
+    require(code(obj.read_bytes(),macho(obj.read_bytes()))==code(staged.read_bytes(),macho(staged.read_bytes())),
+            f'{stem} instructions unchanged by late init staging')
+    return staged
+IONET_TAG='IONetworkingFamily-177';IONET_COMMIT='36dbe56b09729a07e9fa0272524e98718394c9f0'
+ionet=ROOT/'build/ionetworking-family';ionet_src=ionet/'src';ionet_include=ionet/'include';(ionet/'obj').mkdir(parents=True,exist_ok=True)
+if not (ionet_src/'.git').exists():
+    run(['git','clone','-q','--depth','1','--branch',IONET_TAG,'https://github.com/apple-oss-distributions/IONetworkingFamily.git',ionet_src])
+require(run(['git','-C',ionet_src,'rev-parse','HEAD'],text=True).strip()==IONET_COMMIT,f'{IONET_TAG} must be commit {IONET_COMMIT}')
+# The sources include their headers as <IOKit/network/...>; IONetworkInterface.cpp also wants the SDK's TargetConditionals.h.
+(ionet_include/'IOKit/network').mkdir(parents=True,exist_ok=True)
+for link,target in [*((ionet_include/'IOKit/network'/h.name,h) for h in ionet_src.glob('*.h')),
+                    (ionet_include/'TargetConditionals.h',Path(sdk)/'usr/include/TargetConditionals.h')]:
+    link.unlink(missing_ok=True);link.symlink_to(target)
+# Every compile here includes sys/systm.h first: the family includes it inside extern "C", where in this private-header universe
+# its zalloc/startup templates cannot be declared. The bsd source tree, last on the path, supplies private headers the export
+# set leaves out (net/classq).
+ionet_flags=['-include','sys/systm.h','-I',str(ROOT/'.cache/xnu-work/osfmk'),'-I',str(ROOT/'.cache/xnu-work/bsd')]
+ionet_objects=[];ionet_sources=sorted(ionet_src.glob('*.cpp'))
+for source in ionet_sources:
+    obj=ionet/'obj'/(source.stem+'.o')
+    run(iokit_command(source,obj)+['-D__PRIVATE_SPI__','-Wno-everything','-I',str(ionet_include),'-I',str(ionet_src)]+ionet_flags,
+        cwd=iokit_record['directory'])
+    ionet_objects.append(stage_late(obj,source.stem))
+require(len(ionet_objects)==12,'IONetworkingFamily-177 has twelve sources')
+# Classes built on the family must see its headers exactly as the family was built: IONetworkController.h and
+# IONetworkInterface.h lay out their vtables and members differently under __PRIVATE_SPI__, and a subclass compiled without it
+# has its overrides in the wrong slots (the family's own getHardwareAddress call then publishes a zero MAC).
+strict=['-D__PRIVATE_SPI__','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-macro-redefined','-Wno-c99-designator',
+        '-Wno-reorder-init-list','-Wno-deprecated-enum-enum-conversion','-Wno-unnecessary-virtual-specifier','-isystem',str(ionet_include)]+ionet_flags
+ethernet_source=ROOT/'kits/droidvm/DroidVMVirtioEthernet.cpp'
+ethernet_obj=OUT/'DroidVMVirtioEthernet.o'
+run(iokit_command(ethernet_source,ethernet_obj)+strict,cwd=iokit_record['directory'])
+ethernet_late=stage_late(ethernet_obj,'DroidVMVirtioEthernet')
+netif_source=ROOT/'kits/droidvm/DroidVMVirtioNetIf.cpp'
+netif_obj=OUT/'DroidVMVirtioNetIf.o'
+run(iokit_command(netif_source,netif_obj)+strict,cwd=iokit_record['directory'])
 # The paravirtual Adreno over the host's KGSL (scripts/build-droidvm-gpu.py, an earlier archive step), with the NativeAdreno parts it keeps.
 gpu_objects=[ROOT/p for p in json.loads((ROOT/'build/droidvm-gpu/objects.json').read_text())]
 gpu_sources=[ROOT/p for p in json.loads((ROOT/'build/droidvm-gpu/sources.json').read_text())]
@@ -280,13 +339,13 @@ run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func',
 require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/'NativeKeyStoreEvents.o').read_bytes()))==
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned event-service instructions unchanged by late init staging')
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDisplayProbe.o',hid_obj,keystore_obj,process_obj,trace_obj,
-     hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',keyevents_late,stub_obj,policy_obj,clock_obj,export_obj,store_obj,input_obj,
-     *gpu_objects])
+     hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',keyevents_late,stub_obj,policy_obj,clock_obj,export_obj,store_obj,input_obj,net_obj,netif_obj,
+     ethernet_late,*ionet_objects,*gpu_objects])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',
          ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,hid_source,keystore_source,process_source,trace_source,ROOT/'kits/droidvm/BootUiTraceCore.h',ROOT/'kits/droidvm/BootUiTraceDetails.h',
          ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',
-         ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',stub_source,policy_source,clock_source,export_source,store_source,input_source,
-         *gpu_sources]
+         ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',stub_source,policy_source,clock_source,export_source,store_source,input_source,net_source,netif_source,
+         ethernet_source,*ionet_sources,*gpu_sources]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

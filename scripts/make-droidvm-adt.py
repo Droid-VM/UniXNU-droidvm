@@ -206,6 +206,8 @@ def main():
                         help='Bases of the FDT virtio-mmio windows of the input devices, comma-separated (/arm-io/input-N)')
     parser.add_argument('--gpu-mmio', type=lambda value: int(value, 0), default=None,
                         help='Base of the FDT virtio-mmio window of the droidvm-gpu device (/arm-io/gpu)')
+    parser.add_argument('--net-mmio', type=lambda value: int(value, 0), default=None,
+                        help='Base of the FDT virtio-mmio window of the virtio-net device (/arm-io/net)')
     parser.add_argument('--reclaim-memory', action='store_true',
                         help='/chosen/darwinboot-memory-limit: DarwinBoot also hands the kernel the RAM after its window that the '
                              'firmware frees at ExitBootServices, up to the panic region (or the end of guest RAM)')
@@ -260,7 +262,7 @@ def main():
     except ValueError:
         parser.error('--input-mmio takes comma-separated addresses')
     virtio_mmio = [window for window in vm['virtio_mmio']
-                   if window[0] not in (args.data_store_mmio, args.gpu_mmio) and window[0] not in input_bases]
+                   if window[0] not in (args.data_store_mmio, args.gpu_mmio, args.net_mmio) and window[0] not in input_bases]
     data_store = [window for window in vm['virtio_mmio'] if window[0] == args.data_store_mmio]
     if args.data_store_mmio is not None and not data_store:
         parser.error(f'the FDT has no virtio-mmio window at {args.data_store_mmio:#x} for --data-store-mmio')
@@ -270,6 +272,10 @@ def main():
     gpu = [window for window in vm['virtio_mmio'] if window[0] == args.gpu_mmio]
     if args.gpu_mmio is not None and (not gpu or args.gpu_mmio in input_bases or args.gpu_mmio == args.data_store_mmio):
         parser.error(f'--gpu-mmio {args.gpu_mmio:#x} must be a virtio-mmio window of the FDT of its own')
+    net = [window for window in vm['virtio_mmio'] if window[0] == args.net_mmio]
+    if args.net_mmio is not None and (not net or args.net_mmio in input_bases or
+                                      args.net_mmio in (args.data_store_mmio, args.gpu_mmio)):
+        parser.error(f'--net-mmio {args.net_mmio:#x} must be a virtio-mmio window of the FDT of its own')
 
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
                                    ('reg', struct.pack('<I', reg)),
@@ -351,7 +357,11 @@ def main():
               *[node('gpu', [('compatible', b'droidvm,gpu\0'),
                              ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
                              ('dma-coherent', b'')])
-                for address, size in gpu]]),
+                for address, size in gpu],
+              *[node('net', [('compatible', b'droidvm,net\0'),
+                             ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                             ('dma-coherent', b'')])
+                for address, size in net]]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
@@ -359,7 +369,7 @@ def main():
           f'psci {psci_method}, dram {dram_base:#x}+{args.dram_size:#x}, timebase {args.timebase}, '
           f'panic {"none" if not panic_region else f"{panic_region[0]:#x}+{panic_region[1]:#x}"}, '
           f'virtio-mmio {[hex(a) for a, _ in virtio_mmio]}, data store {hex(data_store[0][0]) if data_store else "none"}, '
-          f'input {[hex(a) for a, _ in inputs]}, gpu {hex(gpu[0][0]) if gpu else "none"}')
+          f'input {[hex(a) for a, _ in inputs]}, gpu {hex(gpu[0][0]) if gpu else "none"}, net {hex(net[0][0]) if net else "none"}')
 
 
 if __name__ == '__main__':

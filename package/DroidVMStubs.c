@@ -18,6 +18,7 @@ extern void boot_process_capture(void);
 extern void boot_process_snapshot(void);
 extern void droidvm_export_poll(void);
 extern void droidvm_input_start(void);
+extern void droidvm_net_start(void);
 extern unsigned boot_ui_trace_role_rows(unsigned role, char rows[][120], unsigned max, unsigned detail);
 extern unsigned boot_ui_trace_hot_rows(char rows[][120], unsigned max);
 
@@ -70,6 +71,7 @@ static void droidvm_monitor(void *parameter, wait_result_t result) {
 void native_touch_probe(void) {
     thread_t thread;
     droidvm_input_start();
+    droidvm_net_start();
     if (!PE_parse_boot_argn("droidvm-monitor", &droidvm_monitor_interval, sizeof(droidvm_monitor_interval)) ||
         !droidvm_monitor_interval)
         return;
