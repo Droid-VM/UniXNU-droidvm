@@ -5,8 +5,8 @@ NativeAdreno's user client, IOKit surface, execbuf and memory (NativeAdrenoUserC
 NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled unchanged, except for a few lines of two
 files, compiled from staged copies: NativeAdrenoPublish.cpp's client windows are absolute addresses of sheng's GPU address space
 (0x20000000..), and here the space is the KGSL VBO the host reserved, so they are offset from droidvm_gpu_window_base() (the VBO's
-start), and there are six of them instead of three (below); NativeAdrenoUserClient.cpp's setScope() refuses a new connection
-while the render server has jobs in flight (below). The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer)
+start), and there are six of them instead of three, and its user client frees its views the way they were allocated (below);
+NativeAdrenoUserClient.cpp's setScope() refuses a new connection while the render server has jobs in flight (below). The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer)
 come from DroidVMGpu.cpp instead of their own sources. The staged AGXAccelerator (build-native-adreno-accelerator.py) rides
 along for droidvm-gpu-metal=1.
 
@@ -74,6 +74,14 @@ publish = publish.replace(table, 'enum : unsigned {NativeAdrenoMaxClients=6};\n'
                           'static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={\n'
                           '    {0x20000000ull,0x40000000ull},{0x60000000ull,0x10000000ull},{0x70000000ull,0x10000000ull},\n'
                           '    {0x80000000ull,0x10000000ull},{0x90000000ull,0x10000000ull},{0xa0000000ull,0x10000000ull}};')
+# The user client's views are allocated typed (IONewZero: a View holds a descriptor pointer) but were freed to the data heap
+# (IODeleteData), which kfree catches as heap confusion and panics on in AGXDeviceUserClient::free(). Nothing freed a user client
+# while only the render server, which never exits, opened one; the granted clients (DroidVMGpu.cpp grantedProcesses) close theirs.
+# A NativeAdreno bug: the same one-line fix belongs upstream.
+free_views = 'if(views_) {IODeleteData(views_,View,MaxViews);views_=nullptr;}'
+if publish.count(free_views) != 1:
+    sys.exit('NativeAdrenoPublish.cpp no longer frees its views with IODeleteData exactly once')
+publish = publish.replace(free_views, 'if(views_) {IODelete(views_,View,MaxViews);views_=nullptr;}')
 staged = OUT / 'NativeAdrenoPublish.cpp'
 staged.write_text(publish)
 
