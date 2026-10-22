@@ -16,7 +16,9 @@ the environment wins):
 
 | Tool | Use |
 | --- | --- |
-| `vm.sh restart\|start\|stop\|attach\|health` | Restart the VM (killing its crosvm, which a daemon that aborts on `vm_stop` survives), wait for the first frame or a panic, put its display on the phone until a touch reaches the guest, unlock, print `health.py` |
+| `vm.sh restart\|start\|stop\|attach\|health` | Run the VM: stop it through crosvm's control socket, give the hugepage pool 10 s to reclaim and report it; before a start make sure the pool is whole (`acquire=3` when short, refuse if still short); start, wait for the first frame or a panic, put its display on the phone until a touch reaches the guest, unlock, print `health.py` (see `hugepage-harness.md`) |
+| `hostwatch.py [--boot-wait S]` | One line per event while a VM runs, for a monitor: host reboot (boot id or uptime), adb lost, VM up/gone in the hugepage pool's `vm_owners` (requested stop vs crash), the pool 10 s after, a start with no VM (boot failure) |
+| `hugepage-harness.md` | Debugging notes: guest RAM comes only from `gh_hugepage_reserve`, the stop/start procedure, the watcher, the host-crash signature and where its evidence is |
 | `health.py` | One line each for the kernel (panic?), Data, userland, display and input, the network (en0, the guest's addresses on the phone's wlan0) and new crash reports |
 | `panic.py [--raw]` | Whether the kernel has panicked, and its panic log with kernel addresses symbolized: a panic does not stop this VM, only the panicking vCPU spins |
 | `crashes.py [--all\|--list] [NAME...]` | The guest's new crash reports (ReportCrash's .ips), fetched to `out/crashes/` and summarized: exception, where an uncaught exception was thrown, the crashed thread; a JetsamEvent's killed processes and their reasons |
