@@ -16,7 +16,7 @@ build = "21H461"
 device_class = "j120ap"
 chip_id = 0x8011
 board_id = 12
-fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
+fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache", "Cryptex1,AppOS", "Cryptex1,AppTrustCache"]
 
 [ipsw.sha256]
 "044-76040-038.dmg" = "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d"
@@ -106,7 +106,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "60fcc28da7e8ccd4b476278a678eee9dd0787023f53df8350bb05b2b6bd781f4",
+  "b6d0120b97fe90c9c69c06c2c0f21031a5b1bc97b75f354eaa59e08e7fec22c5",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -145,6 +145,9 @@ kernel_args = [
   # union view over /Applications, since the Data seed carries no copy for the first boot's migration to install (UniXNU
   # patches/xnu/zzy-owner-staged-apps-mount.patch)
   "owner-staged-apps=1",
+  # the App cryptex (Safari's daemons, SafariSupport.bundle, Safari's settings pane) from the seed's /private/var/ngpu/preboot shown
+  # read-only over /private/preboot, where /System/Cryptexes/App leads (package/DroidVMLaunchPolicy.c, scripts/add-app-cryptex-data.py)
+  "owner-app-cryptex=1",
   # /private/var/ngpu/bin shown read-only over /usr/libexec, so launchd's cached job for a daemon there (it ignores the plist
   # file's ProgramArguments) execs our binary of the same basename instead. droidvm-diag rides in as /usr/libexec/remindd
   # (scripts/build-droidvm-diag.py).

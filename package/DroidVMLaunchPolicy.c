@@ -13,6 +13,8 @@
 #include <sys/sysproto.h>
 #include <sys/fcntl.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/vnode.h>
 #include <pexpert/pexpert.h>
 
 static const char policy_head[] =
@@ -146,6 +148,55 @@ static int mark_lsd_first_boot_done(proc_t p, uint64_t scratch) {
  return sem_close(p,&cl,&result);
 }
 
+// owner-app-cryptex=1: the cryptexes as iPadOS lays them out under /private/preboot/Cryptexes, which /System/Cryptexes/{App,OS} lead to.
+//  - App (Cryptex1,AppOS: Safari's daemons, SafariSupport.bundle, Safari's settings pane) is owner Data here: the seed carries its files
+//    under /private/var/ngpu/preboot/Cryptexes/App (scripts/add-app-cryptex-data.py), shown read-only over the empty /private/preboot as
+//    the boot-time GPU addon mount does (bindfs, files reported as root's). Its binaries pass AMFI through the cryptex's own trust module,
+//    which the owner trust bundle carries unchanged.
+//  - OS is the SystemOS volume, already a union over the root. The OS volume still reaches it by that path: its framework entries are
+//    links such as /System/Library/PrivateFrameworks/SafariCore.framework -> ../../../System/Cryptexes/OS/System/Library/...
+//    It must not lead back into the union: there a directory's lower layer is the OS volume, whose entries are links into /System/Cryptexes/OS, and
+//    a link to / made getdirentries' union traversal arrive at the same directory forever. So each top-level directory of the SystemOS
+//    volume (/System and /usr, which a lookup from the root finds on that volume) is bound, read-only and not as a union, over its
+//    mount point in the seed's Cryptexes/OS: bindfs looks up in the SystemOS volume itself, with no union below it.
+// Once per boot (the policy runs before every launchd attempt); never fatal.
+extern volatile int native_bindfs_boot_mount;
+volatile int droidvm_app_cryptex_status=-1;
+static int bind_view(proc_t p, uint64_t scratch, const char *source, const char *point, int flags) {
+ struct mount_args request={.type=scratch,.path=scratch+0x20,.flags=MNT_RDONLY|flags,.data=scratch+0x100};
+ int32_t result=0;
+ int error;
+ if((error=copyout("bindfs",request.type,7)) || (error=copyout(point,request.path,strlen(point)+1)) ||
+    (error=copyout(source,request.data,strlen(source)+1)))return error;
+ native_bindfs_boot_mount=1;
+ error=mount(p,&request,&result);
+ native_bindfs_boot_mount=0;
+ return error;
+}
+static int mount_app_cryptex(proc_t p, uint64_t scratch) {
+ static int mounted;
+ static const char *const os[][2]={{"/System","/private/preboot/Cryptexes/OS/System"},{"/usr","/private/preboot/Cryptexes/OS/usr"}};
+ static const char *const visible[]={"/private/preboot/Cryptexes/App/usr/libexec/webbookmarksd",
+  "/System/Cryptexes/OS/System/Library/PrivateFrameworks/SafariCore.framework/Info.plist"};
+ uint32_t enabled=0;
+ if(mounted || !PE_parse_boot_argn("owner-app-cryptex",&enabled,sizeof(enabled)) || enabled!=1)return 0;
+ vnode_t probe=NULLVP;
+ int error=vnode_lookup("/private/var/ngpu/preboot",0,&probe,vfs_context_current());
+ if(error)return error;
+ vnode_put(probe);
+ if((error=bind_view(p,scratch,"/private/var/ngpu/preboot","/private/preboot",MNT_UNION)))return error;
+ mounted=1;
+ for(size_t i=0;i<sizeof(os)/sizeof(os[0]);i++)
+  if((error=bind_view(p,scratch,os[i][0],os[i][1],0)))return error;
+ // A file of each cryptex must be visible where iPadOS looks for it.
+ for(size_t i=0;i<sizeof(visible)/sizeof(visible[0]);i++) {
+  probe=NULLVP;
+  if((error=vnode_lookup(visible[i],0,&probe,vfs_context_current())))return error;
+  vnode_put(probe);
+ }
+ return 0;
+}
+
 // The calendar clock from the host before launchd and everything it starts read the time (DroidVMClock.c); never fatal.
 extern void droidvm_rtc_set_calendar(void);
 
@@ -154,6 +205,9 @@ int native_board_launch_policy(void *process, uint64_t scratch) {
  const int error=write_overrides(process,scratch);
  droidvm_gpu_clients_status=write_gpu_clients(process,scratch);
  droidvm_lsd_firstboot_status=mark_lsd_first_boot_done(process,scratch);
+ const int cryptex=mount_app_cryptex(process,scratch);
+ if(cryptex || droidvm_app_cryptex_status<0)droidvm_app_cryptex_status=cryptex;
  if(clients[0])printf("droidvm GPU clients: %d\n",droidvm_gpu_clients_status);
+ if(droidvm_app_cryptex_status)printf("droidvm App cryptex: %d\n",droidvm_app_cryptex_status);
  return error;
 }
