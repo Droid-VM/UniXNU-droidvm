@@ -30,7 +30,8 @@ export RIG_OUT=${RIG_OUT:-$RIG/out}
 # dead for its grace time is abandoned and stays out of the pool, and a VM started on a short pool is served short (the boot
 # just before the 2026-10-22 host crash was that day's only one with 2 MiB collapses failing and a framebuffer not
 # pool-served). So stop gives the module POOL_SETTLE s to reclaim and reports the pool, and start checks it first and, when
-# short, asks the module to gather (acquire=3) before it starts anything. See hugepage-harness.md; hostwatch.sh watches runs.
+# short, asks the module to gather (acquire=3) before it starts anything. The procedure is hugepage-harness.md at the root of
+# the DroidVM meta repo; hostwatch.py watches runs.
 pool() {
   $A shell "su -c 'cat $POOL/refill_stat $POOL/served_summary 2>/dev/null'" | tr -d '\r' | python3 -c "
 import sys

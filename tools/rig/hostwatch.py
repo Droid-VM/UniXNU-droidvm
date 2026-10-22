@@ -9,7 +9,8 @@
                         (crosvm crashed or was killed)
   POOL ...              the pool --settle s after a VM went: avail/want, active VMs, what the module abandoned
   BOOT FAILED ...       vm.sh asked for a start and no VM took pool pages within --boot-wait s
-vm.sh writes out/vm-request ("start|stop <epoch>") so a requested stop is told from a crash. See hugepage-harness.md."""
+vm.sh writes out/vm-request ("start|stop <epoch>") so a requested stop is told from a crash. See hugepage-harness.md at the root
+of the DroidVM meta repo, which keeps a copy of this watcher for any launcher (deploy/hostwatch)."""
 import argparse
 import os
 import re
