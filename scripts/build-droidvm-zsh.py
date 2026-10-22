@@ -75,7 +75,13 @@ binary = OUT / 'zsh'
 binary.unlink(missing_ok=True)
 shutil.copyfile(src / 'Src/zsh', binary)
 binary.chmod(0o755)
-subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'org.droidvm.zsh', binary], check=True)
+# no-container: an owner tool without it is refused (AMFI launch constraints) when another owner process execs it.
+entitlements = OUT / 'entitlements.plist'
+entitlements.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>'
+                        '<key>com.apple.private.security.no-container</key><true/></dict></plist>\n')
+subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'org.droidvm.zsh',
+                '--entitlements', entitlements, binary], check=True)
 detail = subprocess.run(['codesign', '--display', '--verbose=4', binary], capture_output=True, text=True, check=True).stderr
 assert re.search(r'^Page size=4096$', detail, re.M)
 cdhash = re.search(r'^CDHash=([a-f0-9]{40})$', detail, re.M)[1]

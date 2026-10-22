@@ -73,12 +73,29 @@ def main():
             if zsh.is_file():
                 shutil.copyfile(zsh, bin_dir / 'zsh')
                 os.chmod(bin_dir / 'zsh', 0o755)
+            # dropbear: a pubkey-only ssh server (scripts/build-droidvm-dropbear.py), patched to use zsh as the login shell and
+            # to read authorized_keys from /private/var/ngpu/ssh (export.py put writes there; the home /var/root is not writable
+            # by the rig). The ssh dir is 0700 root so checkfileperm accepts the keys. Optional.
+            dropbear = ROOT / 'build/dropbear'
+            if (dropbear / 'dropbear').is_file():
+                for b in ('dropbear', 'dropbearkey'):
+                    shutil.copyfile(dropbear / b, bin_dir / b)
+                    os.chmod(bin_dir / b, 0o755)
+                ssh_dir = mount / 'ngpu/ssh'
+                ssh_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(ssh_dir, 0o700)
             # The managed services. ownervisor creates run/log/state/control at startup; the seed carries the
             # definitions and the enable markers so they autostart from the first boot.
             services = {
                 'adrenoprobe': {'exec': ['/private/var/ngpu/bin/adrenoprobed'], 'keepalive': False, 'uid': 0},
                 'selftest': {'exec': ['/private/var/ngpu/bin/ownertest', 'boot'], 'keepalive': True, 'throttle': 10},
             }
+            if (dropbear / 'dropbear').is_file():
+                # Foreground (-F) so ownervisor supervises it; log to stderr (-E); generate the host key on first need (-R;
+                # the default path is /private/var/ngpu/ssh, patched in build-droidvm-dropbear.py). pubkey only. Binds every
+                # address on 2222; the login shell is zsh. Needs the rig's key at /private/var/ngpu/ssh/authorized_keys.
+                services['dropbear'] = {'exec': [
+                    '/private/var/ngpu/bin/dropbear', '-F', '-E', '-R', '-p', '2222'], 'keepalive': True, 'throttle': 5}
             svc_dir, en_dir = mount / 'ngpu/ownervisor/services.d', mount / 'ngpu/ownervisor/enabled'
             for d in (mount / 'ngpu/ownervisor', svc_dir, en_dir):
                 d.mkdir(parents=True, exist_ok=True)
