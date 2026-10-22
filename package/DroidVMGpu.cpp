@@ -821,6 +821,10 @@ void publishMetal()
     accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
     accelerator->setProperty("NativeSandboxGrantProcess", "backboardd");
     accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
+    // OpenGL ES finds its renderer the same way: GLEngine loads the bundle this names. The stock accelerator
+    // (AGXAcceleratorG9G) names AppleMetalGLRenderer, Apple's GL on Metal, which then runs on the process's Metal device.
+    // Without it every EAGL context fails, and CoreImage's GL path calls through an empty dispatch table.
+    accelerator->setProperty("IOGLESBundleName", "AppleMetalGLRenderer");
     droidvm_gpu_stats[14] = 4;
     if (!accelerator->attach(IOService::getPlatform())) {accelerator->release(); droidvm_gpu_stats[15] = uint32_t(kIOReturnNotAttached); return;}
     accelerator->registerService();
