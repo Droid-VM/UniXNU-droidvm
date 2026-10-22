@@ -206,8 +206,49 @@ static void writeStatusFile(void) {
         rename(tmp.fileSystemRepresentation, dst.fileSystemRepresentation);
 }
 
+// Run one command to completion and return its output: the guest-side exec channel for the rig (run /usr/bin/log,
+// launchctl, ... and read what they print). Synchronous — the kqueue loop is one thread, so nothing else is reaped while
+// this blocks; a service that exits meanwhile is reaped when the loop resumes. Runs as ownervisor's user (root). stdout and
+// stderr go to one file, capped in the reply; a command past its timeout is killed.
+static NSDictionary *runCommand(NSArray *argvIn, int timeout) {
+    if (![argvIn isKindOfClass:NSArray.class] || argvIn.count == 0) return @{@"ok": @NO, @"error": @"run needs argv:[...]"};
+    for (id a in argvIn) if (![a isKindOfClass:NSString.class]) return @{@"ok": @NO, @"error": @"argv must be strings"};
+    if (timeout <= 0) timeout = 20;
+    NSString *outPath = [P(@"state") stringByAppendingPathComponent:@".run.out"];
+    int argc = (int)argvIn.count;
+    char **argv = calloc(argc + 1, sizeof(char *));
+    for (int i = 0; i < argc; i++) argv[i] = strdup(((NSString *)argvIn[i]).fileSystemRepresentation);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 1, outPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_adddup2(&fa, 1, 2);
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, argv[0], &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    for (int i = 0; i < argc; i++) free(argv[i]);
+    free(argv);
+    if (rc != 0) return @{@"ok": @NO, @"error": [NSString stringWithFormat:@"spawn failed: %s", strerror(rc)]};
+    int status = 0;
+    BOOL timedout = NO;
+    time_t deadline = time(NULL) + timeout;
+    for (;;) {
+        if (waitpid(pid, &status, WNOHANG) == pid) break;
+        if (time(NULL) >= deadline) { kill(pid, SIGKILL); waitpid(pid, &status, 0); timedout = YES; break; }
+        usleep(100000);
+    }
+    NSData *out = [NSData dataWithContentsOfFile:outPath] ?: [NSData data];
+    NSUInteger cap = 256 * 1024;
+    if (out.length > cap) out = [out subdataWithRange:NSMakeRange(out.length - cap, cap)];
+    NSString *text = [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] ?: @"";
+    NSMutableDictionary *rep = [@{@"ok": @YES, @"pid": @(pid), @"output": text} mutableCopy];
+    if (timedout) rep[@"timedout"] = @YES;
+    if (WIFEXITED(status)) rep[@"exit"] = @(WEXITSTATUS(status));
+    else if (WIFSIGNALED(status)) rep[@"signal"] = @(WTERMSIG(status));
+    return rep;
+}
+
 // ---- control ----
-// One request dict -> one reply dict. cmd in {list,status,start,stop,restart,enable,disable,add,remove,reload}.
+// One request dict -> one reply dict. cmd in {list,status,start,stop,restart,enable,disable,add,remove,reload,run}.
 static NSDictionary *handle(NSDictionary *req) {
     NSString *cmd = req[@"cmd"];
     NSString *name = req[@"name"];
@@ -236,6 +277,8 @@ static NSDictionary *handle(NSDictionary *req) {
         [jsonData(req[@"def"]) writeToFile:path atomically:YES];
         return @{@"ok": @YES};
     }
+    if ([cmd isEqual:@"run"])
+        return runCommand(req[@"argv"], [req[@"timeout"] respondsToSelector:@selector(intValue)] ? [req[@"timeout"] intValue] : 0);
 
     if (!name) return @{@"ok": @NO, @"error": @"name required"};
     Service *s = gServices[name];
