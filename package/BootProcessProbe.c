@@ -33,6 +33,12 @@ static unsigned capture_seen,capture_passes,published_passes,published_seen,publ
 static unsigned chrono_focus_initialized;
 static char focus_name[32],focus2_name[32],focus3_name[32],focus4_name[32];
 static unsigned trace_slot[10]={0,1,1};
+// The host rig's choice for the third traced slot (role T) while the guest runs: a process name it writes into guest RAM
+// (trace.py --focus), checked on every pass. Empty leaves the slot to the boot arguments.
+char boot_ui_trace_focus[32];
+static char runtime_focus_name[32];
+static const char *boot_target3;
+static unsigned boot_trace_slot3;
 static const char *targets[]={"launchd","backboardd","SpringBoard","PreBoard","runningboardd","lsd","keybagd","cfprefsd","containermanagerd","kernel_task"};
 // boot-ui-follow=1: follow a wait chain by pid. follow_pid[0] is the process the SpringBoard slot sends to (traced in slot 4, role U),
 // follow_pid[1] the one that process sends to (traced in slot 1, role B); 0 = nothing to follow.
@@ -114,7 +120,14 @@ void boot_process_capture(void) {
   }
   PE_parse_boot_argn("boot-ui-follow",&follow_enabled,sizeof(follow_enabled));
   if(follow_enabled==1)trace_slot[4]=trace_slot[1]=1;
+  boot_target3=targets[3];boot_trace_slot3=trace_slot[3];
   chrono_focus_initialized=1;
+ }
+ if(boot_ui_trace_focus[0]) {
+  memcpy(runtime_focus_name,boot_ui_trace_focus,sizeof(runtime_focus_name));runtime_focus_name[sizeof(runtime_focus_name)-1]=0;
+  targets[3]=runtime_focus_name;trace_slot[3]=1;
+ } else {
+  targets[3]=boot_target3;trace_slot[3]=boot_trace_slot3;
  }
  // The previous pass's traces name the next processes to follow (a busy trace keeps the previous choice).
  if(follow_enabled==1 && boot_ui_trace_role_peer) {
