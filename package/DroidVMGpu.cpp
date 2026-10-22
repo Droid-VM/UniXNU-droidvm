@@ -27,6 +27,8 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOUserClient.h>
 #include <libkern/c++/OSMetaClass.h>
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 #include <mach/kmod.h>
 #include <kern/clock.h>
@@ -796,8 +798,36 @@ void selfTest(unsigned output_bits)
            fence, droidvm_gpu_selftest[3], droidvm_gpu_selftest[4]);
 }
 
+// The processes the accelerator's user client is granted to in place of the sandbox's verdict (NativeSandboxGrantProcess, patch
+// zzw-native-adreno-sandbox-grant): the render server, and each process droidvm-gpu-clients gives a native Metal device of its own
+// (DroidVMLaunchPolicy.c writes the same list for the plugin). Their own profiles refuse this driver's user client as well: without the
+// grant WidgetRenderer_Default and iconservicesagent got no device (Vulkan -3), and CoreImage then crashed in its GL fallback, which
+// left the widgets and every Settings icon blank. "*" (every process) gets no grant; only named processes pass the sandbox.
+OSArray *grantedProcesses()
+{
+    OSArray *names = OSArray::withCapacity(4);
+    if (!names) return nullptr;
+    auto add = [names](const char *name) {
+        if (OSString *string = OSString::withCString(name)) {names->setObject(string); string->release();}
+    };
+    add("backboardd");
+    char clients[200] = {};
+    if (PE_parse_boot_argn("droidvm-gpu-clients", clients, sizeof clients - 1)) {
+        char *name = clients;
+        for (char *at = clients;; ++at) {
+            if (*at && *at != ',') continue;
+            const bool last = !*at;
+            *at = 0;
+            if (*name && strcmp(name, "*") != 0) add(name);
+            if (last) break;
+            name = at + 1;
+        }
+    }
+    return names;
+}
+
 // sheng's publishMetal (UniXNU-sheng GpuPowerProbe.cpp): the staged AGXAccelerator class registered after the original IOGPUFamily
-// loaded, with the two keys the original Metal discovery reads and the render server's sandbox grant.
+// loaded, with the two keys the original Metal discovery reads and the sandbox grant (grantedProcesses).
 void publishMetal()
 {
     droidvm_gpu_stats[14] = 1;
@@ -819,7 +849,12 @@ void publishMetal()
     if (!accelerator) {droidvm_gpu_stats[15] = uint32_t(kIOReturnNoMemory); return;}
     if (!accelerator->init()) {accelerator->release(); droidvm_gpu_stats[15] = uint32_t(kIOReturnError); return;}
     accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
-    accelerator->setProperty("NativeSandboxGrantProcess", "backboardd");
+    if (OSArray *granted = grantedProcesses()) {
+        accelerator->setProperty("NativeSandboxGrantProcess", granted);
+        granted->release();
+    } else {
+        accelerator->setProperty("NativeSandboxGrantProcess", "backboardd");
+    }
     accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
     // OpenGL ES finds its renderer the same way: GLEngine loads the bundle this names. The stock accelerator
     // (AGXAcceleratorG9G) names AppleMetalGLRenderer, Apple's GL on Metal, which then runs on the process's Metal device.
