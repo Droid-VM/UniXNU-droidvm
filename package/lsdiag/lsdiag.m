@@ -93,6 +93,45 @@ static void extension(NSString *identifier) {
          call(containing, "bundleIdentifier"), [call(containing, "bundleURL") path]);
 }
 
+// Every plug-in LaunchServices offers for an extension point (default com.apple.widgetkit-extension), the way chronod's
+// discovery sees them: each plug-in's bundle id, extension point, and whether its containing bundle resolves (nil is what
+// pkd rejects on). Uses LSApplicationWorkspace, looked up at run time.
+static void plugins(NSArray<NSString *> *points) {
+    id workspace = call(NSClassFromString(@"LSApplicationWorkspace"), "defaultWorkspace");
+    id all = call(workspace, "installedPlugins");
+    if (!all) {
+        line(@"no installedPlugins (workspace %@)", workspace ? @"ok" : @"nil");
+        return;
+    }
+    // No arg (or "all"): histogram of every plug-in's extension-point identifier, so a missing point stands out.
+    if (points.count == 0 || [points[0] isEqualToString:@"all"]) {
+        NSCountedSet *hist = [NSCountedSet set];
+        for (id proxy in all) {
+            NSString *pt = call(proxy, "extensionPointIdentifier");
+            [hist addObject:pt ?: @"(nil)"];
+        }
+        line(@"%lu plug-ins installed, by extension point:", (unsigned long)[all count]);
+        NSArray *sorted = [hist.allObjects sortedArrayUsingComparator:^(id a, id b) {
+            return [@([hist countForObject:b]) compare:@([hist countForObject:a])];
+        }];
+        for (NSString *pt in sorted)
+            line(@"  %4lu  %@", (unsigned long)[hist countForObject:pt], pt);
+        return;
+    }
+    NSString *point = points[0];
+    line(@"extension point %@: %lu plug-ins installed total", point, (unsigned long)[all count]);
+    NSUInteger shown = 0;
+    for (id proxy in all) {
+        NSString *pt = call(proxy, "extensionPointIdentifier");
+        if (![pt isEqualToString:point]) continue;
+        shown++;
+        id containing = call(proxy, "containingBundle");
+        line(@"  %@ containing=%@ at %@ restricted=%@", call(proxy, "pluginIdentifier"),
+             call(containing, "bundleIdentifier") ?: @"(nil)", [call(proxy, "bundleURL") path], flag(proxy, "isRestricted"));
+    }
+    line(@"  (%lu for %@)", (unsigned long)shown, point);
+}
+
 static void restrictions(NSArray<NSString *> *identifiers) {
     id manager = call(NSClassFromString(@"LSApplicationRestrictionsManager"), "sharedInstance");
     if (!manager) {
@@ -209,6 +248,8 @@ int main(int argc, char **argv) {
                 extension(identifier);
         } else if ([verb isEqualToString:@"restrictions"]) {
             restrictions(identifiers);
+        } else if ([verb isEqualToString:@"plugins"]) {
+            plugins(identifiers);
         } else if ([verb isEqualToString:@"boot"]) {
             bootstrap(identifiers);
         } else {
