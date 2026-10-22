@@ -67,6 +67,12 @@ def main():
             if toybox.is_file():
                 shutil.copyfile(toybox, bin_dir / 'toybox')
                 os.chmod(bin_dir / 'toybox', 0o755)
+            # zsh: Apple's own shell (apple-oss-distributions/zsh, scripts/build-droidvm-zsh.py), a real interactive shell for
+            # the run verb and, later, the ssh login shell. Static modules, so the one binary needs no module dir. Optional.
+            zsh = ROOT / 'build/zsh/zsh'
+            if zsh.is_file():
+                shutil.copyfile(zsh, bin_dir / 'zsh')
+                os.chmod(bin_dir / 'zsh', 0o755)
             # The managed services. ownervisor creates run/log/state/control at startup; the seed carries the
             # definitions and the enable markers so they autostart from the first boot.
             services = {
