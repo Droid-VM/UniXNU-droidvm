@@ -5,8 +5,9 @@
 
 Mirrors /private/var/db/diagnostics (Persist, Special, Signpost, HighVolume, timesync, logdata.statistics) and
 /private/var/db/uuidtext (format strings of every binary, dsc/ for the shared cache) through the kernel's file mailbox,
-then writes the Info.plist an archive needs. Files already copied with the right size are skipped, so a second run
-only fetches what logd wrote since. --sizes only prints how much there is."""
+then writes the Info.plist an archive needs. Each tree is listed with its file sizes in one request (kind 6), and files
+already copied with the right size are skipped, so a second run only fetches what logd wrote since. --sizes only prints
+how much there is."""
 import argparse
 import plistlib
 import sys
@@ -16,32 +17,24 @@ sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(_
 from export import request
 
 SOURCES = ('/private/var/db/diagnostics', '/private/var/db/uuidtext')
+DT_REG = '8'
 
 
-def entries(path):
-    body, _ = request(1, path)
-    for line in body.decode(errors='replace').splitlines():
-        kind, _, name = line.partition(' ')
-        if name not in ('.', '..'):
-            yield int(kind), name
+def tree(path):
+    """{path below `path`: size} of every regular file in the tree; a full answer is continued from where it stopped."""
+    files, first = {}, 0
+    while True:
+        body, listed = request(6, path, first)
+        if not listed:
+            return files
+        for line in body.decode(errors='replace').splitlines():
+            kind, size, name = line.split(' ', 2)
+            if kind == DT_REG:
+                files[name] = int(size)
+        first += listed
 
 
-def size(path):
-    _, total = request(0, path, 1 << 40)   # past the end: no bytes, just the size
-    return total
-
-
-def walk(path):
-    for kind, name in entries(path):
-        child = f'{path}/{name}'
-        if kind == 4:
-            yield from walk(child)
-        elif kind == 8:
-            yield child
-
-
-def fetch(path, out):
-    total = size(path)
+def fetch(path, out, total):
     if out.exists() and out.stat().st_size == total:
         return 0
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -63,15 +56,13 @@ def main():
     args = parser.parse_args()
     grand = 0
     for source in SOURCES:
-        files = list(walk(source))
+        files = tree(source)
         if args.sizes:
-            sizes = [size(f) for f in files]
-            print(f'{source}: {len(files)} files, {sum(sizes) / 1e6:.1f} MB')
-            grand += sum(sizes)
+            print(f'{source}: {len(files)} files, {sum(files.values()) / 1e6:.1f} MB')
+            grand += sum(files.values())
             continue
-        for path in files:
-            relative = path[len(source) + 1:]
-            got = fetch(path, args.archive / relative)
+        for relative, total in sorted(files.items()):
+            got = fetch(f'{source}/{relative}', args.archive / relative, total)
             if got:
                 print(f'{relative}: {got} bytes', flush=True)
     if args.sizes:

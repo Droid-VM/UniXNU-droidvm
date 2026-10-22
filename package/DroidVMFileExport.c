@@ -7,6 +7,7 @@
 // Files are read (FREAD, O_NOFOLLOW) anywhere and written only under /private/var/ngpu/, the owner tools'
 // directory (their launchd jobs and binaries, staged by the host between boots). The one other action is a signal to a process,
 // for a userland that hangs where launchd would restart it (a SpringBoard deadlocked at launch).
+#include <stdbool.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
@@ -17,6 +18,7 @@
 #include <sys/fcntl.h>
 #include <sys/kauth.h>
 #include <sys/signal.h>
+#include <kern/kalloc.h>
 
 #define DROIDVM_EXPORT_BYTES (1u << 20)
 
@@ -27,7 +29,9 @@
 // `offset` (not to launchd or the kernel); kind 4 copies `length` bytes (at most DROIDVM_EXPORT_BYTES) of the user memory of
 // process <path, in decimal> from address `offset` (length = bytes copied); kind 5 writes the first `length` bytes of
 // droidvm_export_data to file <path> at `offset`, creating it root-owned with mode `total` (truncated when offset is 0),
-// only under /private/var/ngpu/.
+// only under /private/var/ngpu/; kind 6 lists a whole tree as kind 1 lists a directory, "<d_type> <size> <path below
+// <path>>\n" lines depth-first (a regular file's size, 0 for anything else), from entry offset (total = entries listed):
+// one request where kind 1 and a size read per file took thousands, for the unified log's uuidtext.
 struct droidvm_export {
 	volatile uint32_t request, done;
 	uint32_t kind;
@@ -99,6 +103,92 @@ static int droidvm_export_directory(const char *path, uint64_t first, uint64_t *
 	vnode_put(vp);
 	*length = used;
 	*total = index > first ? index - first : 0;
+	return error;
+}
+
+#define DROIDVM_EXPORT_TREE_DEPTH 4   // the unified log's diagnostics and uuidtext are two levels deep
+#define DROIDVM_EXPORT_DIRENTS 16384
+
+struct droidvm_export_tree {
+	char path[1024];
+	size_t root;                      // the listed directory's own length in `path`
+	uint64_t first, index, listed, used;
+	int full;
+};
+
+static uint64_t droidvm_export_size(const char *path, vfs_context_t ctx) {
+	vnode_t vp = NULLVP;
+	uint64_t size = 0;
+	if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) return 0;
+	struct vnode_attr va;
+	VATTR_INIT(&va);
+	VATTR_WANTED(&va, va_data_size);
+	if (!vnode_getattr(vp, &va, ctx)) size = va.va_data_size;
+	vnode_put(vp);
+	return size;
+}
+
+// One directory of the tree: tree->path holds its path (`length` bytes), and grows by each entry's name in turn. Each
+// level reads its directory into a buffer of its own, since a subdirectory is listed before the next entry is read.
+static int droidvm_export_tree_level(struct droidvm_export_tree *tree, size_t length, unsigned depth) {
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	int error = vnode_lookup(tree->path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
+	if (error) return error;
+	bool directory = vnode_vtype(vp) == VDIR;
+	char *entries = directory ? kalloc_data(DROIDVM_EXPORT_DIRENTS, Z_WAITOK) : NULL;
+	if (!entries) {
+		vnode_put(vp);
+		return directory ? ENOMEM : ENOTDIR;
+	}
+	int eof = 0;
+	off_t cookie = 0;
+	while (!eof && !error && !tree->full) {
+		uio_t uio = uio_create(1, cookie, UIO_SYSSPACE, UIO_READ);
+		if (!uio) { error = ENOMEM; break; }
+		uio_addiov(uio, CAST_USER_ADDR_T(entries), DROIDVM_EXPORT_DIRENTS);
+		int count = 0;
+		error = VNOP_READDIR(vp, uio, 0, &eof, &count, ctx);
+		size_t got = DROIDVM_EXPORT_DIRENTS - (size_t)uio_resid(uio);
+		cookie = uio_offset(uio);
+		uio_free(uio);
+		if (error || !got) break;
+		for (size_t at = 0; at + offsetof(struct dirent, d_name) <= got && !tree->full;) {
+			const struct dirent *entry = (const struct dirent *)(entries + at);
+			if (!entry->d_reclen) break;
+			at += entry->d_reclen;
+			bool dot = entry->d_name[0] == '.' && (entry->d_namlen == 1 || (entry->d_namlen == 2 && entry->d_name[1] == '.'));
+			int n = snprintf(tree->path + length, sizeof(tree->path) - length, "/%.*s", (int)entry->d_namlen, entry->d_name);
+			if (!entry->d_ino || dot || n < 0 || length + (size_t)n >= sizeof(tree->path)) continue;
+			if (tree->index++ >= tree->first) {
+				uint64_t size = entry->d_type == DT_REG ? droidvm_export_size(tree->path, ctx) : 0;
+				int w = snprintf(droidvm_export_data + tree->used, DROIDVM_EXPORT_BYTES - tree->used, "%u %llu %s\n",
+				    entry->d_type, size, tree->path + tree->root + 1);
+				if (w < 0 || tree->used + (uint64_t)w >= DROIDVM_EXPORT_BYTES) { tree->full = 1; break; }
+				tree->used += (uint64_t)w;
+				++tree->listed;
+			}
+			// A subdirectory it cannot read is listed but not descended into.
+			if (entry->d_type == DT_DIR && depth + 1 < DROIDVM_EXPORT_TREE_DEPTH)
+				(void)droidvm_export_tree_level(tree, length + (size_t)n, depth + 1);
+		}
+	}
+	tree->path[length] = 0;
+	kfree_data(entries, DROIDVM_EXPORT_DIRENTS);
+	vnode_put(vp);
+	return error;
+}
+
+static int droidvm_export_tree(const char *path, uint64_t first, uint64_t *length, uint64_t *total) {
+	static struct droidvm_export_tree tree;
+	memset(&tree, 0, sizeof(tree));
+	tree.root = strlcpy(tree.path, path, sizeof(tree.path));
+	if (tree.root >= sizeof(tree.path)) return ENAMETOOLONG;
+	while (tree.root > 1 && tree.path[tree.root - 1] == '/') tree.path[--tree.root] = 0;
+	tree.first = first;
+	int error = droidvm_export_tree_level(&tree, tree.root, 0);
+	*length = tree.used;
+	*total = tree.listed;
 	return error;
 }
 
@@ -212,6 +302,7 @@ void droidvm_export_poll(void) {
 	} else if (path[0] == '/') {
 		if (droidvm_export_box.kind == 0) status = droidvm_export_file(path, droidvm_export_box.offset, &length, &total);
 		else if (droidvm_export_box.kind == 1) status = droidvm_export_directory(path, droidvm_export_box.offset, &length, &total);
+		else if (droidvm_export_box.kind == 6) status = droidvm_export_tree(path, droidvm_export_box.offset, &length, &total);
 	}
 	droidvm_export_box.status = status;
 	droidvm_export_box.length = length;

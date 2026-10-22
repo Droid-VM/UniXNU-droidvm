@@ -2,6 +2,7 @@
 """Read a file or list a directory of the running guest through the kernel's file mailbox (DroidVMFileExport.c).
 
   export.py ls /private/var/mobile/Library/Logs/CrashReporter
+  export.py tree /private/var/db/uuidtext          (every file below it with its size: "<d_type> <size> <path>")
   export.py cat /private/var/log/some.log [--offset N]
   export.py get /private/var/db/file OUTPUT        (the whole file, in 1 MiB requests)
   export.py ps                                     (pid, parent pid, name of every process)
@@ -79,7 +80,7 @@ def request(kind, path, offset=0, length=0, total=0, payload=b''):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=['ls', 'cat', 'get', 'ps', 'kill', 'mem', 'put'])
+    parser.add_argument('command', choices=['ls', 'tree', 'cat', 'get', 'ps', 'kill', 'mem', 'put'])
     parser.add_argument('path', nargs='?', default='')
     parser.add_argument('output', nargs='?')
     parser.add_argument('length', nargs='?')
@@ -106,6 +107,14 @@ def main():
     elif args.command == 'ls':
         body, _ = request(1, args.path, args.offset)
         sys.stdout.write(body.decode(errors='replace'))
+    elif args.command == 'tree':
+        first = args.offset
+        while True:   # a full answer goes on from the entry after its last
+            body, listed = request(6, args.path, first)
+            if not listed:
+                break
+            sys.stdout.write(body.decode(errors='replace'))
+            first += listed
     elif args.command == 'cat':
         body, total = request(0, args.path, args.offset)
         sys.stdout.buffer.write(body)

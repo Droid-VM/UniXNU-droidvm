@@ -3,11 +3,13 @@
 #   vm.sh restart [WAIT]   stop it, start it, wait (up to WAIT s, default 240) for the first frame or a panic, put its
 #                          display on the phone's screen, unlock it, and print health.py
 #   vm.sh start [WAIT]     the same, without stopping it first
-#   vm.sh stop             kill its crosvm
+#   vm.sh stop             stop it
 #   vm.sh attach           put its display on the phone's screen again, until a touch reaches the guest
 #   vm.sh health           health.py
-# The VM is stopped by killing its crosvm, not with vm_stop: the daemon can abort on a VM stop (daemon-recover.sh), which then
-# brings it back and recreates the VM. Each boot rewrites out/handoff.env from DarwinBoot's hand-off, which peek.py reads.
+# The VM is stopped the way the app's own stop does it, but without the daemon (which can abort on a VM stop;
+# daemon-recover.sh brings it back): crosvm's `stop` on the VM's control socket, so crosvm exits through its devices'
+# teardown -- the GPU device frees what the host's GPU holds of guest memory before that memory goes. Only a crosvm still
+# there after STOP_WAIT seconds is killed. Each boot rewrites out/handoff.env from DarwinBoot's hand-off, which peek.py reads.
 set -uo pipefail
 RIG=$(cd "$(dirname "$0")" && pwd)
 . "$RIG/rigenv.sh"
@@ -16,6 +18,8 @@ VM=${VM:?set VM to the id of the UniXNU VM}
 IPC=${DVMIPC:?set DVMIPC to the path of the DroidVM daemon IPC client dvmipc.py}
 A="adb -s $PHONE"
 RUN=/data/data/cn.classfun.droidvm/run
+APP_USR=/data/data/cn.classfun.droidvm/usr
+STOP_WAIT=${STOP_WAIT:-20}
 export RIG_OUT=${RIG_OUT:-$RIG/out}
 
 crosvm_pid() {
@@ -23,9 +27,17 @@ crosvm_pid() {
 }
 
 stop() {
-  local pid
+  local pid name
   pid=$(crosvm_pid)
-  [ -n "$pid" ] && $A shell "su -c 'kill -9 $pid'" && echo "stopped crosvm $pid"
+  [ -n "$pid" ] || return 0
+  # The control socket is run/<VM name>.sock (CrosvmBackendInstance); the app's crosvm needs its own libraries.
+  name=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['config']['name'])" "$RIG/unixnu-vm.config.json")
+  $A shell "su -c 'LD_LIBRARY_PATH=$APP_USR/lib $APP_USR/bin/crosvm stop \"$RUN/$name.sock\"'" >/dev/null 2>&1
+  for i in $(seq 1 "$STOP_WAIT"); do
+    [ -z "$(crosvm_pid)" ] && { echo "stopped crosvm $pid through its control socket"; sleep 2; return 0; }
+    sleep 1
+  done
+  $A shell "su -c 'kill -9 $pid'" && echo "crosvm $pid had not exited after ${STOP_WAIT}s; killed it"
   sleep 2
 }
 
@@ -106,5 +118,5 @@ case "${1:-}" in
   stop) stop ;;
   attach) attach ;;
   health) python3 "$RIG/health.py" ;;
-  *) sed -n '2,9p' "$0"; exit 2 ;;
+  *) sed -n '2,12p' "$0"; exit 2 ;;
 esac

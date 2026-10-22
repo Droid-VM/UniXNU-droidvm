@@ -32,15 +32,17 @@ the environment wins):
 | `console-watch.sh [SECONDS]` | Keep the newest serial console on this machine while the VM boots, stamped with host time (survives a phone that goes down) |
 | `procs.py`, `trace.py` | The droidvm-monitor worker's process samples and UI thread traces (`droidvm-monitor=<ms>`) |
 | `trace.py --focus NAME [--symbolize]` | Trace any process's threads (role T) while the guest runs, e.g. an app that hangs; `--symbolize` names the frames with `dsc_sym.py` on `BUILD_HOST` |
-| `export.py ls\|cat\|get\|ps` | Read guest files, directories and the process list through the kernel's file mailbox |
+| `export.py ls\|tree\|cat\|get\|ps` | Read guest files, directories (`tree`: a whole tree with file sizes) and the process list through the kernel's file mailbox |
 | `dsc_sym.py CACHE_DIR SLIDE ADDR...` | Symbolize user addresses against the SystemOS dyld shared cache (run on the Mac) |
+| `dsc_dis.py CACHE_DIR SYMBOL [IMAGE] [--around OFF]` | Disassemble a function of the dyld shared cache, at a crash report's "symbol + offset", with branch targets named (run on the Mac, Homebrew llvm-mc) |
 | `home.py` | Press Home |
 | `touch.py tap X Y`, `touch.py swipe X0 Y0 X1 Y1` | Touch the guest screen (pixels of the 1280x800 framebuffer) by writing NativeHidInput's finger set |
 | `load-modules.sh` | Load the DroidVM app's kernel modules after the phone itself restarted |
 | `show-vm.sh` | Bring a fresh display of the VM to the front of the phone (a VM restart closes it; `vm.sh attach` also checks that input arrives) |
 | `export.py kill PID [SIGNAL]` | Signal a guest process, e.g. a SpringBoard deadlocked at launch (launchd restarts it) |
 | `export.py mem PID ADDRESS [LENGTH]`, `umem.py` | Read a guest process's user memory (hex dump; `umem.read`/`umem.q` for scripted pointer walks) |
-| `logarchive.py OUT` | Mirror the guest's unified log (diagnostics + uuidtext) for a tracev3 parser such as mandiant/macos-UnifiedLogs (`unifiedlog_iterator -m log-archive`); reruns fetch only what changed |
+| `logarchive.py OUT` | Mirror the guest's unified log (diagnostics + uuidtext) for a tracev3 parser such as mandiant/macos-UnifiedLogs (`unifiedlog_iterator -m log-archive`) or macOS `log show --archive`; each tree is listed with its sizes in one request (`export.py tree`), and reruns fetch only what changed |
+| `logs.sh [--no-mirror] LOG-SHOW-OPTIONS...` | The guest's unified log through macOS's own `log show` on `BUILD_HOST`: mirror, copy the archive there, show it, e.g. `logs.sh --last 10m --predicate 'process == "Preferences"'` |
 | `make-data-store.sh [GIB]` | Make the labelled sparse disk of the persistent Data store on the phone |
 | `daemon-recover.sh` | Restart droidvmd the way the app does and recreate the VM from its saved config |
 
