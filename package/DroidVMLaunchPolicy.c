@@ -17,6 +17,81 @@
 #include <sys/vnode.h>
 #include <pexpert/pexpert.h>
 
+// Owner service manager bootstrap repair. spawn_service_manager posix_spawns ownervisor from this hook while launchd is
+// still being exec'd (load_init_program_at_path, before the execve), so launchd has not yet created its bootstrap port;
+// ownervisor -- and every service it spawns -- inherits a null TASK_BOOTSTRAP_PORT, and a guest tool reached over ssh then
+// cannot talk to launchd (XPC lookups fail "Reentrancy avoided", LaunchServices unreachable). A bootstrap port is inherited
+// only at task creation and has no userspace recovery path, so once launchd is up the kernel copies pid 1's send right into
+// ownervisor's task; ownervisor waits for that before spawning its services, so they inherit the good one at birth.
+// droidvm_fix_ownervisor_bootstrap() does the copy and is called from the board monitor thread (DroidVMStubs.c) until it
+// takes once. Inert unless owner-service-manager=1 actually spawned ownervisor (droidvm_ownervisor_pid stays 0 otherwise).
+typedef struct ipc_port *droidvm_ipc_port_t;
+extern struct proc *initproc;
+extern kern_return_t task_get_special_port(task_t, int, droidvm_ipc_port_t *);
+extern kern_return_t task_set_special_port(task_t, int, droidvm_ipc_port_t);
+extern void ipc_port_release_send(droidvm_ipc_port_t);
+#define DROIDVM_TASK_BOOTSTRAP_PORT 4
+#define DROIDVM_IP_NULL ((droidvm_ipc_port_t)0)
+#define DROIDVM_IP_DEAD ((droidvm_ipc_port_t)~0UL)
+#define DROIDVM_IP_VALID(p) ((p)!=DROIDVM_IP_NULL && (p)!=DROIDVM_IP_DEAD)
+volatile int droidvm_ownervisor_pid;
+volatile int droidvm_ownervisor_bootstrap_status; // 0 pending/no donor yet, 1 adopted, -2 ownervisor gone
+volatile int droidvm_bootstrap_donor_pid;         // which daemon's bootstrap we copied (for diagnosis via peek)
+char droidvm_bootstrap_donor_name[16];
+
+// launchd (pid 1) keeps no bootstrap in its own task: it sets each job's TASK_BOOTSTRAP_PORT through posix_spawn port
+// actions, so the port to copy lives on its children, not on initproc. The GUI session daemons (backboardd, SpringBoard;
+// uid 501) hold the user-domain bootstrap the LaunchServices tools over ssh need, so prefer those, else any daemon that
+// has one. A bootstrap port is a capability; the service identifies the caller by its audit token, not the port.
+static int donor_name_preferred(const char *n){
+ static const char *const pref[]={"backboardd","SpringBoard"};
+ for(unsigned i=0;i<sizeof(pref)/sizeof(pref[0]);i++){
+  const char *a=n,*b=pref[i];
+  while(*a && *a==*b){a++;b++;}
+  if(*a==0 && *b==0)return 1;
+ }
+ return 0;
+}
+static droidvm_ipc_port_t find_bootstrap_donor(int preferred_only,int *donor_pid,char donor_name[16]){
+ for(int q=1;q<=2048;q++){
+  if(q==droidvm_ownervisor_pid)continue;
+  proc_t pr=proc_find(q);
+  if(!pr)continue;
+  task_t t=proc_task(pr);
+  const char *nm=proc_best_name(pr);
+  droidvm_ipc_port_t bp=DROIDVM_IP_NULL;
+  if(t && (!preferred_only || donor_name_preferred(nm)) &&
+     task_get_special_port(t,DROIDVM_TASK_BOOTSTRAP_PORT,&bp)==0 && DROIDVM_IP_VALID(bp)){
+   *donor_pid=q;
+   int i=0;for(;i<15 && nm[i];i++)donor_name[i]=nm[i];donor_name[i]=0;
+   proc_rele(pr);
+   return bp;
+  }
+  if(bp!=DROIDVM_IP_NULL && DROIDVM_IP_VALID(bp))ipc_port_release_send(bp);
+  proc_rele(pr);
+ }
+ return DROIDVM_IP_NULL;
+}
+void droidvm_fix_ownervisor_bootstrap(void) {
+ if(droidvm_ownervisor_bootstrap_status!=0 || droidvm_ownervisor_pid<=0)return;
+ int dp=0;char dn[16]={0};
+ droidvm_ipc_port_t boot=find_bootstrap_donor(1,&dp,dn);       // a GUI session daemon first
+ if(!DROIDVM_IP_VALID(boot))boot=find_bootstrap_donor(0,&dp,dn); // else any daemon with a bootstrap
+ if(!DROIDVM_IP_VALID(boot))return;                            // nobody has one yet; retry next pass
+ proc_t ov=proc_find(droidvm_ownervisor_pid);
+ if(!ov){ipc_port_release_send(boot);droidvm_ownervisor_bootstrap_status=-2;return;}
+ task_t t=proc_task(ov);
+ if(!t){ipc_port_release_send(boot);proc_rele(ov);return;} // dying; retry next pass
+ droidvm_ipc_port_t cur=DROIDVM_IP_NULL;
+ if(task_get_special_port(t,DROIDVM_TASK_BOOTSTRAP_PORT,&cur)==0 && DROIDVM_IP_VALID(cur)){
+  ipc_port_release_send(cur);ipc_port_release_send(boot);droidvm_ownervisor_bootstrap_status=1;proc_rele(ov);return;}
+ task_set_special_port(t,DROIDVM_TASK_BOOTSTRAP_PORT,boot); // consumes the boot send right
+ droidvm_bootstrap_donor_pid=dp;
+ { int i=0;for(;i<16;i++)droidvm_bootstrap_donor_name[i]=dn[i]; }
+ droidvm_ownervisor_bootstrap_status=1;
+ proc_rele(ov);
+}
+
 static const char policy_head[] =
  "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
  "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
@@ -219,7 +294,13 @@ static int spawn_service_manager(proc_t p, uint64_t scratch) {
  struct posix_spawn_args request={.pid=scratch+0x68,.path=scratch,.adesc=USER_ADDR_NULL,.argv=scratch+0x40,.envp=scratch+0x60};
  int32_t result=0;
  error=posix_spawn(p,&request,&result);
- if(!error)started=1;
+ if(!error){
+  started=1;
+  // posix_spawn copied the child pid to request.pid (scratch+0x68); remember it so the monitor thread can hand
+  // ownervisor launchd's bootstrap port once launchd is up (droidvm_fix_ownervisor_bootstrap).
+  int32_t pid=0;
+  if(copyin((user_addr_t)(scratch+0x68),&pid,sizeof(pid))==0 && pid>0)droidvm_ownervisor_pid=pid;
+ }
  return error;
 }
 

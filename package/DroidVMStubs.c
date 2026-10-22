@@ -17,6 +17,7 @@ extern void IOSleep(unsigned milliseconds);
 extern void boot_process_capture(void);
 extern void boot_process_snapshot(void);
 extern void droidvm_export_poll(void);
+extern void droidvm_fix_ownervisor_bootstrap(void);
 extern void droidvm_input_start(void);
 extern void droidvm_net_start(void);
 extern unsigned boot_ui_trace_role_rows(unsigned role, char rows[][120], unsigned max, unsigned detail);
@@ -64,6 +65,9 @@ static void droidvm_monitor(void *parameter, wait_result_t result) {
             waited = 0;
         }
         droidvm_export_poll();
+        // Hand the owner service manager launchd's bootstrap port once launchd is up (self-gating: a no-op after it
+        // takes once, and when owner-service-manager=1 never spawned ownervisor). See DroidVMLaunchPolicy.c.
+        droidvm_fix_ownervisor_bootstrap();
         IOSleep(100);
     }
 }

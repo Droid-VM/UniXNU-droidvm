@@ -21,6 +21,8 @@
 // Control verbs (socket line-JSON or a .req file): list, status, start, stop, restart, enable, disable,
 // add, remove, reload. enable/disable only change boot autostart; "now":true also starts/stops at once.
 #import <Foundation/Foundation.h>
+#import <mach/mach.h>
+#import <mach/task_special_ports.h>
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -391,6 +393,31 @@ static void tick(void) {
     writeStatusFile();
 }
 
+// libSystem's cached bootstrap port; the iphoneos SDK has no <servers/bootstrap.h>. It was 0 at our launch because the
+// kernel spawned us before launchd made its bootstrap port.
+extern mach_port_t bootstrap_port;
+
+// Wait until our task has a bootstrap port. The kernel spawns ownervisor during launchd's exec, before launchd creates
+// that port, so we (and so every service we would spawn, which inherits it at birth) start with none, and no owner tool
+// over ssh can reach launchd (XPC/LaunchServices fail "Reentrancy avoided"). The board kernel copies launchd's into our
+// task once launchd is up (DroidVMLaunchPolicy.c droidvm_fix_ownervisor_bootstrap). Bounded so a boot without the fix
+// still brings services up, just without a bootstrap port as before.
+static void waitForBootstrapPort(void) {
+    // The kernel can only copy a donor once a GUI session daemon (backboardd/SpringBoard) is up, which on this guest can
+    // take some tens of seconds; wait generously so the ssh/debug tree we spawn below inherits a working port, but not
+    // forever, so a boot where it never comes still brings the services up (as before, without a bootstrap).
+    for (int i = 0; i < 900; i++) {   // up to ~90 s, breaks as soon as the port appears
+        mach_port_t bp = MACH_PORT_NULL;
+        if (task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp) == KERN_SUCCESS && MACH_PORT_VALID(bp)) {
+            bootstrap_port = bp;   // retain the send right; services inherit the task port and re-read it themselves
+            NSLog(@"ownervisor: adopted bootstrap port 0x%x after %d ms", bp, i * 100);
+            return;
+        }
+        usleep(100 * 1000);
+    }
+    NSLog(@"ownervisor: no bootstrap port after wait; starting services without one");
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     @autoreleasepool {
@@ -406,6 +433,7 @@ int main(int argc, char **argv) {
         setvbuf(stderr, NULL, _IOLBF, 0);
         NSLog(@"ownervisor: root %@ pid %d uid %d", gRoot, getpid(), getuid());
 
+        waitForBootstrapPort();
         loadServices();
         for (NSString *n in gServices) if (isEnabled(n)) startService(gServices[n]);
 
