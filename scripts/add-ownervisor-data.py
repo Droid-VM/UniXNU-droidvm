@@ -86,8 +86,12 @@ def main():
                 os.chmod(ssh_dir, 0o700)
             # The managed services. ownervisor creates run/log/state/control at startup; the seed carries the
             # definitions and the enable markers so they autostart from the first boot.
+            # 'autostart' (a staging flag, stripped from the json) decides whether an enable marker is written. adrenoprobe is
+            # defined but NOT autostarted: it opens AGXDeviceUserClient and submits a GPU self-test that can fault (the known CP
+            # register-load AHB fault), and running it at boot, racing the real render clients, left the shared GPU state bad and
+            # every app's rendering black. Keep it for a manual `ownerctl start adrenoprobe` diagnostic, not at boot.
             services = {
-                'adrenoprobe': {'exec': ['/private/var/ngpu/bin/adrenoprobed'], 'keepalive': False, 'uid': 0},
+                'adrenoprobe': {'exec': ['/private/var/ngpu/bin/adrenoprobed'], 'keepalive': False, 'uid': 0, 'autostart': False},
                 'selftest': {'exec': ['/private/var/ngpu/bin/ownertest', 'boot'], 'keepalive': True, 'throttle': 10},
             }
             if (dropbear / 'dropbear').is_file():
@@ -101,10 +105,12 @@ def main():
                 d.mkdir(parents=True, exist_ok=True)
                 os.chmod(d, 0o755)
             for name, spec in services.items():
+                autostart = spec.pop('autostart', True)
                 (svc_dir / (name + '.json')).write_text(json.dumps(spec, indent=2) + '\n')
                 os.chmod(svc_dir / (name + '.json'), 0o644)
-                (en_dir / name).write_text('')
-                os.chmod(en_dir / name, 0o644)
+                if autostart:
+                    (en_dir / name).write_text('')
+                    os.chmod(en_dir / name, 0o644)
             print('staged ngpu/bin:', sorted(p.name for p in bin_dir.iterdir()))
             print('staged services:', sorted(services))
         finally:
