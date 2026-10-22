@@ -7,6 +7,7 @@
   export.py ps                                     (pid, parent pid, name of every process)
   export.py kill PID [SIGNAL]                      (default 9; launchd restarts what it keeps alive)
   export.py mem PID ADDRESS [LENGTH]               (hex dump of a process's user memory)
+  export.py put LOCAL /private/var/ngpu/... [MODE]  (write a file, root-owned, default mode 0644; only under /private/var/ngpu/)
 
 The request is written into droidvm_export_box through crosvm's /proc/<pid>/mem; the droidvm-monitor worker answers
 within ~100 ms. Paths are in the guest's namespace (Data is mounted at /private/var)."""
@@ -28,8 +29,19 @@ def physical(name):
 
 def write_guest(pid, maps, pa, data):
     host = peek.host_address(maps, pa, len(data))
-    escaped = ''.join(f'\\{byte:03o}' for byte in data)
-    peek.adb(f"printf '{escaped}' | dd of=/proc/{pid}/mem bs=1 seek={host} conv=notrunc 2>/dev/null")
+    if len(data) <= 512:
+        escaped = ''.join(f'\\{byte:03o}' for byte in data)
+        peek.adb(f"printf '{escaped}' | dd of=/proc/{pid}/mem bs=1 seek={host} conv=notrunc 2>/dev/null")
+        return
+    # Larger pieces (a file for `put`) travel as a file on the phone: a command line holds only so much.
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile() as piece:
+        piece.write(data)
+        piece.flush()
+        subprocess.run(['adb', '-s', peek.PHONE, 'push', piece.name, '/data/local/tmp/droidvm-export-piece'], check=True,
+                       capture_output=True, timeout=120)
+    peek.adb(f'dd if=/data/local/tmp/droidvm-export-piece of=/proc/{pid}/mem bs=65536 seek={host} oflag=seek_bytes conv=notrunc 2>/dev/null; '
+             'rm -f /data/local/tmp/droidvm-export-piece')
 
 
 def read_guest(pid, maps, pa, length):
@@ -39,13 +51,15 @@ def read_guest(pid, maps, pa, length):
     return peek.adb(f'dd if=/proc/{pid}/mem bs=1 skip={host} count={length} 2>/dev/null')
 
 
-def request(kind, path, offset=0, length=0):
+def request(kind, path, offset=0, length=0, total=0, payload=b''):
     pid, maps = peek.crosvm_maps()
     box, data = physical('droidvm_export_box'), physical('droidvm_export_data')
     current = BOX.unpack(read_guest(pid, maps, box, BOX.size))
     number = (current[0] + 1) & 0xffffffff
+    if payload:
+        write_guest(pid, maps, data, payload)
     # Everything but the counters first, then the request counter: the worker reads the fields after it sees it change.
-    write_guest(pid, maps, box + 8, struct.pack('<IiQQQ512s', kind, 0, offset, length, 0, path.encode()[:511]))
+    write_guest(pid, maps, box + 8, struct.pack('<IiQQQ512s', kind, 0, offset, length, total, path.encode()[:511]))
     write_guest(pid, maps, box, struct.pack('<I', number))
     for _ in range(100):
         answer = BOX.unpack(read_guest(pid, maps, box, BOX.size))
@@ -65,13 +79,21 @@ def request(kind, path, offset=0, length=0):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=['ls', 'cat', 'get', 'ps', 'kill', 'mem'])
+    parser.add_argument('command', choices=['ls', 'cat', 'get', 'ps', 'kill', 'mem', 'put'])
     parser.add_argument('path', nargs='?', default='')
     parser.add_argument('output', nargs='?')
     parser.add_argument('length', nargs='?')
     parser.add_argument('--offset', type=int, default=0)
     args = parser.parse_args()
-    if args.command == 'mem':
+    if args.command == 'put':
+        source = open(args.path, 'rb').read()
+        mode = int(args.length or '0644', 8)
+        # In 1 MiB pieces: the first creates or truncates the file and sets its mode, the rest append at their offsets.
+        for offset in range(0, max(len(source), 1), DATA_BYTES):
+            piece = source[offset:offset + DATA_BYTES]
+            request(5, args.output, offset, len(piece), mode, piece)
+        print(f'{args.output}: {len(source)} bytes, mode {mode:o}')
+    elif args.command == 'mem':
         body, _ = request(4, args.path, int(args.output, 16), int(args.length, 0) if args.length else 64)
         for at in range(0, len(body), 16):
             print(f'{int(args.output, 16) + at:016x}: {body[at:at + 16].hex(" ")}')

@@ -4,8 +4,9 @@
 // droidvm_export_box through guest memory (tools/rig/export.py); the droidvm-monitor worker answers it here, in
 // the kernel's VFS context, with a file's bytes or a directory's entries in droidvm_export_data.
 //
-// Files are only read (FREAD, O_NOFOLLOW), nothing is created or changed; the one action is a signal to a process, for a
-// userland that hangs where launchd would restart it (a SpringBoard deadlocked at launch).
+// Files are read (FREAD, O_NOFOLLOW) anywhere and written only under /private/var/ngpu/, the owner tools'
+// directory (their launchd jobs and binaries, staged by the host between boots). The one other action is a signal to a process,
+// for a userland that hangs where launchd would restart it (a SpringBoard deadlocked at launch).
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
@@ -24,7 +25,9 @@
 // directory as "<d_type> <name>\n" lines from entry offset (total = entries listed, length = bytes); kind 2 lists the
 // processes as "<pid> <ppid> <name>\n" lines (path unused; total = processes); kind 3 sends signal `length` to process
 // `offset` (not to launchd or the kernel); kind 4 copies `length` bytes (at most DROIDVM_EXPORT_BYTES) of the user memory of
-// process <path, in decimal> from address `offset` (length = bytes copied).
+// process <path, in decimal> from address `offset` (length = bytes copied); kind 5 writes the first `length` bytes of
+// droidvm_export_data to file <path> at `offset`, creating it root-owned with mode `total` (truncated when offset is 0),
+// only under /private/var/ngpu/.
 struct droidvm_export {
 	volatile uint32_t request, done;
 	uint32_t kind;
@@ -99,6 +102,44 @@ static int droidvm_export_directory(const char *path, uint64_t first, uint64_t *
 	return error;
 }
 
+static const char droidvm_export_writable[] = "/private/var/ngpu/";
+
+static int droidvm_export_may_write(const char *path) {
+	if (strncmp(path, droidvm_export_writable, sizeof(droidvm_export_writable) - 1)) return 0;
+	for (const char *c = path; *c; ++c)
+		if (c[0] == '/' && c[1] == '.' && c[2] == '.' && (c[3] == '/' || !c[3])) return 0;
+	return 1;
+}
+
+static int droidvm_export_write(const char *path, uint64_t offset, uint64_t length, uint64_t mode) {
+	if (!droidvm_export_may_write(path) || length > DROIDVM_EXPORT_BYTES || (mode & ~(uint64_t)07777)) return EPERM;
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	int error = vnode_open(path, FWRITE | O_CREAT | O_NOFOLLOW | (offset ? 0 : O_TRUNC), (int)mode, 0, &vp, ctx);
+	if (error) return error;
+	if (vnode_vtype(vp) != VREG) error = EISDIR;
+	/* O_TRUNC is not honoured on every backing filesystem here, so a shorter overwrite would keep the old file's trailing
+	 * bytes; truncate the file to empty ourselves before the first piece (offset 0) lands. */
+	if (!error && !offset) {
+		struct vnode_attr tr;
+		VATTR_INIT(&tr);
+		VATTR_SET(&tr, va_data_size, 0);
+		error = vnode_setattr(vp, &tr, ctx);
+	}
+	int resid = 0;
+	if (!error && length) error = vn_rdwr(UIO_WRITE, vp, droidvm_export_data, (int)length, (off_t)offset, UIO_SYSSPACE, IO_SYNC,
+	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+	if (!error && resid) error = EIO;
+	if (!error && !offset) {
+		struct vnode_attr va;
+		VATTR_INIT(&va);
+		VATTR_SET(&va, va_mode, (mode_t)mode);
+		error = vnode_setattr(vp, &va, ctx);
+	}
+	vnode_close(vp, FWRITE, ctx);
+	return error;
+}
+
 extern vm_map_t get_task_map_reference(task_t);
 extern kern_return_t vm_map_read_user(vm_map_t, vm_map_address_t, void *, vm_size_t);
 extern void vm_map_deallocate(vm_map_t);
@@ -165,6 +206,9 @@ void droidvm_export_poll(void) {
 		length = cursor.used;
 		total = cursor.count;
 		status = 0;
+	} else if (droidvm_export_box.kind == 5) {
+		status = droidvm_export_write(path, droidvm_export_box.offset, droidvm_export_box.length, droidvm_export_box.total);
+		length = status ? 0 : droidvm_export_box.length;
 	} else if (path[0] == '/') {
 		if (droidvm_export_box.kind == 0) status = droidvm_export_file(path, droidvm_export_box.offset, &length, &total);
 		else if (droidvm_export_box.kind == 1) status = droidvm_export_directory(path, droidvm_export_box.offset, &length, &total);
