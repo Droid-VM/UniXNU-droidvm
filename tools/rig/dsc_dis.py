@@ -56,7 +56,13 @@ def disassemble(cache, start, count):
         found = re.match(r'(b|bl|b\.\w+|cbz|cbnz|tbz|tbnz)\s+.*?#(-?0x[0-9a-f]+|-?\d+)\s*$', text)
         if found:
             target = address + int(found[2], 0)
-            note = f'    -> {target:#x} {cache.symbolize(target)}'
+            # An image whose load commands the reader cannot map (a branch into another cache file's text) is named by
+            # address alone rather than ending the listing.
+            try:
+                name = cache.symbolize(target)
+            except (TypeError, ValueError, struct.error):
+                name = '(not named)'
+            note = f'    -> {target:#x} {name}'
         print(f'{address:#x}  {text}{note}')
 
 
