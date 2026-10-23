@@ -111,6 +111,34 @@ publish = publish.replace(definition, 'IOReturn AGXDeviceUserClient::clientDied(
                           '    }\n'
                           '    return IOUserClient::clientDied();\n'
                           '}\n' + definition)
+# The open cap counts a name's opens in a token bucket, not in the boot: eight at once, then one more each 30 seconds. NativeAdreno
+# refuses a process name's ninth open of the boot (kIOReturnBusy), against a plugin that crashes its host on every launch; but the
+# wallpaper's poster extensions run one process per variant and per host (PosterBoard's gallery, SpringBoard's lock screen), and
+# after eight every AegirPoster and KaleidoscopePoster got no device and crashed -- SpringBoard relaunched its wallpaper in a loop.
+# Widget renderers and WebKit's processes open again in normal use too. A process that crashes every few seconds still runs dry.
+if publish.count('#include <kern/thread.h>\n') != 1:
+    sys.exit('NativeAdrenoPublish.cpp no longer includes <kern/thread.h> exactly once')
+publish = publish.replace('#include <kern/thread.h>\n', '#include <kern/thread.h>\n#include <kern/clock.h>\n')
+capped = '    const bool capped=cap && record && record->opens>=cap;\n'
+if publish.count(capped) != 1:
+    sys.exit('NativeAdrenoPublish.cpp no longer caps a name\'s opens with record->opens>=cap exactly once')
+publish = publish.replace(capped,
+    '    static uint64_t bucket_time[8];\n'
+    '    static uint32_t bucket_tokens[8];\n'
+    '    bool capped=false;\n'
+    '    if(cap && record) {\n'
+    '        const size_t index=size_t(record-native_adreno_client_log);\n'
+    '        uint64_t now=0,period=0;\n'
+    '        clock_get_uptime(&now);\n'
+    '        nanoseconds_to_absolutetime(30000000000ull,&period);\n'
+    '        if(!bucket_time[index]) {bucket_time[index]=now;bucket_tokens[index]=cap;}\n'
+    '        const uint64_t earned=period?(now-bucket_time[index])/period:0;\n'
+    '        if(earned) {\n'
+    '            bucket_tokens[index]=uint32_t(bucket_tokens[index]+earned<cap?bucket_tokens[index]+earned:cap);\n'
+    '            bucket_time[index]+=earned*period;\n'
+    '        }\n'
+    '        if(bucket_tokens[index])--bucket_tokens[index];else capped=true;\n'
+    '    }\n')
 staged = OUT / 'NativeAdrenoPublish.cpp'
 staged.write_text(publish)
 
