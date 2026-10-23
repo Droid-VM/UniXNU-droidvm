@@ -891,7 +891,7 @@ void gpuThread(void *, wait_result_t)
     droidvm_gpu_state = 1;
     if (call(DROIDVM_GPU_OP_INFO, nullptr, 0, nullptr, 0, &droidvm_gpu_facts, sizeof droidvm_gpu_facts)) {fail("INFO failed"); return;}
     const droidvm_gpu_info &info = droidvm_gpu_facts;
-    if (info.version != DROIDVM_GPU_WIRE_VERSION || !info.chip_id || info.va_size < (UINT64_C(10) << 30) || (info.va_start & 4095)) {
+    if (info.version != DROIDVM_GPU_WIRE_VERSION || !info.chip_id || info.va_size < (UINT64_C(32) << 30) || (info.va_start & 4095)) {
         fail("unusable device facts");
         return;
     }

@@ -17,7 +17,7 @@
  * DROIDVM_GPU_WAIT_MAX_MS. All integers little endian; every struct is naturally aligned and has a fixed size. */
 enum {
     DROIDVM_GPU_DEVICE_ID = 59,           /* virtio device id: crosvm's nonstandard ids count down from 63 */
-    DROIDVM_GPU_WIRE_VERSION = 2,
+    DROIDVM_GPU_WIRE_VERSION = 3,
     DROIDVM_GPU_MAX_RANGES = 1024,        /* IMPORT entries per request */
     DROIDVM_GPU_MAX_IBS = 16,             /* NativeAdrenoAbiMaxBuffers */
     DROIDVM_GPU_WAIT_MAX_MS = 4,
@@ -31,7 +31,7 @@ enum {
     DROIDVM_GPU_OP_WAIT = 7,
     DROIDVM_GPU_OP_TICKS = 8,
     DROIDVM_GPU_OP_CLIENT = 9,            /* a client slot's next user starts with a fresh KGSL context */
-    DROIDVM_GPU_MAX_CLIENTS = 16,
+    DROIDVM_GPU_MAX_CLIENTS = 32,
 
     DROIDVM_GPU_BIND = 1,                 /* KGSL_GPUMEM_RANGE_OP_BIND */
     DROIDVM_GPU_UNBIND = 2,               /* KGSL_GPUMEM_RANGE_OP_UNBIND */

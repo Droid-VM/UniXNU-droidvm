@@ -77,17 +77,19 @@ mounted = '            if(kernel)g.kernel_client=true;else g.slots[slot]=true;\n
 if publish.count(mounted) != 1:
     sys.exit('NativeAdrenoPublish.cpp no longer marks a mounted slot exactly once')
 publish = publish.replace(mounted, mounted + '            if(!kernel)droidvm_gpu_client_opened(slot);\n')
-# Ten connections instead of NativeAdreno's four: the render server, the widget renderer, the wallpaper and the app icons take four,
-# WebKit's GPU and WebContent processes (droidvm-gpu-clients com.apple.WebKit.*) more, and an app that draws with Metal itself (Maps)
-# one each. Each window is 1 GiB, following the render server's; the ten take 10 GiB of the KGSL VBO (128 GiB on the SM8650 host),
-# which DroidVMGpu.cpp requires. sheng's aperture ends at 0x80000000, so NativeAdreno splits it in three.
+# 32 connections instead of NativeAdreno's four: the render server, the widget renderer, the app icons and Settings take four,
+# PosterBoard and each running wallpaper poster extension one each (*Poster*: the gallery runs several at once), WebKit's GPU and
+# WebContent processes (com.apple.WebKit.*) more, and an app that draws with Metal itself one each; ten were taken in normal use.
+# Each window is 1 GiB, following the render server's; the 32 take 32 GiB of the KGSL VBO (128 GiB on the SM8650 host), which
+# DroidVMGpu.cpp requires, and crosvm keeps a KGSL context for each (DROIDVM_GPU_MAX_CLIENTS). sheng's aperture ends at 0x80000000,
+# so NativeAdreno splits it in three.
 table = re.search(r'enum : unsigned \{NativeAdrenoMaxClients=4\};\n'
                   r'static const struct \{uint64_t start,bytes;\} kClientWindows\[NativeAdrenoMaxClients\]=\{\n'
                   r'    \{0x20000000ull,0x40000000ull\}(,\{0x[0-9A-Fa-f]+ull,0x[0-9A-Fa-f]+ull\}){3}\};', publish)
 if not table:
     sys.exit('NativeAdrenoPublish.cpp no longer declares the four client windows')
-windows = ','.join('{%#xull,0x40000000ull}' % (0x20000000 + (i << 30)) for i in range(10))
-publish = publish.replace(table[0], 'enum : unsigned {NativeAdrenoMaxClients=10};\n'
+windows = ','.join('{%#xull,0x40000000ull}' % (0x20000000 + (i << 30)) for i in range(32))
+publish = publish.replace(table[0], 'enum : unsigned {NativeAdrenoMaxClients=32};\n'
                           'static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={\n    ' + windows + '};')
 # A client that dies with its BOs mapped: a crash's corpse keeps its address space while IOKit closes the connection
 # (iokit_client_died under ipc_space_terminate), so clientClose freed BO pages the dead process still mapped through their CPU
