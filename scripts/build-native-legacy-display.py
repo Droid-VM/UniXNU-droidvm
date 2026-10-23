@@ -354,6 +354,57 @@ print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end=''
 hid_dir=ROOT/'build/native-hid-input'
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeKeyStoreEvents'],text=True),end='')
 keyevents=ROOT/'build/native-keystore-events'
+# The keystore's user client also wraps and unwraps keys for securityd (aks_wrap_key, selector 10; aks_unwrap_key, 11: scalars
+# {keybag, class}, the key in and out as structures, and for 10 the class used as the one scalar out, as libaks calls them).
+# NativeKeyStoreEvents refuses both (kIOReturnUnsupported), so every keychain item add failed (ks_crypt e00002c7 'oe') and
+# bluetoothd, cloudd and the rest stored nothing. A wrapped key here is an 8-byte header ('DVMK' and the class) and the key:
+# like the rest of this keystore it protects nothing. Compiled from a staged copy with build-arm-driver.py's own command.
+keystore_original=ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp';keystore_text=keystore_original.read_text()
+keystore_helper='''// DroidVM (build-native-legacy-display.py): aks_wrap_key (10) and aks_unwrap_key (11) without keys.
+IOReturn droidvmWrap(uint32_t selector, IOExternalMethodArguments *args) {
+    const bool wrap = selector == 10;
+    if (args->scalarInputCount != 2 || !args->scalarInput) return kIOReturnBadArgument;
+    if (wrap ? (args->scalarOutputCount < 1 || !args->scalarOutput) : args->scalarOutputCount != 0) return kIOReturnBadArgument;
+    uint8_t in[512], out[520];
+    uint32_t length = 0, produced = 0;
+    if (args->structureInputDescriptor) {
+        length = (uint32_t)args->structureInputDescriptor->getLength();
+        if (length > sizeof in || args->structureInputDescriptor->readBytes(0, in, length) != length) return kIOReturnBadArgument;
+    } else {
+        length = args->structureInputSize;
+        if (length > sizeof in || (length && !args->structureInput)) return kIOReturnBadArgument;
+        memcpy(in, args->structureInput, length);
+    }
+    const uint32_t keyclass = (uint32_t)args->scalarInput[1];
+    if (wrap) {
+        memcpy(out, "DVMK", 4); memcpy(out + 4, &keyclass, 4); memcpy(out + 8, in, length); produced = length + 8;
+    } else {
+        if (length < 8 || memcmp(in, "DVMK", 4)) return kIOReturnBadArgument;
+        produced = length - 8; memcpy(out, in + 8, produced);
+    }
+    if (args->structureOutputDescriptor) {
+        if (produced > args->structureOutputDescriptor->getLength()) return kIOReturnNoSpace;
+        args->structureOutputDescriptor->writeBytes(0, out, produced);
+        args->structureOutputDescriptorSize = produced;
+    } else if (args->structureOutput && produced <= args->structureOutputSize) {
+        memcpy(args->structureOutput, out, produced);
+        args->structureOutputSize = produced;
+    } else {
+        return kIOReturnNoSpace;
+    }
+    if (wrap) {args->scalarOutput[0] = keyclass; args->scalarOutputCount = 1;}
+    return kIOReturnSuccess;
+}
+'''
+for anchor,replacement in (('}  // namespace\n',keystore_helper+'}  // namespace\n'),
+                           ('        default: break;\n','        case 10: case 11: rc = droidvmWrap(selector, args); break;\n        default: break;\n')):
+    require(keystore_text.count(anchor)==1,'NativeKeyStoreEvents.cpp no longer has exactly one '+anchor.strip())
+    keystore_text=keystore_text.replace(anchor,replacement)
+# the same file name: the late static initializer is named after it (__GLOBAL__sub_I_NativeKeyStoreEvents.cpp)
+keystore_staged=keyevents/'droidvm'/'NativeKeyStoreEvents.cpp';keystore_staged.parent.mkdir(exist_ok=True);keystore_staged.write_text(keystore_text)
+keystore_command=json.loads((keyevents/'compile-command.json').read_text())
+require(keystore_command.count(str(keystore_original))==1,'build-arm-driver.py compiles NativeKeyStoreEvents.cpp once')
+run([str(keystore_staged) if a==str(keystore_original) else a for a in keystore_command],cwd=r['directory'])
 keyevents_late=keyevents/'NativeKeyStoreEvents.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func',
      '--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
