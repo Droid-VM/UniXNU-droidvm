@@ -6,7 +6,8 @@
 //   lsdiag [-u UID] rebuild [nosystem] [internal] [nouser]   rebuild the LaunchServices database (system and user apps)
 //   lsdiag [-u UID] register APP_PATH...   re-register app bundles by URL (their plug-ins go under them)
 //   lsdiag [-u UID] midump [FILTER...]    the item dictionaries installd gives LaunchServices (type, plug-in owner)
-//   lsdiag [-u UID] relink BUNDLE_ID...|all   re-register apps with their plug-ins as an install does (plug-ins get their app)
+//   lsdiag [-u UID] relink [-clean] BUNDLE_ID...|all   re-register apps with their plug-ins as an install does (plug-ins get
+//                                       their app); -clean drops each plug-in's records first (unregisterPlugin:)
 //   lsdiag bundle PATH...                what CFBundle reads from a bundle directory (identifier, Info.plist, extension point)
 //   lsdiag nodes PATH...                 stat/getattrlist IDs of each path and whether fsgetpath leads back to it
 //   lsdiag fsnode PATH...                what LaunchServices' FSNode answers: path, length, file and volume IDs
@@ -291,6 +292,11 @@ static void fsnodes(NSArray<NSString *> *paths) {
 // lsd (performPostInstallationRegistration) collapses into one registration -- the app with _LSBundlePlugins. The first-boot
 // seeding registers system apps and their plug-ins one by one instead, and a plug-in registered after its app gets no parent.
 static void relink(NSArray<NSString *> *bundleIDs) {
+    // -clean first: each plug-in's records are dropped (unregisterPlugin:) before the app is registered with them, so a record the
+    // first-boot seeding left without its app -- which pkd rejects, "plug-ins outside containing apps must be in /System" -- goes.
+    BOOL clean = bundleIDs.count && [bundleIDs[0] isEqualToString:@"-clean"];
+    if (clean)
+        bundleIDs = [bundleIDs subarrayWithRange:NSMakeRange(1, bundleIDs.count - 1)];
     void *mi = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_NOW);
     id (*enumerate)(NSDictionary *, void (^)(NSDictionary *, NSError *)) =
         (id (*)(NSDictionary *, void (^)(NSDictionary *, NSError *)))dlsym(mi, "MobileInstallationEnumerateAllInstalledItemDictionaries");
@@ -337,6 +343,14 @@ static void relink(NSArray<NSString *> *bundleIDs) {
         if (items.count == 0 || [items[0][@"ApplicationType"] isEqual:@"PluginKitPlugin"]) {
             line(@"relink %@: installd has no app record for it", bundleID);
             continue;
+        }
+        if (clean) {
+            SEL unregister = sel_registerName("unregisterPlugin:");
+            for (NSDictionary *item in items) {
+                if (![item[@"ApplicationType"] isEqual:@"PluginKitPlugin"] || !item[@"Path"]) continue;
+                BOOL dropped = ((BOOL (*)(id, SEL, NSURL *))objc_msgSend)(workspace, unregister, [NSURL fileURLWithPath:item[@"Path"]]);
+                line(@"  unregisterPlugin %@: %@", item[@"CFBundleIdentifier"], dropped ? @"YES" : @"NO");
+            }
         }
         NSError *error = nil;
         BOOL ok = ((BOOL (*)(id, SEL, NSArray *, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
