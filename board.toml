@@ -109,7 +109,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "06cb9b5c3a3f1392dfe520b593d3cbd431bb2a0fab06d15cb81a0145a7904959",
+  "ebbcf149d301f7087189e7b60186debf68c1abfe6dae28439467706973f025b9",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -167,6 +167,10 @@ kernel_args = [
   # ignores its own amfi_* boot-args, so XNU clears the error itself (patches/xnu/zzy-union-staged-apps.patch). This
   # VM is not a security boundary.
   "owner-skip-launch-constraints=1",
+  # the data protection class a caller sets is kept on the unencrypted Data volume (and an unset one reads as class D, "None"):
+  # PosterBoard checks its data store's class back and, finding none, had no wallpaper store at all (UniXNU
+  # patches/xnu/zzu-dataprotect-without-cprotect.patch)
+  "owner-dataprotect=1",
   # start the owner service manager once at boot. launchd takes its jobs from the signed compiled cache and ignores an owner
   # overlay plist's ProgramArguments, and a new label is never enumerated, so no launchd overlay launches an owner binary here;
   # the kernel launch-policy hook posix_spawns /private/var/ngpu/bin/ownervisor itself (kits/droidvm/DroidVMLaunchPolicy.c,
@@ -187,14 +191,18 @@ kernel_args = [
   "droidvm-gpu-metal=1",
   "sheng-gpu-addon=1",
   # the processes besides backboardd that get a Metal device of their own (DroidVMLaunchPolicy.c writes the plugin's clients file):
-  # WidgetRenderer draws the widgets through RenderBox, PosterBoard the wallpaper, and iconservicesagent the app icons, whose
-  # CoreImage context otherwise falls back to OpenGL ES and crashes in CI::GLContext on every icon (sheng disables the job);
-  # and WebKit's processes, com.apple.WebKit.* (a name ending in '*' names every process it begins; the kernel's grant compares
-  # the first 16 characters): CoreGraphics draws a page's wide-color layers ('b3a8', 'w30r') only through the GPU, so without a
-  # device WebContent drew nothing into them and Safari's pages were black. Maps is not one: VectorKit
+  # WidgetRenderer draws the widgets through RenderBox, and iconservicesagent the app icons, whose CoreImage context otherwise
+  # falls back to OpenGL ES and crashes in CI::GLContext on every icon (sheng disables the job); *Poster* ("*X*" names every
+  # process whose name holds X) is PosterBoard and each wallpaper's poster extension, which render the wallpaper and the
+  # gallery's previews with Metal (AegirPoster, KaleidoscopePoster crashed without a device); and WebKit's processes,
+  # com.apple.WebKit.* (a name ending in '*' names every process it begins): CoreGraphics draws a page's wide-color layers
+  # ('b3a8', 'w30r') only through the GPU, so without a device WebContent drew nothing into them and Safari's pages were black.
+  # Settings (Preferences) reads the wallpaper's snapshot, which PosterBoard writes in its device's texture layout (an ASTC ATX
+  # file); ImageIO reads such a file back only through a device's layout, and Settings > Wallpaper trapped on the missing image.
+  # The kernel's grant and the plugin take the same forms (UniXNU patch zzw, build-adreno-metal-plugin.py). Maps is not one: VectorKit
   # lost its device (DeviceLost) within seconds, and the render server's frames were wedged until a reboot; without one its map is
   # blank but the app runs
-  "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent,com.apple.WebKit.*",
+  "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,com.apple.WebKit.*,Preferences",
 ]
 
 [payload.adt]
