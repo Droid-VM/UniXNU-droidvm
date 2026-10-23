@@ -29,7 +29,7 @@ binary = OUT / 'lsdiag'
 # Manual reference counting: the records are made with alloc + an init sent through a cast objc_msgSend, which ARC would
 # not see as consuming the allocation (it released it a second time, a crash). A short-lived tool can leak instead.
 subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk, '-O2', '-Wall', '-Wextra', '-Werror',
-                '-fno-objc-arc', '-framework', 'Foundation', SOURCE, '-o', binary], check=True)
+                '-fno-objc-arc', '-framework', 'Foundation', '-framework', 'ImageIO', '-framework', 'CoreGraphics', SOURCE, '-o', binary], check=True)
 entitlements = OUT / 'entitlements.plist'
 entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True,
                                          'com.apple.private.coreservices.canmaplsdatabase': True,

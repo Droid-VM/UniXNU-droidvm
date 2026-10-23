@@ -15,14 +15,19 @@
 //   lsdiag [-u UID] container [-plugin] [-create] ID...   the data container MobileContainerManager keeps for each
 //                                       identifier, whether it is on disk; -create makes a missing one
 //   lsdiag [-u UID] point ID...          an extension point's LaunchServices record and the extensions enumerated for it
+//   lsdiag protect [-set] PATH...        data protection: the mount's, fcntl's class, NSURLFileProtectionKey (-set: None)
 //   lsdiag tree PATH [DEPTH]             a directory tree where only an entitled process may look (app containers)
 //   lsdiag show PATH...                  a file: a property list printed, anything else as text
+//   lsdiag procs [FILTER]                processes: pid, ppid, uid, p_comm, p_name (the GPU grant's name), executable path
+//   lsdiag copy SRC DST                  a file copied where the shell may read it (out of an app container)
+//   lsdiag image PATH [OUT.png]          an image as ImageIO decodes it: type, size, pixel mean and range; written as PNG
 //   lsdiag remove PATH...                removes files or directories there (an app's broken data store)
 //
 // The records come from the private LaunchServices classes, looked up at run time so nothing private is linked; a
 // selector a class does not answer prints as "n/a". -u switches to that user first (501 = mobile, whose database the
 // apps and widgets use), since root sees the system domain. A leading -c runs the query in a coalition of its own.
 #import <Foundation/Foundation.h>
+#import <ImageIO/ImageIO.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <objc/message.h>
@@ -470,6 +475,91 @@ static void show(NSArray<NSString *> *paths) {
     }
 }
 
+// The processes as the kernel names them: p_comm (16 characters), p_name (32: what proc_selfname and the GPU grant compare) and the
+// executable's path, those whose names hold FILTER if one is given (toybox here has no ps).
+// libproc, which the iOS SDK leaves out (macOS's libproc.h and sys/proc_info.h; libsystem has it on iOS too).
+int proc_listallpids(void *buffer, int size);
+int proc_pidinfo(int pid, int flavor, uint64_t argument, void *buffer, int size);
+int proc_pidpath(int pid, void *buffer, uint32_t size);
+struct proc_bsdinfo {
+    uint32_t pbi_flags, pbi_status, pbi_xstatus, pbi_pid, pbi_ppid;
+    uid_t pbi_uid; gid_t pbi_gid; uid_t pbi_ruid; gid_t pbi_rgid; uid_t pbi_svuid; gid_t pbi_svgid;
+    uint32_t rfu_1;
+    char pbi_comm[16], pbi_name[32];
+    uint32_t pbi_nfiles, pbi_pgid, pbi_pjobc, e_tdev, e_tpgid;
+    int32_t pbi_nice;
+    uint64_t pbi_start_tvsec, pbi_start_tvusec;
+};
+#define PROC_PIDTBSDINFO 3
+static void procs(NSArray<NSString *> *arguments) {
+    const char *filter = arguments.count ? arguments[0].UTF8String : NULL;
+    int count = proc_listallpids(NULL, 0);
+    if (count <= 0) {line(@"procs: %s", strerror(errno)); return;}
+    pid_t *pids = calloc((size_t)count + 64, sizeof(pid_t));
+    count = proc_listallpids(pids, (int)(((size_t)count + 64) * sizeof(pid_t)));
+    for (int i = 0; i < count; i++) {
+        struct proc_bsdinfo info;
+        if (proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &info, sizeof info) != (int)sizeof info) continue;
+        char path[4 * 1024] = {}, comm[17] = {}, name[33] = {};
+        memcpy(comm, info.pbi_comm, 16);
+        memcpy(name, info.pbi_name, 32);
+        proc_pidpath(pids[i], path, sizeof path);
+        if (filter && !strstr(comm, filter) && !strstr(name, filter) && !strstr(path, filter)) continue;
+        line(@"%5d %5u %4u comm '%s' name '%s' %s", pids[i], info.pbi_ppid, info.pbi_uid, comm, name, path);
+    }
+    free(pids);
+}
+
+// A file copied where the shell may read it (an app container's file: lsdiag holds the data-vault entitlement, the shell does not).
+static void copyFile(NSArray<NSString *> *arguments) {
+    if (arguments.count != 2) {line(@"copy SRC DST"); return;}
+    NSError *error = nil;
+    [[NSFileManager defaultManager] removeItemAtPath:arguments[1] error:nil];
+    BOOL ok = [[NSFileManager defaultManager] copyItemAtPath:arguments[0] toPath:arguments[1] error:&error];
+    line(@"copy %@ -> %@: %@", arguments[0], arguments[1], ok ? @"done" : error.localizedDescription);
+}
+
+// An image as ImageIO decodes it in this process: its type, size, mean and range of its pixels (a blank snapshot is uniform), and
+// optionally the first image written as a PNG.
+static void image(NSArray<NSString *> *arguments) {
+    if (!arguments.count) {line(@"image PATH [OUT.png]"); return;}
+    NSURL *url = [NSURL fileURLWithPath:arguments[0]];
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+    if (!source) {line(@"image %@: no image source", arguments[0]); return;}
+    line(@"image %@: type %@, %zu image(s), status %d, properties %@", arguments[0], CGImageSourceGetType(source), CGImageSourceGetCount(source),
+         (int)CGImageSourceGetStatus(source), CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL)));
+    CGImageRef picture = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    CFRelease(source);
+    if (!picture) {line(@"  no image decoded"); return;}
+    size_t width = CGImageGetWidth(picture), height = CGImageGetHeight(picture);
+    uint8_t *pixels = calloc(width * height, 4);
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pixels, width, height, 8, width * 4, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), picture);
+    double sum[4] = {};
+    uint8_t low[4] = {255, 255, 255, 255}, high[4] = {};
+    for (size_t i = 0; i < width * height; ++i)
+        for (int c = 0; c < 4; ++c) {
+            const uint8_t v = pixels[i * 4 + c];
+            sum[c] += v; if (v < low[c]) low[c] = v; if (v > high[c]) high[c] = v;
+        }
+    line(@"  %zux%zu bpc %zu: mean rgba %.1f %.1f %.1f %.1f, min %u %u %u %u, max %u %u %u %u", width, height, CGImageGetBitsPerComponent(picture),
+         sum[0] / (width * height), sum[1] / (width * height), sum[2] / (width * height), sum[3] / (width * height),
+         low[0], low[1], low[2], low[3], high[0], high[1], high[2], high[3]);
+    if (arguments.count > 1) {
+        CGImageDestinationRef out = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:arguments[1]], CFSTR("public.png"), 1, NULL);
+        if (out) {
+            CGImageDestinationAddImage(out, picture, NULL);
+            line(@"  png %@: %@", arguments[1], CGImageDestinationFinalize(out) ? @"written" : @"failed");
+            CFRelease(out);
+        }
+    }
+    CGContextRelease(context);
+    CGColorSpaceRelease(space);
+    free(pixels);
+    CGImageRelease(picture);
+}
+
 // An extension point as LaunchServices records it, and the extensions it enumerates for it (what ExtensionKit's queries read).
 static void points(NSArray<NSString *> *identifiers) {
     Class point = NSClassFromString(@"LSExtensionPointRecord"), extension = NSClassFromString(@"LSApplicationExtensionRecord");
@@ -496,6 +586,35 @@ static void removePaths(NSArray<NSString *> *paths) {
         NSError *error = nil;
         BOOL removed = [NSFileManager.defaultManager removeItemAtPath:path error:&error];
         line(@"remove %@: %@", path, removed ? @"removed" : error.localizedDescription);
+    }
+}
+
+// A file's data protection as the kernel and Foundation see it: the mount's content protection (MNT_CPROTECT), fcntl's class,
+// NSURLFileProtectionKey, and whether -set (NSURLFileProtectionNone) takes.
+static void protect(NSArray<NSString *> *arguments) {
+    BOOL set = arguments.count && [arguments[0] isEqualToString:@"-set"];
+    for (NSString *path in set ? [arguments subarrayWithRange:NSMakeRange(1, arguments.count - 1)] : arguments) {
+        struct statfs fs;
+        int mounted = statfs(path.fileSystemRepresentation, &fs);
+        int fd = open(path.fileSystemRepresentation, O_RDONLY);
+        int cls = fd >= 0 ? fcntl(fd, F_GETPROTECTIONCLASS) : -1;
+        int why = errno;
+        if (fd >= 0) close(fd);
+        NSURL *url = [NSURL fileURLWithPath:path];
+        id value = nil;
+        NSError *error = nil;
+        [url getResourceValue:&value forKey:NSURLFileProtectionKey error:&error];
+        line(@"protect %@: mount %s cprotect=%d, fcntl class %d%@, NSURLFileProtectionKey %@%@", path, mounted ? "?" : fs.f_mntonname,
+             mounted ? -1 : !!(fs.f_flags & MNT_CPROTECT), cls, cls < 0 ? [NSString stringWithFormat:@" (%s)", strerror(why)] : @"",
+             value, error ? [NSString stringWithFormat:@" (%@)", error.localizedDescription] : @"");
+        if (set) {
+            NSError *setError = nil;
+            BOOL ok = [url setResourceValue:NSURLFileProtectionNone forKey:NSURLFileProtectionKey error:&setError];
+            [url removeCachedResourceValueForKey:NSURLFileProtectionKey];
+            value = nil;
+            [url getResourceValue:&value forKey:NSURLFileProtectionKey error:nil];
+            line(@"  set NSURLFileProtectionNone: %@, now %@", ok ? @"YES" : setError.localizedDescription, value);
+        }
     }
 }
 
@@ -609,12 +728,20 @@ int main(int argc, char **argv) {
             bootstrap(identifiers);
         } else if ([verb isEqualToString:@"container"]) {
             containers(identifiers);
+        } else if ([verb isEqualToString:@"protect"]) {
+            protect(identifiers);
         } else if ([verb isEqualToString:@"point"]) {
             points(identifiers);
         } else if ([verb isEqualToString:@"tree"]) {
             tree(identifiers);
         } else if ([verb isEqualToString:@"remove"]) {
             removePaths(identifiers);
+        } else if ([verb isEqualToString:@"procs"]) {
+            procs(identifiers);
+        } else if ([verb isEqualToString:@"copy"]) {
+            copyFile(identifiers);
+        } else if ([verb isEqualToString:@"image"]) {
+            image(identifiers);
         } else if ([verb isEqualToString:@"show"]) {
             show(identifiers);
         } else {
