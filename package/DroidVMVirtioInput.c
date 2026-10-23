@@ -212,6 +212,15 @@ static int32_t input_scale(int32_t value, int32_t min, int32_t span, int32_t axi
 // The digitizer's report count when the finger set was last published.
 static uint32_t droidvm_published_at;
 
+// NativeHidInput reads a published finger set when it is told to (it has no timer for touch): the sink it installs, as with sheng's
+// touch thread (kits/sheng/TouchProbe.cpp). It runs the report on its work loop, from this input thread.
+static void (*droidvm_touch_sink)(void *);
+static void *droidvm_touch_sink_context;
+void native_touch_set_sink(void (*sink)(void *), void *context) {
+    droidvm_touch_sink_context = context;
+    __atomic_store_n(&droidvm_touch_sink, sink, __ATOMIC_RELEASE);
+}
+
 static void touch_publish(const struct droidvm_finger *fingers, unsigned count) {
     droidvm_published_at = native_touch_hid_reports;
     uint32_t seq = native_touch_seq & ~1u;
@@ -226,6 +235,8 @@ static void touch_publish(const struct droidvm_finger *fingers, unsigned count) 
     __asm__ volatile("dmb ish" ::: "memory");
     native_touch_seq = seq + 2;
     droidvm_input_published = droidvm_input_published + 1;
+    void (*sink)(void *) = __atomic_load_n(&droidvm_touch_sink, __ATOMIC_ACQUIRE);
+    if (sink) sink(droidvm_touch_sink_context);
 }
 
 // Waits (bounded) until the digitizer has turned the last publication into a report.
@@ -242,8 +253,8 @@ static bool finger_down(const struct droidvm_finger *f) {
 static void touch_frame(void) {
     struct droidvm_finger next[DROIDVM_TOUCH_FINGERS];
     unsigned n = 0;
-    // The digitizer samples every 8 ms and only sees the newest set: a finger that lifts before the set it went down in
-    // was reported would never have touched. A tap's down and up frames often arrive within one poll.
+    // The digitizer reports only the newest set: a finger that lifts before the set it went down in was reported would
+    // never have touched. A tap's down and up frames often arrive within one poll.
     bool lifting = false;
     for (unsigned i = 0; i < droidvm_order_count && !lifting; ++i) lifting = !finger_down(&droidvm_order[i]);
     if (lifting && native_touch_hid_reports == droidvm_published_at) touch_wait_report(droidvm_published_at);

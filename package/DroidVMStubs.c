@@ -83,6 +83,8 @@ void native_touch_probe(void) {
         thread_deallocate(thread);
 }
 void sheng_cpufreq_probe(void) {}
+// NativeHidInput hands its button sink to sheng's ButtonProbe; this board has no buttons to report.
+void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) {(void)sink;(void)context;}
 
 // The shared probes declare sheng's diagnostic page (BootProgress.c) weak and test for it, but a static kernel link
 // still needs a definition. These keep the behaviour of a board without it: no diagnostic writer to yield to and no

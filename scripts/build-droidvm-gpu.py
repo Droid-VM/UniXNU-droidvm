@@ -2,17 +2,17 @@
 """Build the DroidVM guest's paravirtual Adreno (kits/droidvm/DroidVMGpu.cpp) with the parts of NativeAdreno it keeps.
 
 NativeAdreno's user client, IOKit surface, execbuf and memory (NativeAdrenoUserClient, NativeAdrenoPublish, NativeAdrenoSubmit,
-NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled unchanged, except for a few lines of two
-files, compiled from staged copies: NativeAdrenoPublish.cpp's client windows are absolute addresses of sheng's GPU address space
+NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled unchanged, except for a few lines of
+NativeAdrenoPublish.cpp, compiled from a staged copy: its client windows are absolute addresses of sheng's GPU address space
 (0x20000000..), and here the space is the KGSL VBO the host reserved, so they are offset from droidvm_gpu_window_base() (the VBO's
-start), and there are six of them instead of three, and its user client frees its views the way they were allocated (below);
-NativeAdrenoUserClient.cpp's setScope() refuses a new connection while the render server has jobs in flight (below). The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer)
+start), and there are six of them instead of four (below). The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer)
 come from DroidVMGpu.cpp instead of their own sources. The staged AGXAccelerator (build-native-adreno-accelerator.py) rides
 along for droidvm-gpu-metal=1.
 
 The objects land in build/droidvm-gpu; build-native-legacy-display.py archives them into the late display archive, which the
 kernel force-loads (this board does not select CONFIG_XNU_NATIVE_ADRENO, the sheng GPU)."""
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -62,39 +62,21 @@ if publish.count(anchor) != 1:
     sys.exit('NativeAdrenoPublish.cpp include anchor not found')
 publish = publish.replace(anchor, anchor + '/* DroidVM: the clients\' windows start at the VBO (kits/droidvm/DroidVMGpu.cpp). */\n'
                           'extern "C" uint64_t droidvm_gpu_window_base(void);\n')
-# Six connections instead of three: the render server, the widget renderer and the wallpaper already take three, and iconservicesagent
-# (the app icons) needs a fourth. The added windows follow the others (256 MiB each), still inside the 3 GiB of the VBO that
-# DroidVMGpu.cpp requires; sheng's aperture ends at the third.
-table = ('enum : unsigned {NativeAdrenoMaxClients=3};\n'
-         'static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={\n'
-         '    {0x20000000ull,0x40000000ull},{0x60000000ull,0x10000000ull},{0x70000000ull,0x10000000ull}};')
-if publish.count(table) != 1:
-    sys.exit('NativeAdrenoPublish.cpp no longer declares the three client windows')
-publish = publish.replace(table, 'enum : unsigned {NativeAdrenoMaxClients=6};\n'
+# Six connections instead of NativeAdreno's four: the render server, the widget renderer, the wallpaper and the app icons take four,
+# and WebKit's GPU and WebContent processes (droidvm-gpu-clients com.apple.WebKit.*) need two more. The render server keeps its 1 GiB;
+# the others get 256 MiB each, following it, still inside the 3 GiB of the VBO that DroidVMGpu.cpp requires (sheng's aperture ends
+# at 0x80000000, so NativeAdreno splits it in three).
+table = re.search(r'enum : unsigned \{NativeAdrenoMaxClients=4\};\n'
+                  r'static const struct \{uint64_t start,bytes;\} kClientWindows\[NativeAdrenoMaxClients\]=\{\n'
+                  r'    \{0x20000000ull,0x40000000ull\}(,\{0x[0-9A-Fa-f]+ull,0x[0-9A-Fa-f]+ull\}){3}\};', publish)
+if not table:
+    sys.exit('NativeAdrenoPublish.cpp no longer declares the four client windows')
+publish = publish.replace(table[0], 'enum : unsigned {NativeAdrenoMaxClients=6};\n'
                           'static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={\n'
                           '    {0x20000000ull,0x40000000ull},{0x60000000ull,0x10000000ull},{0x70000000ull,0x10000000ull},\n'
                           '    {0x80000000ull,0x10000000ull},{0x90000000ull,0x10000000ull},{0xa0000000ull,0x10000000ull}};')
-# The user client's views are allocated typed (IONewZero: a View holds a descriptor pointer) but were freed to the data heap
-# (IODeleteData), which kfree catches as heap confusion and panics on in AGXDeviceUserClient::free(). Nothing freed a user client
-# while only the render server, which never exits, opened one; the granted clients (DroidVMGpu.cpp grantedProcesses) close theirs.
-# A NativeAdreno bug: the same one-line fix belongs upstream.
-free_views = 'if(views_) {IODeleteData(views_,View,MaxViews);views_=nullptr;}'
-if publish.count(free_views) != 1:
-    sys.exit('NativeAdrenoPublish.cpp no longer frees its views with IODeleteData exactly once')
-publish = publish.replace(free_views, 'if(views_) {IODelete(views_,View,MaxViews);views_=nullptr;}')
 staged = OUT / 'NativeAdrenoPublish.cpp'
 staged.write_text(publish)
-
-# A new connection's setScope() also asks whether its current queue range has jobs outstanding, and an unscoped core's range is 0,
-# the render server's: while the render server has a job in flight every other process's open fails with kIOReturnBusy (a listed
-# client then keeps the software renderer for good). The old range matters only once the core was scoped.
-client = (ADRENO / 'NativeAdrenoUserClient.cpp').read_text()
-check = 'if(liveObjects() || submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues) ||'
-if client.count(check) != 1:
-    sys.exit('NativeAdrenoUserClient.cpp no longer checks the old queue range in setScope exactly once')
-client = client.replace(check, 'if(liveObjects() || (window_bytes_ && submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues)) ||')
-staged_client = OUT / 'NativeAdrenoUserClient.cpp'
-staged_client.write_text(client)
 
 cxx = recipe('iokit/DEVELOPMENT/IOPlatformExpert.cpo.json')
 c = recipe('bsd/DEVELOPMENT/bsd_init.o.json')
@@ -103,7 +85,7 @@ includes = ['-I', str(ADRENO), '-I', str(ROOT / 'kits/ArmSmmu4K'), '-I', str(ROO
 warnings = ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-incompatible-sysroot', '-Wno-c99-designator',
             '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion', '-Wno-unnecessary-virtual-specifier']
 sources = [ADRENO / name for name in ('NativeAdrenoSubmit.cpp', 'NativeAdrenoMemory.cpp', 'NativeAdrenoCpu.cpp')]
-sources += [staged_client, staged, ROOT / 'kits/droidvm/DroidVMGpu.cpp']
+sources += [ADRENO / 'NativeAdrenoUserClient.cpp', staged, ROOT / 'kits/droidvm/DroidVMGpu.cpp']
 objects = []
 for source in sources:
     obj = OUT / (source.stem + '.o')

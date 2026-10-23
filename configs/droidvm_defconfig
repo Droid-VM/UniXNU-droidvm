@@ -5,6 +5,9 @@
 # (verified owner root), and the Data volume as a packed RAM disk. Nothing of sheng's hardware (UFS, PMGR,
 # Adreno, touch) is linked.
 
+# run the board's archive builders ([kernel] archives of board.toml) before the link; upstream runs them only when a
+# configuration asks
+CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
 CONFIG_XNU_SOURCE_PTHREAD=y
 CONFIG_XNU_ARM_DT_PLATFORM=y

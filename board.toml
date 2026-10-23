@@ -109,7 +109,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "3ad3762611e1f78119bfd875651632307c04343cbe59e3562880b3c0327659da",
+  "ba5beee99001802ab5533eb7beea28d357381b72b3a3094c8c4f81a318dee19e",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -153,7 +153,7 @@ kernel_args = [
   "droidvm-data-persist=2",
   # the deletable system apps (Weather, Calendar, Notes, Maps, ...): the OS volume's /private/var/staged_system_apps as a read-only
   # union view over /Applications, since the Data seed carries no copy for the first boot's migration to install (UniXNU
-  # patches/xnu/zzy-owner-staged-apps-mount.patch)
+  # patches/xnu/zzy-union-staged-apps.patch)
   "owner-staged-apps=1",
   # the App cryptex (Safari's daemons, SafariSupport.bundle, Safari's settings pane) from the seed's /private/var/ngpu/preboot shown
   # read-only over /private/preboot, where /System/Cryptexes/App leads (package/DroidVMLaunchPolicy.c, scripts/add-app-cryptex-data.py)
@@ -164,7 +164,7 @@ kernel_args = [
   "owner-tools-overlay=1",
   # Our owner-signed binaries are in the trust cache but not platform binaries, so AMFI's launch constraints (which gate a
   # system-service launch on a platform binary) kill them with "Launch Constraint Violation". The original RELEASE AMFI
-  # ignores its own amfi_* boot-args, so XNU clears the error itself (patches/xnu/zzy-owner-staged-apps-mount.patch). This
+  # ignores its own amfi_* boot-args, so XNU clears the error itself (patches/xnu/zzy-union-staged-apps.patch). This
   # VM is not a security boundary.
   "owner-skip-launch-constraints=1",
   # start the owner service manager once at boot. launchd takes its jobs from the signed compiled cache and ignores an owner
