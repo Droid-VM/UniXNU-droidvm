@@ -89,6 +89,28 @@ if not table:
 windows = ','.join('{%#xull,0x40000000ull}' % (0x20000000 + (i << 30)) for i in range(10))
 publish = publish.replace(table[0], 'enum : unsigned {NativeAdrenoMaxClients=10};\n'
                           'static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={\n    ' + windows + '};')
+# A client that dies with its BOs mapped: a crash's corpse keeps its address space while IOKit closes the connection
+# (iokit_client_died under ipc_space_terminate), so clientClose freed BO pages the dead process still mapped through their CPU
+# views, and the VM's pmap_assert_free panicked the guest (WidgetRenderer_Default crashed with BOs from the scattered path; pooled
+# BOs never go back to the VM). The views are physical-range descriptors that do not hold the pages, so every mapping IOKit made
+# of this connection's memory is taken down first, then the connection closes as before.
+declaration = '    IOReturn clientClose() APPLE_KEXT_OVERRIDE;\n'
+if publish.count(declaration) != 1:
+    sys.exit('NativeAdrenoPublish.cpp no longer declares AGXDeviceUserClient::clientClose exactly once')
+publish = publish.replace(declaration, declaration + '    IOReturn clientDied() APPLE_KEXT_OVERRIDE;\n')
+definition = 'void AGXDeviceUserClient::free()\n'
+if publish.count(definition) != 1:
+    sys.exit('NativeAdrenoPublish.cpp no longer defines AGXDeviceUserClient::free exactly once')
+publish = publish.replace(definition, 'IOReturn AGXDeviceUserClient::clientDied()\n'
+                          '{\n'
+                          '    if(mappings) {\n'
+                          '        if(OSCollectionIterator *iterator=OSCollectionIterator::withCollection(mappings)) {\n'
+                          '            while(OSObject *object=iterator->getNextObject())if(IOMemoryMap *map=OSDynamicCast(IOMemoryMap,object))map->unmap();\n'
+                          '            iterator->release();\n'
+                          '        }\n'
+                          '    }\n'
+                          '    return IOUserClient::clientDied();\n'
+                          '}\n' + definition)
 staged = OUT / 'NativeAdrenoPublish.cpp'
 staged.write_text(publish)
 
