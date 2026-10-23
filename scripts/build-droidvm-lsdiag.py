@@ -37,7 +37,9 @@ entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-containe
                                          'com.apple.private.mobileinstall.allowedSPI': ['EnumerateInstalledAppsForLaunchServices',
                                                                                         'InstallForLaunchServices'],
                                          'com.apple.mobileinstallation.enumeration': True,
-                                         'com.apple.private.coreservices.can-register-install-results': True}))
+                                         'com.apple.private.coreservices.can-register-install-results': True,
+                                         'com.apple.private.MobileContainerManager.allowed': True,
+                                         'com.apple.private.security.storage.AppDataContainers': True}))
 subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'org.droidvm.lsdiag',
                 '--entitlements', entitlements, binary], check=True)
 detail = subprocess.run(['codesign', '--display', '--verbose=4', binary], capture_output=True, text=True, check=True).stderr

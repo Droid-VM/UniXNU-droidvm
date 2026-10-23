@@ -12,6 +12,12 @@
 //   lsdiag nodes PATH...                 stat/getattrlist IDs of each path and whether fsgetpath leads back to it
 //   lsdiag fsnode PATH...                what LaunchServices' FSNode answers: path, length, file and volume IDs
 //   lsdiag [-u UID] boot [SERVICE...]    this process's bootstrap port, and a bootstrap_look_up of each service
+//   lsdiag [-u UID] container [-plugin] [-create] ID...   the data container MobileContainerManager keeps for each
+//                                       identifier, whether it is on disk; -create makes a missing one
+//   lsdiag [-u UID] point ID...          an extension point's LaunchServices record and the extensions enumerated for it
+//   lsdiag tree PATH [DEPTH]             a directory tree where only an entitled process may look (app containers)
+//   lsdiag show PATH...                  a file: a property list printed, anything else as text
+//   lsdiag remove PATH...                removes files or directories there (an app's broken data store)
 //
 // The records come from the private LaunchServices classes, looked up at run time so nothing private is linked; a
 // selector a class does not answer prints as "n/a". -u switches to that user first (501 = mobile, whose database the
@@ -217,6 +223,9 @@ static void midump(NSArray<NSString *> *filters) {
         if (!wanted) return;
         line(@"%@ type=%@ owner=%@ path=%@", identifier, item[@"ApplicationType"], item[@"PluginOwnerBundleID"], item[@"Path"]);
         line(@"    keys: %@", [[item.allKeys sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" "]);
+        // where the item's data lives: its container and the kinds of container it is given
+        for (NSString *key in @[@"Container", @"IsContainerized", @"HasSystemContainer", @"HasSystemGroupContainers", @"GroupContainers"])
+            if (item[key]) line(@"    %@ = %@", key, [[item[key] description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "]);
     });
     line(@"midump: %lu items, returned %@", (unsigned long)total, result);
 }
@@ -403,6 +412,93 @@ extern kern_return_t bootstrap_look_up(mach_port_t bootstrap, const char *name, 
 extern char *bootstrap_strerror(kern_return_t error);
 
 // The bootstrap port this process reaches launchd through, and a plain lookup of each name on it.
+// The data container MobileContainerManager keeps for each identifier (an app's, or with -plugin an extension's), and whether its
+// directory exists; -create asks it to make a missing one (createIfNecessary), as an install would.
+static void containers(NSArray<NSString *> *arguments) {
+    BOOL create = NO, plugin = NO;
+    NSMutableArray<NSString *> *identifiers = [NSMutableArray array];
+    for (NSString *argument in arguments) {
+        if ([argument isEqualToString:@"-create"]) create = YES;
+        else if ([argument isEqualToString:@"-plugin"]) plugin = YES;
+        else [identifiers addObject:argument];
+    }
+    dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
+    Class cls = NSClassFromString(plugin ? @"MCMPluginKitPluginDataContainer" : @"MCMAppDataContainer");
+    SEL lookup = sel_registerName("containerWithIdentifier:createIfNecessary:existed:error:");
+    if (!cls || ![cls respondsToSelector:lookup]) {
+        line(@"container: no %@", plugin ? @"MCMPluginKitPluginDataContainer" : @"MCMAppDataContainer");
+        return;
+    }
+    for (NSString *identifier in identifiers) {
+        BOOL existed = NO;
+        NSError *error = nil;
+        id container = ((id (*)(Class, SEL, NSString *, BOOL, BOOL *, NSError **))objc_msgSend)(cls, lookup, identifier, create, &existed,
+                                                                                               &error);
+        NSURL *url = [container respondsToSelector:@selector(url)] ? [container performSelector:@selector(url)] : nil;
+        struct stat st;
+        BOOL present = url && stat(url.fileSystemRepresentation, &st) == 0;
+        line(@"container %@: %@ existed=%d on-disk=%d%@", identifier, url.path ?: @"(none)", existed, present,
+             error ? [NSString stringWithFormat:@" error=%@", error] : @"");
+    }
+}
+
+// A directory tree (paths, sizes, modification dates) where only an entitled process may look: the app data containers.
+static void tree(NSArray<NSString *> *arguments) {
+    if (!arguments.count) return;
+    NSUInteger depth = arguments.count > 1 ? (NSUInteger)arguments[1].integerValue : 4;
+    NSString *root = arguments[0];
+    NSDirectoryEnumerator *walk = [NSFileManager.defaultManager enumeratorAtURL:[NSURL fileURLWithPath:root]
+        includingPropertiesForKeys:@[NSURLFileSizeKey, NSURLContentModificationDateKey, NSURLIsDirectoryKey] options:0
+        errorHandler:^BOOL(NSURL *url, NSError *error) { line(@"tree: %@: %@", url.path, error.localizedDescription); return YES; }];
+    for (NSURL *url in walk) {
+        if (walk.level > depth) {[walk skipDescendants]; continue;}
+        NSDictionary *values = [url resourceValuesForKeys:@[NSURLFileSizeKey, NSURLContentModificationDateKey, NSURLIsDirectoryKey] error:nil];
+        line(@"%@%@ %@ %@", [@"" stringByPaddingToLength:2 * (walk.level - 1) withString:@" " startingAtIndex:0],
+             [url.path substringFromIndex:MIN(root.length + 1, url.path.length)],
+             [values[NSURLIsDirectoryKey] boolValue] ? @"/" : values[NSURLFileSizeKey], values[NSURLContentModificationDateKey]);
+    }
+}
+
+// A file's content: a property list as its description, anything else as text.
+static void show(NSArray<NSString *> *paths) {
+    for (NSString *path in paths) {
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) {line(@"show %@: unreadable (%s)", path, strerror(errno)); continue;}
+        id plist = [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:nil];
+        line(@"show %@ (%lu bytes):\n%@", path, (unsigned long)data.length,
+             plist ?: [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"(binary)");
+    }
+}
+
+// An extension point as LaunchServices records it, and the extensions it enumerates for it (what ExtensionKit's queries read).
+static void points(NSArray<NSString *> *identifiers) {
+    Class point = NSClassFromString(@"LSExtensionPointRecord"), extension = NSClassFromString(@"LSApplicationExtensionRecord");
+    for (NSString *identifier in identifiers) {
+        NSError *error = nil;
+        id record = ((id (*)(id, SEL, NSString *, NSError **))objc_msgSend)([point alloc], sel_registerName("initWithIdentifier:error:"),
+                                                                           identifier, &error);
+        line(@"point %@: %@%@", identifier, record ? [record description] : @"no record", error ? [NSString stringWithFormat:@" (%@)", error] : @"");
+        if (!record) continue;
+        id enumerator = ((id (*)(Class, SEL, id, NSUInteger))objc_msgSend)(extension,
+                                                                            sel_registerName("enumeratorWithExtensionPointRecord:options:"), record, 0);
+        NSUInteger count = 0;
+        for (id found in enumerator) {
+            line(@"  %@ %@", [found valueForKey:@"bundleIdentifier"], [[found valueForKey:@"URL"] path]);
+            ++count;
+        }
+        line(@"  %lu extensions", (unsigned long)count);
+    }
+}
+
+// Removes files or directories (recursively) where only an entitled process may write, e.g. an app's broken data store.
+static void removePaths(NSArray<NSString *> *paths) {
+    for (NSString *path in paths) {
+        NSError *error = nil;
+        BOOL removed = [NSFileManager.defaultManager removeItemAtPath:path error:&error];
+        line(@"remove %@: %@", path, removed ? @"removed" : error.localizedDescription);
+    }
+}
+
 static void bootstrap(NSArray<NSString *> *names) {
     mach_port_t special = MACH_PORT_NULL;
     kern_return_t kr = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &special);
@@ -511,6 +607,16 @@ int main(int argc, char **argv) {
             bundle(identifiers);
         } else if ([verb isEqualToString:@"boot"]) {
             bootstrap(identifiers);
+        } else if ([verb isEqualToString:@"container"]) {
+            containers(identifiers);
+        } else if ([verb isEqualToString:@"point"]) {
+            points(identifiers);
+        } else if ([verb isEqualToString:@"tree"]) {
+            tree(identifiers);
+        } else if ([verb isEqualToString:@"remove"]) {
+            removePaths(identifiers);
+        } else if ([verb isEqualToString:@"show"]) {
+            show(identifiers);
         } else {
             fprintf(stderr, "unknown verb %s\n", argv[at - 1]);
             return 2;
