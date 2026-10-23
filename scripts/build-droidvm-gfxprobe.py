@@ -25,7 +25,7 @@ sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'],
 binary = OUT / 'gfxprobe'
 subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk, '-O2', '-Wall', '-Wextra', '-Werror',
                 '-fno-objc-arc', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface',
-                '-framework', 'QuartzCore', '-framework', 'IOKit', SOURCE, '-o', binary], check=True)
+                '-framework', 'QuartzCore', '-framework', 'IOKit', '-framework', 'CoreGraphics', SOURCE, '-o', binary], check=True)
 entitlements = OUT / 'entitlements.plist'
 # The platform sandbox refuses IOServiceOpen of a user-client class a process is not granted: the surface and GPU clients it opens.
 entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True,

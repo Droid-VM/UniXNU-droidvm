@@ -106,7 +106,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "5bb6a349bdea07544d6c574dfb5f8f06adc92434bb0a1b3a14f86e0b07a8e687",
+  "5fccc8d146a2b9d6d9643a08f35b115a836386683981ec08b1ff59e420b604d4",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -177,9 +177,10 @@ kernel_args = [
   # the processes besides backboardd that get a Metal device of their own (DroidVMLaunchPolicy.c writes the plugin's clients file):
   # WidgetRenderer draws the widgets through RenderBox, PosterBoard the wallpaper, and iconservicesagent the app icons, whose
   # CoreImage context otherwise falls back to OpenGL ES and crashes in CI::GLContext on every icon (sheng disables the job);
-  # WebKit's GPU process draws Safari's pages (the kernel's grant compares the first 16 characters of a name, com.apple.WebKit,
-  # so WebKit's other processes may open the GPU too; the plugin gives a device to the GPU process alone)
-  "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent,com.apple.WebKit.GPU",
+  # and WebKit's processes, com.apple.WebKit.* (a name ending in '*' names every process it begins; the kernel's grant compares
+  # the first 16 characters): CoreGraphics draws a page's wide-color layers ('b3a8', 'w30r') only through the GPU, so without a
+  # device WebContent drew nothing into them and Safari's pages were black
+  "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent,com.apple.WebKit.*",
 ]
 
 [payload.adt]
@@ -198,5 +199,8 @@ chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
 # The third crosvm --virtio-mmio-block (tools/rig/make-data-store.sh) is the store disk, not a NativeVirtioBlock image;
 # --virtio-mmio-input puts the app's four input devices (mouse, multi-touch, absolute mouse, keyboard) after the disks,
 # --droidvm-gpu its GPU after them, and --virtio-mmio-net the --net device last (/arm-io/net, package/DroidVMVirtioNet.c).
+# --display-gamut sRGB: the display chain scans out 8-bit sRGB (BGRX), and with the panel's P3 every app and WebKit drew its layers
+# into wide-color surfaces ('w30r', 'b3a8') that CoreGraphics fills only through the GPU -- which WebKit's sandboxed GPU process
+# cannot map -- so Safari's pages stayed black; sRGB keeps them on 8-bit BGRA surfaces CoreGraphics draws on the CPU too.
 tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000",
-             "--gpu-mmio", "0x0a007000", "--net-mmio", "0x0a008000", "--reclaim-memory"]
+             "--gpu-mmio", "0x0a007000", "--net-mmio", "0x0a008000", "--reclaim-memory", "--display-gamut", "sRGB"]
