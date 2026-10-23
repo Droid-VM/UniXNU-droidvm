@@ -39,9 +39,9 @@ extern void IOSleep(unsigned milliseconds);
 
 enum { EV_SYN = 0, EV_KEY = 1, EV_ABS = 3 };
 enum { SYN_REPORT = 0, ABS_X = 0, ABS_Y = 1, ABS_MT_SLOT = 0x2f, ABS_MT_POSITION_X = 0x35, ABS_MT_POSITION_Y = 0x36,
-       ABS_MT_TRACKING_ID = 0x39, BTN_LEFT = 0x110, BTN_TOUCH = 0x14a, INPUT_PROP_DIRECT = 1 };
+       ABS_MT_TRACKING_ID = 0x39, BTN_LEFT = 0x110, BTN_TOUCH = 0x14a, INPUT_PROP_DIRECT = 1, KEY_ENTER = 28, KEY_A = 30 };
 enum { CFG_ID_NAME = 1, CFG_PROP_BITS = 0x10, CFG_EV_BITS = 0x11, CFG_ABS_INFO = 0x12 };
-enum { KIND_NONE, KIND_TOUCH, KIND_POINTER };
+enum { KIND_NONE, KIND_TOUCH, KIND_POINTER, KIND_KEYBOARD };
 
 struct droidvm_input_desc { uint64_t address; uint32_t length; uint16_t flags, next; };
 struct droidvm_input_event { uint16_t type, code; int32_t value; };
@@ -60,13 +60,16 @@ struct droidvm_input {
     struct { int32_t id, x, y; } slots[DROIDVM_INPUT_SLOTS];   // id -1: no finger
     int32_t pointer_x, pointer_y;
     bool pointer_down;
+    uint8_t key_modifiers, keys[6];   // a keyboard's boot report state: modifier bits and up to six usages held
+    bool keys_changed;
 };
 static struct droidvm_input droidvm_inputs[DROIDVM_INPUT_DEVICES];
 static unsigned droidvm_input_count;
 
-// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 0 left alone), events and frames seen.
+// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 0 left alone), events and frames
+// seen, keyboard reports sent.
 volatile uint32_t droidvm_input_found, droidvm_input_started, droidvm_input_kinds[DROIDVM_INPUT_DEVICES];
-volatile uint64_t droidvm_input_events, droidvm_input_frames, droidvm_input_published;
+volatile uint64_t droidvm_input_events, droidvm_input_frames, droidvm_input_published, droidvm_input_key_reports;
 char droidvm_input_names[DROIDVM_INPUT_DEVICES][48];
 
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
@@ -196,6 +199,7 @@ static unsigned input_identify(struct droidvm_input *d) {
         (input_bit(keys, nkeys, BTN_LEFT) || input_bit(keys, nkeys, BTN_TOUCH)) &&
         input_axis(d, ABS_X, &d->min_x, &d->span_x) && input_axis(d, ABS_Y, &d->min_y, &d->span_y))
         return KIND_POINTER;
+    if (input_bit(keys, nkeys, KEY_A) && input_bit(keys, nkeys, KEY_ENTER)) return KIND_KEYBOARD;
     return KIND_NONE;
 }
 
@@ -305,6 +309,69 @@ static void touch_frame(void) {
     touch_publish(droidvm_order, droidvm_order_count);
 }
 
+// The keyboard: Linux key codes (what the app's virtio keyboard sends) as USB HID keyboard usages, and the eight modifier keys as
+// the boot report's modifier bits. NativeHidInput sends each state as its report 1 when told (native_keyboard_set_sink, from this
+// input thread), as the touch frames.
+static const uint8_t droidvm_key_usages[128] = {
+    [1] = 0x29, [2] = 0x1e, [3] = 0x1f, [4] = 0x20, [5] = 0x21, [6] = 0x22, [7] = 0x23, [8] = 0x24, [9] = 0x25, [10] = 0x26,
+    [11] = 0x27, [12] = 0x2d, [13] = 0x2e, [14] = 0x2a, [15] = 0x2b, [16] = 0x14, [17] = 0x1a, [18] = 0x08, [19] = 0x15,
+    [20] = 0x17, [21] = 0x1c, [22] = 0x18, [23] = 0x0c, [24] = 0x12, [25] = 0x13, [26] = 0x2f, [27] = 0x30, [28] = 0x28,
+    [30] = 0x04, [31] = 0x16, [32] = 0x07, [33] = 0x09, [34] = 0x0a, [35] = 0x0b, [36] = 0x0d, [37] = 0x0e, [38] = 0x0f,
+    [39] = 0x33, [40] = 0x34, [41] = 0x35, [43] = 0x31, [44] = 0x1d, [45] = 0x1b, [46] = 0x06, [47] = 0x19, [48] = 0x05,
+    [49] = 0x11, [50] = 0x10, [51] = 0x36, [52] = 0x37, [53] = 0x38, [55] = 0x55, [57] = 0x2c, [58] = 0x39, [59] = 0x3a,
+    [60] = 0x3b, [61] = 0x3c, [62] = 0x3d, [63] = 0x3e, [64] = 0x3f, [65] = 0x40, [66] = 0x41, [67] = 0x42, [68] = 0x43,
+    [69] = 0x53, [70] = 0x47, [71] = 0x5f, [72] = 0x60, [73] = 0x61, [74] = 0x56, [75] = 0x5c, [76] = 0x5d, [77] = 0x5e,
+    [78] = 0x57, [79] = 0x59, [80] = 0x5a, [81] = 0x5b, [82] = 0x62, [83] = 0x63, [86] = 0x64, [87] = 0x44, [88] = 0x45,
+    [96] = 0x58, [98] = 0x54, [99] = 0x46, [102] = 0x4a, [103] = 0x52, [104] = 0x4b, [105] = 0x50, [106] = 0x4f, [107] = 0x4d,
+    [108] = 0x51, [109] = 0x4e, [110] = 0x49, [111] = 0x4c, [127] = 0x65,
+};
+static uint8_t key_modifier(unsigned code) {
+    switch (code) {
+    case 29: return 0x01; case 42: return 0x02; case 56: return 0x04; case 125: return 0x08;   // left Ctrl, Shift, Alt, Meta
+    case 97: return 0x10; case 54: return 0x20; case 100: return 0x40; case 126: return 0x80;  // right Ctrl, Shift, Alt, Meta
+    default: return 0;
+    }
+}
+static void (*droidvm_keyboard_sink)(void *, const uint8_t *);
+static void *droidvm_keyboard_sink_context;
+void native_keyboard_set_sink(void (*sink)(void *, const uint8_t *), void *context) {
+    droidvm_keyboard_sink_context = context;
+    __atomic_store_n(&droidvm_keyboard_sink, sink, __ATOMIC_RELEASE);
+}
+// A key down or up (auto-repeat is the guest's own, so the device's repeats are not passed on). A seventh key held is dropped.
+static void keyboard_key(struct droidvm_input *d, unsigned code, bool down) {
+    uint8_t bit = key_modifier(code);
+    if (bit) {
+        d->key_modifiers = down ? (uint8_t)(d->key_modifiers | bit) : (uint8_t)(d->key_modifiers & ~bit);
+        d->keys_changed = true;
+        return;
+    }
+    uint8_t usage = code < sizeof(droidvm_key_usages) ? droidvm_key_usages[code] : 0;
+    if (!usage) return;
+    unsigned i = 0;
+    while (i < 6 && d->keys[i] != usage) ++i;
+    if (down && i == 6) {
+        for (i = 0; i < 6 && d->keys[i]; ++i) {}
+        if (i == 6) return;
+        d->keys[i] = usage;
+    } else if (!down && i < 6) {
+        memmove(&d->keys[i], &d->keys[i + 1], 5 - i);
+        d->keys[5] = 0;
+    } else {
+        return;
+    }
+    d->keys_changed = true;
+}
+static void keyboard_publish(struct droidvm_input *d) {
+    void (*sink)(void *, const uint8_t *) = __atomic_load_n(&droidvm_keyboard_sink, __ATOMIC_ACQUIRE);
+    if (!d->keys_changed || !sink) return;
+    uint8_t report[8] = {d->key_modifiers, 0};
+    memcpy(report + 2, d->keys, sizeof(d->keys));
+    d->keys_changed = false;
+    sink(droidvm_keyboard_sink_context, report);
+    droidvm_input_key_reports = droidvm_input_key_reports + 1;
+}
+
 static bool input_event(struct droidvm_input *d, const struct droidvm_input_event *e) {
     droidvm_input_events = droidvm_input_events + 1;
     if (e->type == EV_SYN) return e->code == SYN_REPORT;
@@ -319,6 +386,8 @@ static bool input_event(struct droidvm_input *d, const struct droidvm_input_even
         if (e->type == EV_ABS && e->code == ABS_X) d->pointer_x = e->value;
         else if (e->type == EV_ABS && e->code == ABS_Y) d->pointer_y = e->value;
         else if (e->type == EV_KEY && (e->code == BTN_LEFT || e->code == BTN_TOUCH)) d->pointer_down = e->value != 0;
+    } else if (d->kind == KIND_KEYBOARD && e->type == EV_KEY && e->value != 2) {
+        keyboard_key(d, e->code, e->value != 0);
     }
     return false;
 }
@@ -337,7 +406,8 @@ static void input_poll(struct droidvm_input *d) {
         if (id < d->size) {
             if (input_event(d, &droidvm_input_buffers[d->index][id])) {
                 droidvm_input_frames = droidvm_input_frames + 1;
-                touch_frame();
+                if (d->kind == KIND_KEYBOARD) keyboard_publish(d);
+                else touch_frame();
             }
             available[2 + (head + returned) % d->size] = (uint16_t)id;
             ++returned;
@@ -406,7 +476,7 @@ void droidvm_input_start(void) {
             droidvm_input_kinds[droidvm_input_count] = KIND_NONE;
             continue;
         }
-        printf("droidvm input %s: %s, %s\n", path, droidvm_input_names[d->index], d->kind == KIND_TOUCH ? "touch" : "pointer");
+        printf("droidvm input %s: %s, %s\n", path, droidvm_input_names[d->index], d->kind == KIND_TOUCH ? "touch" : d->kind == KIND_POINTER ? "pointer" : "keyboard");
         droidvm_input_count++;
     }
     droidvm_input_started = droidvm_input_count;

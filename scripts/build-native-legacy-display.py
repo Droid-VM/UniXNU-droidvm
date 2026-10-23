@@ -352,6 +352,47 @@ gpu_sources=[ROOT/p for p in json.loads((ROOT/'build/droidvm-gpu/sources.json').
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end='')
 hid_dir=ROOT/'build/native-hid-input'
+# The HID device also sends its report 1, the boot keyboard its descriptor already declares, when the board's keyboard driver tells it
+# (native_keyboard_set_sink: kits/droidvm/DroidVMVirtioInput.c, the app's virtio keyboard): NativeHidInput sends only the Home button
+# and touch, so no key typed on the phone reached iOS. Compiled from a staged copy with build-arm-driver.py's own command, after the
+# HID build's audit: only static members are added, its vtable and original bindings stay as audited.
+hid_original=ROOT/'drivers/NativeHidInput/NativeHidInput.cpp';hid_text=hid_original.read_text()
+hid_keyboard=('    // DroidVM (build-native-legacy-display.py): the keyboard driver calls keyboardNotify with each boot keyboard state (modifier\n'
+              '    // byte, reserved byte, six usages), sent as report 1.\n'
+              '    static void keyboardNotify(void *context,const uint8_t *keys) {\n'
+              '        NativeHidInput *self=static_cast<NativeHidInput *>(context);\n'
+              '        if(self && self->inputLoop && keys)self->inputLoop->runAction(&NativeHidInput::keyboardAction,self,const_cast<uint8_t *>(keys));\n'
+              '    }\n'
+              '    static IOReturn keyboardAction(OSObject *owner,void *keys,void *,void *,void *) {\n'
+              '        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return kIOReturnSuccess;\n'
+              '        if(!self->hasEventDriverCached())return kIOReturnNotReady;\n'
+              '        unsigned char report[9]={1};\n'
+              '        memcpy(report+1,keys,8);\n'
+              '        IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);\n'
+              '        IOReturn result=buffer?self->handleReport(buffer,0,0):kIOReturnNoMemory;\n'
+              '        OSSafeReleaseNULL(buffer);\n'
+              '        return result;\n'
+              '    }\n')
+for anchor,replacement in (
+        ('extern "C" void native_buttons_set_sink(void (*)(void *, uint32_t), void *) __attribute__((weak_import));\n',
+         'extern "C" void native_buttons_set_sink(void (*)(void *, uint32_t), void *) __attribute__((weak_import));\n'
+         'extern "C" void native_keyboard_set_sink(void (*)(void *, const uint8_t *), void *);\n'),
+        ('    bool hasEventDriverCached() {\n',hid_keyboard+'    bool hasEventDriverCached() {\n'),
+        ('        if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(&NativeHidInput::buttonsNotify,this);\n',
+         '        if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(&NativeHidInput::buttonsNotify,this);\n'
+         '        if(!touchOnly)native_keyboard_set_sink(&NativeHidInput::keyboardNotify,this);\n'),
+        ('        if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(nullptr,nullptr);\n',
+         '        if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(nullptr,nullptr);\n'
+         '        if(!touchOnly)native_keyboard_set_sink(nullptr,nullptr);\n')):
+    require(hid_text.count(anchor)==1,'NativeHidInput.cpp no longer has exactly one '+anchor.strip())
+    hid_text=hid_text.replace(anchor,replacement)
+# the same file name: the late static initializer is named after it (__GLOBAL__sub_I_NativeHidInput.cpp)
+hid_staged=hid_dir/'droidvm'/'NativeHidInput.cpp';hid_staged.parent.mkdir(exist_ok=True);hid_staged.write_text(hid_text)
+hid_command=json.loads((hid_dir/'compile-command.json').read_text())
+require(hid_command.count(str(hid_original))==1,'build-arm-driver.py compiles NativeHidInput.cpp once')
+run([str(hid_staged) if a==str(hid_original) else a for a in hid_command],cwd=r['directory'])
+run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeHidInput.cpp',
+     hid_dir/'NativeHidInput.o',hid_dir/'NativeHidInput.late.o'])
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeKeyStoreEvents'],text=True),end='')
 keyevents=ROOT/'build/native-keystore-events'
 # The keystore's user client also wraps and unwraps keys for securityd (aks_wrap_key, selector 10; aks_unwrap_key, 11: scalars
