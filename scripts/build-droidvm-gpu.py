@@ -142,13 +142,37 @@ publish = publish.replace(capped,
 staged = OUT / 'NativeAdrenoPublish.cpp'
 staged.write_text(publish)
 
+# Every CPU mapping of a BO's own pages goes before the pages go back to the VM. A BO's CPU views are physical-range descriptors that
+# hold no reference to the pages, so a mapping that outlived the BO left pmap_assert_free a user mapping of a freed page and the
+# guest panicked -- still after clientDied unmapped the dying client's own views (iconservicesagent, killed by jetsam): a copy in
+# another task, or one IOKit does not track. A process that touches the memory afterwards faults instead. Pool pages stay mapped
+# by the kernel and imported pages are not the BO's, so only an owned descriptor's pages are disconnected.
+memory = (ADRENO / 'NativeAdrenoMemory.cpp').read_text()
+release = 'IOReturn NativeAdrenoMemory::release()\n'
+freed = '        native_adreno_trace_stage=33;\n        descriptor_->release();descriptor_=nullptr;\n'
+if memory.count(release) != 1 or memory.count(freed) != 1:
+    sys.exit('NativeAdrenoMemory.cpp no longer releases an owned descriptor where DroidVM disconnects its pages')
+memory = memory.replace(release, '/* DroidVM: pmap_disconnect (osfmk/vm/pmap.h, MACH_KERNEL_PRIVATE) drops every CPU mapping of a physical page. */\n'
+                        'extern "C" unsigned int pmap_disconnect(ppnum_t);\n'
+                        'static void disconnectOwnedPages(const NativeAdrenoPhysicalSpan *spans,size_t count)\n'
+                        '{\n'
+                        '    for(size_t i=0;spans && i<count;++i)\n'
+                        '        for(uint64_t at=spans[i].physical&~uint64_t(PAGE_MASK);at<spans[i].physical+spans[i].bytes;at+=PAGE_SIZE)\n'
+                        '            (void)pmap_disconnect(ppnum_t(at>>PAGE_SHIFT));\n'
+                        '}\n' + release)
+memory = memory.replace(freed, '        native_adreno_trace_stage=33;\n        disconnectOwnedPages(spans_,span_count_);\n'
+                        '        descriptor_->release();descriptor_=nullptr;\n')
+(OUT / 'memory').mkdir(exist_ok=True)
+staged_memory = OUT / 'memory' / 'NativeAdrenoMemory.cpp'
+staged_memory.write_text(memory)
+
 cxx = recipe('iokit/DEVELOPMENT/IOPlatformExpert.cpo.json')
 c = recipe('bsd/DEVELOPMENT/bsd_init.o.json')
 includes = ['-I', str(ADRENO), '-I', str(ROOT / 'kits/ArmSmmu4K'), '-I', str(ROOT / 'kits/AdrenoPM4'), '-I', str(ROOT / 'kits/droidvm'),
             '-I', str(ROOT / '.cache/xnu-work/osfmk')]
 warnings = ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-incompatible-sysroot', '-Wno-c99-designator',
             '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion', '-Wno-unnecessary-virtual-specifier']
-sources = [ADRENO / name for name in ('NativeAdrenoSubmit.cpp', 'NativeAdrenoMemory.cpp', 'NativeAdrenoCpu.cpp')]
+sources = [ADRENO / 'NativeAdrenoSubmit.cpp', staged_memory, ADRENO / 'NativeAdrenoCpu.cpp']
 sources += [ADRENO / 'NativeAdrenoUserClient.cpp', staged, ROOT / 'kits/droidvm/DroidVMGpu.cpp']
 objects = []
 for source in sources:
