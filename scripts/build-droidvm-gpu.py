@@ -61,7 +61,22 @@ anchor = '#include "NativeAdrenoUserClient.h"\n'
 if publish.count(anchor) != 1:
     sys.exit('NativeAdrenoPublish.cpp include anchor not found')
 publish = publish.replace(anchor, anchor + '/* DroidVM: the clients\' windows start at the VBO (kits/droidvm/DroidVMGpu.cpp). */\n'
-                          'extern "C" uint64_t droidvm_gpu_window_base(void);\n')
+                          'extern "C" uint64_t droidvm_gpu_window_base(void);\n'
+                          '/* DroidVM: the host gives each slot a KGSL context of its own (DroidVMGpu.cpp). */\n'
+                          'extern "C" volatile uint32_t droidvm_gpu_client;\n'
+                          'extern "C" void droidvm_gpu_client_opened(uint32_t slot);\n')
+# Each slot has a KGSL context of its own on the host, so a client whose commands fault loses its own GPU, not the render server's
+# (Maps' VectorKit once took the whole display down): every call into a connection's core says whose it is (under g.lock, as all
+# dispatch is), and a slot's new user gets a fresh context.
+dispatch = 'connection->live_?connection->core_->dispatch('
+if publish.count(dispatch) != 2:
+    sys.exit('NativeAdrenoPublish.cpp no longer dispatches to a connection\'s core in exactly two places')
+publish = publish.replace(dispatch, 'connection->live_?(droidvm_gpu_client=connection->slot_<NativeAdrenoMaxClients?connection->slot_:0u,'
+                          'connection->core_)->dispatch(')
+mounted = '            if(kernel)g.kernel_client=true;else g.slots[slot]=true;\n'
+if publish.count(mounted) != 1:
+    sys.exit('NativeAdrenoPublish.cpp no longer marks a mounted slot exactly once')
+publish = publish.replace(mounted, mounted + '            if(!kernel)droidvm_gpu_client_opened(slot);\n')
 # Ten connections instead of NativeAdreno's four: the render server, the widget renderer, the wallpaper and the app icons take four,
 # WebKit's GPU and WebContent processes (droidvm-gpu-clients com.apple.WebKit.*) more, and an app that draws with Metal itself (Maps)
 # one each. Each window is 1 GiB, following the render server's; the ten take 10 GiB of the KGSL VBO (128 GiB on the SM8650 host),

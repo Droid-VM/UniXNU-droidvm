@@ -601,6 +601,18 @@ int32_t readRetired(uint32_t *value)
 }
 }  // namespace
 
+// The client slot submitting now (NativeAdrenoPublish's dispatch sets it under the board lock, build-droidvm-gpu.py), and the
+// submissions each slot had refused because its KGSL context was lost (for the host rig).
+extern "C" volatile uint32_t droidvm_gpu_client = 0;
+extern "C" volatile uint32_t droidvm_gpu_lost[DROIDVM_GPU_MAX_CLIENTS] = {};
+// A slot changed hands (NativeAdrenoPublish's mount): its next user starts with a fresh KGSL context, whatever the last one did.
+extern "C" void droidvm_gpu_client_opened(uint32_t slot)
+{
+    if (slot >= DROIDVM_GPU_MAX_CLIENTS || droidvm_gpu_state < 1) return;
+    const droidvm_gpu_client_reset request = {slot, 0};
+    (void)call(DROIDVM_GPU_OP_CLIENT, &request, sizeof request, nullptr, 0, nullptr, 0);
+}
+
 IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *, const NativeAdrenoRingCache *, void *, size_t, uint64_t, void *, size_t,
     uint64_t)
 {
@@ -631,14 +643,21 @@ IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words, size_t word_count
         if (packet[0] != gIbHeader || !packet[3] || packet[3] > 0xfffff) return kIOReturnBadArgument;
         ibs[i] = {uint64_t(packet[1]) | uint64_t(packet[2]) << 32, uint64_t(packet[3]) * 4};
     }
-    const droidvm_gpu_submit header = {seqno_ + 1, count};
+    // Each client (NativeAdrenoPublish's slot, set while it dispatches under the board lock) has a KGSL context of its own.
+    const uint16_t client = uint16_t(droidvm_gpu_client < DROIDVM_GPU_MAX_CLIENTS ? droidvm_gpu_client : 0);
+    const droidvm_gpu_submit header = {seqno_ + 1, uint16_t(count), client};
     const int32_t status = call(DROIDVM_GPU_OP_SUBMIT, &header, sizeof header, ibs, count * uint32_t(sizeof *ibs), nullptr, 0);
     droidvm_gpu_stats[6] = droidvm_gpu_stats[6] + 1;
-    // KGSL refused the commands (they did not run, the timestamp is still free); a lost transport or an invalidated context
-    // (EDEADLK, after a GPU fault) leaves nothing to submit to.
-    if (status == int32_t(kTransportFailed) || status == -35 /* EDEADLK */ || status == -71 /* EPROTO */) {
+    // KGSL refused the commands (they did not run, the timestamp is still free). A lost transport leaves nothing to submit to;
+    // an invalidated context (EDEADLK, after a fault in this client's commands) is this client's loss only: the ring and the
+    // other clients go on, and its submissions fail from here on (its Vulkan device is lost) until the slot's next user.
+    if (status == int32_t(kTransportFailed)) {
         droidvm_gpu_facts.faults = droidvm_gpu_facts.faults + 1;
         return poison();
+    }
+    if (status == -35 /* EDEADLK */) {
+        droidvm_gpu_lost[client] = droidvm_gpu_lost[client] + 1;
+        return kIOReturnAborted;
     }
     if (status) return ioReturn(status);
     reset_pending_ = false;   // KGSL frames each submission for its context itself

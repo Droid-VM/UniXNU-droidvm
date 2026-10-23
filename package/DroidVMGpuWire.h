@@ -17,7 +17,7 @@
  * DROIDVM_GPU_WAIT_MAX_MS. All integers little endian; every struct is naturally aligned and has a fixed size. */
 enum {
     DROIDVM_GPU_DEVICE_ID = 59,           /* virtio device id: crosvm's nonstandard ids count down from 63 */
-    DROIDVM_GPU_WIRE_VERSION = 1,
+    DROIDVM_GPU_WIRE_VERSION = 2,
     DROIDVM_GPU_MAX_RANGES = 1024,        /* IMPORT entries per request */
     DROIDVM_GPU_MAX_IBS = 16,             /* NativeAdrenoAbiMaxBuffers */
     DROIDVM_GPU_WAIT_MAX_MS = 4,
@@ -30,6 +30,8 @@ enum {
     DROIDVM_GPU_OP_RETIRED = 6,
     DROIDVM_GPU_OP_WAIT = 7,
     DROIDVM_GPU_OP_TICKS = 8,
+    DROIDVM_GPU_OP_CLIENT = 9,            /* a client slot's next user starts with a fresh KGSL context */
+    DROIDVM_GPU_MAX_CLIENTS = 16,
 
     DROIDVM_GPU_BIND = 1,                 /* KGSL_GPUMEM_RANGE_OP_BIND */
     DROIDVM_GPU_UNBIND = 2,               /* KGSL_GPUMEM_RANGE_OP_UNBIND */
@@ -89,8 +91,13 @@ struct droidvm_gpu_ib {
     uint64_t bytes;
 };
 struct droidvm_gpu_submit {               /* OP_SUBMIT request, followed by `count` IBs */
-    uint32_t timestamp;                   /* nonzero, one more than the last submit's */
-    uint32_t count;                       /* 1..DROIDVM_GPU_MAX_IBS */
+    uint32_t timestamp;                   /* nonzero, one more than the last submit's (across the clients) */
+    uint16_t count;                       /* 1..DROIDVM_GPU_MAX_IBS */
+    uint16_t client;                      /* NativeAdrenoPublish's slot: each has a KGSL context of its own (EDEADLK: lost) */
+};
+struct droidvm_gpu_client_reset {         /* OP_CLIENT request */
+    uint32_t client;                      /* < DROIDVM_GPU_MAX_CLIENTS */
+    uint32_t reserved;
 };
 struct droidvm_gpu_timestamp {            /* OP_RETIRED reply; OP_WAIT request (timeout in milliseconds) */
     uint32_t timestamp;
