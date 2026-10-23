@@ -144,26 +144,88 @@ publish = publish.replace(capped,
 staged = OUT / 'NativeAdrenoPublish.cpp'
 staged.write_text(publish)
 
-# Every CPU mapping of a BO's own pages goes before the pages go back to the VM. A BO's CPU views are physical-range descriptors that
-# hold no reference to the pages, so a mapping that outlived the BO left pmap_assert_free a user mapping of a freed page and the
-# guest panicked -- still after clientDied unmapped the dying client's own views (iconservicesagent, killed by jetsam): a copy in
-# another task, or one IOKit does not track. A process that touches the memory afterwards faults instead. Pool pages stay mapped
-# by the kernel and imported pages are not the BO's, so only an owned descriptor's pages are disconnected.
+# An owned BO's pages go back to the VM only once no user task maps them. A BO's CPU views are physical-range descriptors that hold
+# no reference to the pages, and a mapping of one can outlive the BO, one IOKit does not track (clientClose already removes every
+# mapping it made of the views): freeing the pages under it panicked the guest (pmap_assert_free; WidgetRenderer_Default, then
+# iconservicesagent killed by jetsam), and disconnecting it instead let it fault the pages in again from their next owner, so the
+# render server drew one layer's contents in another (a Settings row showed the status bar's time). Such a BO's pages are kept and
+# freed by a later release once no user pmap maps them (native_pmap_user_mappings, patch zzx-pmap-user-mappings); each kept BO is
+# logged with the pmap and address of the mapping, which names who holds it. Pool pages stay mapped by the kernel and imported
+# pages are not the BO's, so only an owned descriptor's pages are checked.
 memory = (ADRENO / 'NativeAdrenoMemory.cpp').read_text()
-release = 'IOReturn NativeAdrenoMemory::release()\n'
+release = 'IOReturn NativeAdrenoMemory::release()\n{\n'
 freed = '        native_adreno_trace_stage=33;\n        descriptor_->release();descriptor_=nullptr;\n'
 if memory.count(release) != 1 or memory.count(freed) != 1:
-    sys.exit('NativeAdrenoMemory.cpp no longer releases an owned descriptor where DroidVM disconnects its pages')
-memory = memory.replace(release, '/* DroidVM: pmap_disconnect (osfmk/vm/pmap.h, MACH_KERNEL_PRIVATE) drops every CPU mapping of a physical page. */\n'
-                        'extern "C" unsigned int pmap_disconnect(ppnum_t);\n'
-                        'static void disconnectOwnedPages(const NativeAdrenoPhysicalSpan *spans,size_t count)\n'
-                        '{\n'
-                        '    for(size_t i=0;spans && i<count;++i)\n'
-                        '        for(uint64_t at=spans[i].physical&~uint64_t(PAGE_MASK);at<spans[i].physical+spans[i].bytes;at+=PAGE_SIZE)\n'
-                        '            (void)pmap_disconnect(ppnum_t(at>>PAGE_SHIFT));\n'
-                        '}\n' + release)
-memory = memory.replace(freed, '        native_adreno_trace_stage=33;\n        disconnectOwnedPages(spans_,span_count_);\n'
-                        '        descriptor_->release();descriptor_=nullptr;\n')
+    sys.exit('NativeAdrenoMemory.cpp no longer releases an owned descriptor where DroidVM keeps its mapped pages')
+memory = memory.replace(release, """/* DroidVM: owned BO pages a user task still maps are kept, and freed by a later release once unmapped (build-droidvm-gpu.py). */
+extern "C" unsigned int native_pmap_user_mappings(ppnum_t,void **,uint64_t *,char *);
+/* [0] BOs kept, [1] freed later, [2] held now, [3] their bytes, [4] the last kept BO's mapping pmap, [5] its address. */
+extern "C" {volatile uint64_t native_adreno_kept[6];}
+namespace {
+struct KeptBo {IOBufferMemoryDescriptor *descriptor;NativeAdrenoPhysicalSpan *spans;size_t count,capacity,bytes;};
+enum {MaxKeptBos=512};
+KeptBo gKeptBos[MaxKeptBos];
+IOLock *gKeptLock;
+}
+static bool userMapped(const NativeAdrenoPhysicalSpan *spans,size_t count,void **pmap,uint64_t *va,char *name)
+{
+    for(size_t i=0;spans && i<count;++i)
+        for(uint64_t at=spans[i].physical&~uint64_t(PAGE_MASK);at<spans[i].physical+spans[i].bytes;at+=PAGE_SIZE)
+            if(native_pmap_user_mappings(ppnum_t(at>>PAGE_SHIFT),pmap,va,name))return true;
+    return false;
+}
+static IOLock *keptLock()
+{
+    if(!gKeptLock) {
+        IOLock *lock=IOLockAlloc();
+        if(lock && !OSCompareAndSwapPtr(nullptr,lock,(void * volatile *)&gKeptLock))IOLockFree(lock);
+    }
+    return gKeptLock;
+}
+/* Keeps a BO's descriptor and spans whose pages a user task maps; false when there is no room (the caller frees them as before). */
+static bool keepMapped(IOBufferMemoryDescriptor *descriptor,NativeAdrenoPhysicalSpan *spans,size_t count,size_t capacity,size_t bytes)
+{
+    void *pmap=nullptr;uint64_t va=0;char name[17]={};
+    if(!userMapped(spans,count,&pmap,&va,name))return false;
+    IOLock *lock=keptLock();
+    if(!lock)return false;
+    bool kept=false;
+    IOLockLock(lock);
+    for(size_t i=0;i<MaxKeptBos && !kept;++i)if(!gKeptBos[i].descriptor) {
+        gKeptBos[i]=KeptBo{descriptor,spans,count,capacity,bytes};kept=true;
+    }
+    IOLockUnlock(lock);
+    if(!kept) {IOLog("native-adreno: a freed BO of %zu bytes is still mapped (%s, pmap %p, %#llx) and no room is left to keep it\\n",bytes,name,pmap,va);return false;}
+    const uint64_t n=__atomic_add_fetch(&native_adreno_kept[0],1,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&native_adreno_kept[2],1,__ATOMIC_RELAXED);__atomic_add_fetch(&native_adreno_kept[3],bytes,__ATOMIC_RELAXED);
+    native_adreno_kept[4]=uint64_t(uintptr_t(pmap));native_adreno_kept[5]=va;
+    if(n<=32)IOLog("native-adreno: freed BO of %zu bytes kept: still mapped by %s (pmap %p) at %#llx; freed by %s\\n",bytes,name,pmap,va,
+                   get_task_pmap(current_task())==pmap?"the same task":"another task");
+    return true;
+}
+/* Frees the kept BOs no user task maps any longer. */
+static void sweepKept()
+{
+    if(!native_adreno_kept[2])return;
+    IOLock *lock=keptLock();
+    if(!lock)return;
+    for(size_t i=0;i<MaxKeptBos;++i) {
+        IOLockLock(lock);
+        KeptBo bo=gKeptBos[i];
+        if(!bo.descriptor || userMapped(bo.spans,bo.count,nullptr,nullptr,nullptr)) {IOLockUnlock(lock);continue;}
+        gKeptBos[i]=KeptBo{};
+        IOLockUnlock(lock);
+        __atomic_add_fetch(&native_adreno_kept[1],1,__ATOMIC_RELAXED);
+        __atomic_sub_fetch(&native_adreno_kept[2],1,__ATOMIC_RELAXED);__atomic_sub_fetch(&native_adreno_kept[3],bo.bytes,__ATOMIC_RELAXED);
+        bo.descriptor->release();
+        IODeleteData(bo.spans,NativeAdrenoPhysicalSpan,bo.capacity);
+    }
+}
+""" + release + '    sweepKept();\n')
+memory = memory.replace(freed, '        native_adreno_trace_stage=33;\n'
+                        '        if(keepMapped(descriptor_,spans_,span_count_,span_capacity_,bytes_))spans_=nullptr;   /* the kept entry owns them */\n'
+                        '        else descriptor_->release();\n'
+                        '        descriptor_=nullptr;\n')
 (OUT / 'memory').mkdir(exist_ok=True)
 staged_memory = OUT / 'memory' / 'NativeAdrenoMemory.cpp'
 staged_memory.write_text(memory)
