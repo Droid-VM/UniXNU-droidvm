@@ -100,7 +100,10 @@ volume = "DROIDVMESP"
 size_mib = 192
 loader = "driver"
 title = "DroidVM: iPadOS 17.7.11, CPU-rendered desktop"
-dram_size = "0x13f600000"            # guest RAM of the 5120 MiB pseudo-unprotected VM: "SHIM: /memory now 0x80600000+0x13f600000"
+# guest RAM of the 5120 MiB pseudo-unprotected VM: "SHIM: /memory now 0x80600000+0x13f400000". crosvm takes the simple
+# framebuffer (screens.simplefb, 6 MiB at 1366x1024) off its top, so this follows the screen size: a larger value puts the panic
+# region inside the framebuffer
+dram_size = "0x13f400000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The original static/System trust caches, and the owner trust bundle built around them with the Adreno Metal plugin's CDHashes
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
@@ -139,6 +142,13 @@ kernel_args = [
   "armcpu-diagnostics=1",
   "sheng-smp=1",
   "droidvm-monitor=1000",            # process samples for the host rig (kits/droidvm/DroidVMStubs.c)
+  # inter-processor interrupts. XNU signals a core (cpu_signal) only once that core has taken its first IPI, and skips it silently
+  # until then: without the self-IPI ArmCpu sends from initCPU no core ever got one, so a panic or a stackshot never stopped the
+  # other cores (a stackshot raced them and the DEVELOPMENT kernel panicked: "thread wait info count mismatch"), and a core
+  # was woken for new work only by its timer. Gunyah drops the SGIs a guest writes to ICC_SGI1R_EL1, so the IPIs are
+  # software-pended SPIs, as on sheng
+  "armcpu-self-ipi=1",
+  "armcpu-spi-ipi=1",
   # the Data disk keeps what the system writes in the store window of the third virtio-mmio disk (kits/droidvm/DroidVMDataStore.c)
   "droidvm-data-persist=2",
   # the deletable system apps (Weather, Calendar, Notes, Maps, ...): the OS volume's /private/var/staged_system_apps as a read-only
@@ -165,8 +175,9 @@ kernel_args = [
   # launchd jobs this platform cannot serve (kits/droidvm/DroidVMLaunchPolicy.c): no watchdog backend, the services sheng found
   # in a cycle of synchronous XPC waits on first boot (UniXNU docs/guide/skip-setup.md), and fairplayd, which exits at once
   # without the FairPlayIOKit kext (it does not prelink against this kernel); its MachServices stay registered meanwhile, so
-  # lockdownd's first FairPlay call waited forever, and with it accountsd and every app that asks it (Notes, Photos stayed blank)
-  "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd,com.apple.fairplayd.A2",
+  # lockdownd's first FairPlay call waited forever, and with it accountsd and every app that asks it (Notes, Photos stayed blank).
+  # A label without a "com." domain is under com.apple.
+  "droidvm-disable-jobs=watchdogd,identityservicesd,locationd,CommCenter,bluetoothd,fairplayd.A2",
   # the host phone's GPU through crosvm --droidvm-gpu (kits/droidvm/DroidVMGpu.cpp): NativeAdreno's service over KGSL
   # (droidvm-gpu-selftest=1 first runs one CP_MEM_WRITE through it; left out, the command line is at its 1000-byte limit)
   "droidvm-gpu=1",

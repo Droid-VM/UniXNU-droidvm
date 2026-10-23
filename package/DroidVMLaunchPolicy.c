@@ -3,7 +3,8 @@
 // before launchd reads them (XNU_BOARD_LAUNCH_POLICY, patches/xnu/native-board-launch-policy.patch).
 //
 // UniXNU-sheng's package/BootWatchdogPolicy.c without its Setup reset: the same plist and checks, the labels
-// from droidvm-disable-jobs=<label>[,<label>...] (restricted characters, bounded length). launchd does not
+// from droidvm-disable-jobs=<label>[,<label>...] (restricted characters, bounded length; a label without a "com." domain
+// is under com.apple.). launchd does not
 // honour a disabled.plist written into the seed on the Mac, which belongs to the user who built the seed.
 // The UniXNU guide lists the jobs that block the first boot (docs/guide/skip-setup.md); watchdogd has no
 // watchdog backend here.
@@ -113,6 +114,8 @@ static int write_overrides(void *process, uint64_t scratch) {
   const char *e=c;while(*e && *e!=',')++e;
   if(e>c) {
    if(strlcat(policy,"<key>",sizeof(policy))>=sizeof(policy))return EINVAL;
+   // a label without a "com." domain is Apple's: watchdogd stands for com.apple.watchdogd (the command line is short)
+   if((e-c<4 || strncmp(c,"com.",4)) && strlcat(policy,"com.apple.",sizeof(policy))>=sizeof(policy))return EINVAL;
    size_t at=strlen(policy);if(at+(size_t)(e-c)+1>=sizeof(policy))return EINVAL;
    memcpy(policy+at,c,(size_t)(e-c));policy[at+(size_t)(e-c)]=0;
    if(strlcat(policy,"</key><true/>",sizeof(policy))>=sizeof(policy))return EINVAL;
