@@ -18,4 +18,10 @@ export MTOOLS_SKIP_CHECK=1
 mcopy -o -i $O/droidvm-disk.img $O/kernel.probe.macho ::/EFI/UniXNU/Payloads/kernel.macho
 mcopy -o -i $O/droidvm-disk.img ::/EFI/UniXNU/Payloads/kernel.macho.adt $O/kernel.macho.adt
 mcopy -o -i $O/droidvm-disk.img ::/EFI/UniXNU/unixnu.toml $O/unixnu.toml
+# BOOT_ARGS_DROP="arg=1 other=2": leave those boot-args out of this disk only, for an experiment without a rebuild.
+if [ -n "${BOOT_ARGS_DROP:-}" ]; then
+  for a in $BOOT_ARGS_DROP; do sed -i "s/ $a\([ \"]\)/\1/" $O/unixnu.toml; done
+  mcopy -o -i $O/droidvm-disk.img $O/unixnu.toml ::/EFI/UniXNU/unixnu.toml
+  echo "dropped boot-args: $BOOT_ARGS_DROP"
+fi
 adb -s $PHONE push $O/droidvm-disk.img /storage/emulated/0/DroidVM/UniXNU/droidvm-disk.img | tail -1

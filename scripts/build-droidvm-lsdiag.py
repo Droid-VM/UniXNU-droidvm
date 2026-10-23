@@ -6,7 +6,10 @@ restricted and installed state, each extension's containing bundle, and the rest
 
 Ad-hoc 4K-signed and trusted through the owner module (build/owner-trust-extra/lsdiag.json, category 3) like toybox. Besides
 no-container (or another owner process may not exec it), it carries com.apple.private.coreservices.canmaplsdatabase: without
-it LaunchServices answers a client only about the client itself. Staged with
+it LaunchServices answers a client only about the client itself; rebuildappdatabases lets `lsdiag rebuild` ask for a rebuild,
+the mobileinstall allowedSPI EnumerateInstalledAppsForLaunchServices lets `lsdiag midump` list what installd gives it, and
+InstallForLaunchServices lets `lsdiag register` re-register an app (lsd's canRegisterWithOptions: checks it), and
+can-register-install-results lets `lsdiag relink` register an app with its plug-ins as an install does. Staged with
   export.py put build/lsdiag/lsdiag /private/var/ngpu/bin/lsdiag 0755
 and run as root over ssh; `lsdiag -u 501 ...` reads the mobile user's database, which the apps and widgets use."""
 import json
@@ -29,7 +32,12 @@ subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot',
                 '-fno-objc-arc', '-framework', 'Foundation', SOURCE, '-o', binary], check=True)
 entitlements = OUT / 'entitlements.plist'
 entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True,
-                                         'com.apple.private.coreservices.canmaplsdatabase': True}))
+                                         'com.apple.private.coreservices.canmaplsdatabase': True,
+                                         'com.apple.lsapplicationworkspace.rebuildappdatabases': True,
+                                         'com.apple.private.mobileinstall.allowedSPI': ['EnumerateInstalledAppsForLaunchServices',
+                                                                                        'InstallForLaunchServices'],
+                                         'com.apple.mobileinstallation.enumeration': True,
+                                         'com.apple.private.coreservices.can-register-install-results': True}))
 subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'org.droidvm.lsdiag',
                 '--entitlements', entitlements, binary], check=True)
 detail = subprocess.run(['codesign', '--display', '--verbose=4', binary], capture_output=True, text=True, check=True).stderr

@@ -43,6 +43,22 @@ class Touch:
     def put(self, name, value):
         write_guest(self.pid, self.maps, self.at[name], struct.pack('<i', value))
 
+    def tap(self, point, hold=0.05):
+        # One adb shell for the whole tap: each write_guest is its own adb round trip (~0.1-0.3 s), so press and release as
+        # separate calls held the finger down long enough for SpringBoard to take it as a long press (the icon context
+        # menu instead of a launch). The press and the release are written by the phone itself, `hold` seconds apart.
+        x, y = self.scale(*point)
+        def put(name, value):
+            data = struct.pack('<i', value)
+            host = peek.host_address(self.maps, self.at[name], 4)
+            escaped = ''.join(f'\\{byte:03o}' for byte in data)
+            return f"printf '{escaped}' | dd of=/proc/{self.pid}/mem bs=1 seek={host} conv=notrunc 2>/dev/null"
+        steps = [put('seq', self.seq + 1), put('ids', 1), put('xs', x), put('ys', y), put('count', 1),
+                 put('seq', self.seq + 2), f'sleep {hold}',
+                 put('seq', self.seq + 3), put('count', 0), put('seq', self.seq + 4)]
+        peek.adb('; '.join(steps))
+        self.seq += 4
+
     def publish(self, point):
         # Odd while the fields change, then the next even number: the reader skips odd and repeated values.
         self.put('seq', self.seq + 1)
@@ -67,9 +83,7 @@ def main():
     touch = Touch(args.raw)
     c = args.coords
     if args.action == 'tap':
-        touch.publish((c[0], c[1]))
-        time.sleep(0.08)
-        touch.publish(None)
+        touch.tap((c[0], c[1]))
     elif args.action == 'swipe':
         steps = c[4] if len(c) > 4 else 8
         for i in range(steps + 1):

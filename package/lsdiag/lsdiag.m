@@ -3,6 +3,13 @@
 //   lsdiag [-u UID] app BUNDLE_ID...     application record: URL, placeholder/restricted/installed state, extensions
 //   lsdiag [-u UID] ext BUNDLE_ID...     extension record and plug-in proxy: URL and the containing bundle
 //   lsdiag [-u UID] restrictions [BUNDLE_ID...]   LSApplicationRestrictionsManager's lists, and per-app verdicts
+//   lsdiag [-u UID] rebuild [nosystem] [internal] [nouser]   rebuild the LaunchServices database (system and user apps)
+//   lsdiag [-u UID] register APP_PATH...   re-register app bundles by URL (their plug-ins go under them)
+//   lsdiag [-u UID] midump [FILTER...]    the item dictionaries installd gives LaunchServices (type, plug-in owner)
+//   lsdiag [-u UID] relink BUNDLE_ID...|all   re-register apps with their plug-ins as an install does (plug-ins get their app)
+//   lsdiag bundle PATH...                what CFBundle reads from a bundle directory (identifier, Info.plist, extension point)
+//   lsdiag nodes PATH...                 stat/getattrlist IDs of each path and whether fsgetpath leads back to it
+//   lsdiag fsnode PATH...                what LaunchServices' FSNode answers: path, length, file and volume IDs
 //   lsdiag [-u UID] boot [SERVICE...]    this process's bootstrap port, and a bootstrap_look_up of each service
 //
 // The records come from the private LaunchServices classes, looked up at run time so nothing private is linked; a
@@ -14,6 +21,10 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <spawn.h>
+#import <sys/attr.h>
+#import <sys/mount.h>
+#import <sys/stat.h>
+#import <fcntl.h>
 #import <sys/wait.h>
 #import <unistd.h>
 
@@ -22,6 +33,14 @@ static id call(id target, const char *name) {
     if (!target || ![target respondsToSelector:sel])
         return nil;
     return ((id (*)(id, SEL))objc_msgSend)(target, sel);
+}
+
+// An unsigned property such as a record's platform (2 = iOS); -1 when the object does not answer it.
+static long uintProperty(id target, const char *name) {
+    SEL sel = sel_registerName(name);
+    if (!target || ![target respondsToSelector:sel])
+        return -1;
+    return (long)((unsigned int (*)(id, SEL))objc_msgSend)(target, sel);
 }
 
 static NSString *flag(id target, const char *name) {
@@ -56,7 +75,8 @@ static void app(NSString *identifier) {
         line(@"  no record: %@", error);
         return;
     }
-    line(@"  class=%@ URL=%@", NSStringFromClass([record class]), [call(record, "URL") path]);
+    line(@"  class=%@ URL=%@ platform=%ld", NSStringFromClass([record class]), [call(record, "URL") path],
+         uintProperty(record, "platform"));
     line(@"  placeholder=%@ deletable=%@ deletableSystemApp=%@ systemPlaceholder=%@ typeForInstallMachinery=%@",
          flag(record, "isPlaceholder"), flag(record, "isDeletable"), flag(record, "isDeletableSystemApplication"),
          flag(record, "isSystemPlaceholder"), call(record, "typeForInstallMachinery"));
@@ -89,11 +109,12 @@ static void extension(NSString *identifier) {
     Class proxyClass = NSClassFromString(@"LSPlugInKitProxy");
     id proxy = ((id (*)(id, SEL, NSString *))objc_msgSend)(proxyClass, sel_registerName("pluginKitProxyForIdentifier:"), identifier);
     id containing = call(proxy, "containingBundle");
-    line(@"  plug-in proxy: %@ URL=%@ containingBundle=%@ at %@", proxy ? @"found" : @"(nil)", [call(proxy, "bundleURL") path],
+    line(@"  plug-in proxy: %@ URL=%@ protocol=%@ platform=%ld containingBundle=%@ at %@", proxy ? @"found" : @"(nil)",
+         [call(proxy, "bundleURL") path], call(proxy, "protocol"), uintProperty(proxy, "platform"),
          call(containing, "bundleIdentifier"), [call(containing, "bundleURL") path]);
 }
 
-// Every plug-in LaunchServices offers for an extension point (default com.apple.widgetkit-extension), the way chronod's
+// Every plug-in LaunchServices offers for an extension point (its "protocol"), the way chronod's
 // discovery sees them: each plug-in's bundle id, extension point, and whether its containing bundle resolves (nil is what
 // pkd rejects on). Uses LSApplicationWorkspace, looked up at run time.
 static void plugins(NSArray<NSString *> *points) {
@@ -107,8 +128,10 @@ static void plugins(NSArray<NSString *> *points) {
     if (points.count == 0 || [points[0] isEqualToString:@"all"]) {
         NSCountedSet *hist = [NSCountedSet set];
         for (id proxy in all) {
-            NSString *pt = call(proxy, "extensionPointIdentifier");
-            [hist addObject:pt ?: @"(nil)"];
+            // The extension point of an LSPlugInKitProxy is its "protocol" (NSExtensionPointIdentifier); a proxy that does
+            // not answer it is counted apart, so a missing selector is never mistaken for a nil point.
+            NSString *pt = [proxy respondsToSelector:sel_registerName("protocol")] ? (call(proxy, "protocol") ?: @"(nil)") : @"(n/a)";
+            [hist addObject:pt];
         }
         line(@"%lu plug-ins installed, by extension point:", (unsigned long)[all count]);
         NSArray *sorted = [hist.allObjects sortedArrayUsingComparator:^(id a, id b) {
@@ -122,7 +145,7 @@ static void plugins(NSArray<NSString *> *points) {
     line(@"extension point %@: %lu plug-ins installed total", point, (unsigned long)[all count]);
     NSUInteger shown = 0;
     for (id proxy in all) {
-        NSString *pt = call(proxy, "extensionPointIdentifier");
+        NSString *pt = call(proxy, "protocol");
         if (![pt isEqualToString:point]) continue;
         shown++;
         id containing = call(proxy, "containingBundle");
@@ -130,6 +153,214 @@ static void plugins(NSArray<NSString *> *points) {
              call(containing, "bundleIdentifier") ?: @"(nil)", [call(proxy, "bundleURL") path], flag(proxy, "isRestricted"));
     }
     line(@"  (%lu for %@)", (unsigned long)shown, point);
+}
+
+// Ask LaunchServices to rebuild its database the way `mobile_install rebuild system user` does on an internal build:
+// re-register the system apps (and their plug-ins under them) and the user's. Needs the rebuildappdatabases entitlement.
+static void rebuild(NSArray<NSString *> *args) {
+    BOOL system = YES, internal = NO, user = YES;
+    for (NSString *a in args) {
+        if ([a isEqualToString:@"nosystem"]) system = NO;
+        if ([a isEqualToString:@"internal"]) internal = YES;
+        if ([a isEqualToString:@"nouser"]) user = NO;
+    }
+    id workspace = call(NSClassFromString(@"LSApplicationWorkspace"), "defaultWorkspace");
+    SEL sel = sel_registerName("_LSPrivateRebuildApplicationDatabasesForSystemApps:internal:user:");
+    if (![workspace respondsToSelector:sel]) {
+        line(@"rebuild: LSApplicationWorkspace does not answer %s", sel_getName(sel));
+        return;
+    }
+    line(@"rebuild: system=%d internal=%d user=%d ...", system, internal, user);
+    BOOL ok = ((BOOL (*)(id, SEL, BOOL, BOOL, BOOL))objc_msgSend)(workspace, sel, system, internal, user);
+    line(@"rebuild: returned %@", ok ? @"YES" : @"NO");
+}
+
+// Register app bundles by URL (-[LSApplicationWorkspace registerApplication:]): LaunchServices then builds the registration
+// from the bundle directory itself, which takes the app's PlugIns/ and Extensions/ along with the app, each under it.
+static void registerApps(NSArray<NSString *> *paths) {
+    id workspace = call(NSClassFromString(@"LSApplicationWorkspace"), "defaultWorkspace");
+    SEL sel = sel_registerName("registerApplication:");
+    for (NSString *path in paths) {
+        if (![workspace respondsToSelector:sel]) {
+            line(@"register: LSApplicationWorkspace does not answer registerApplication:");
+            return;
+        }
+        BOOL ok = ((BOOL (*)(id, SEL, NSURL *))objc_msgSend)(workspace, sel, [NSURL fileURLWithPath:path isDirectory:YES]);
+        line(@"register %@: %@", path, ok ? @"YES" : @"NO");
+    }
+}
+
+// The item dictionaries installd hands LaunchServices when it builds its database
+// (MobileInstallationEnumerateAllInstalledItemDictionaries, as lsd calls it). LaunchServices files each app's plug-ins under
+// it only when the plug-in's dictionary names the app in PluginOwnerBundleID; the rest it registers standalone, with no
+// containing app. Prints the items whose bundle identifier contains FILTER.
+static void midump(NSArray<NSString *> *filters) {
+    void *mi = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_NOW);
+    id (*enumerate)(NSDictionary *, void (^)(NSDictionary *, NSError *)) =
+        (id (*)(NSDictionary *, void (^)(NSDictionary *, NSError *)))dlsym(mi, "MobileInstallationEnumerateAllInstalledItemDictionaries");
+    if (!enumerate) {
+        line(@"midump: no MobileInstallationEnumerateAllInstalledItemDictionaries");
+        return;
+    }
+    __block NSUInteger total = 0;
+    id result = enumerate(@{}, ^(NSDictionary *item, NSError *error) {
+        if (error) {
+            line(@"midump: error %@", error);
+            return;
+        }
+        total++;
+        NSString *identifier = item[@"CFBundleIdentifier"];
+        BOOL wanted = filters.count == 0;
+        for (NSString *filter in filters)
+            if ([identifier containsString:filter]) wanted = YES;
+        if (!wanted) return;
+        line(@"%@ type=%@ owner=%@ path=%@", identifier, item[@"ApplicationType"], item[@"PluginOwnerBundleID"], item[@"Path"]);
+        line(@"    keys: %@", [[item.allKeys sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" "]);
+    });
+    line(@"midump: %lu items, returned %@", (unsigned long)total, result);
+}
+
+// How the file system names a bundle, the way LaunchServices finds a plug-in's app by node: stat's device and inode,
+// getattrlist's fsid, object/file/parent IDs, and whether fsgetpath(fsid, fileID) leads back to the same path.
+extern ssize_t fsgetpath(char *buf, size_t bufsize, fsid_t *fsid, uint64_t objid);
+static void nodes(NSArray<NSString *> *paths) {
+    for (NSString *path in paths) {
+        struct stat st;
+        if (stat(path.fileSystemRepresentation, &st)) {
+            line(@"%@: stat %s", path, strerror(errno));
+            continue;
+        }
+        struct attrlist al = {.bitmapcount = ATTR_BIT_MAP_COUNT,
+                              .commonattr = ATTR_CMN_FSID | ATTR_CMN_OBJID | ATTR_CMN_PAROBJID | ATTR_CMN_FILEID | ATTR_CMN_PARENTID};
+        struct __attribute__((packed)) {
+            uint32_t length;
+            fsid_t fsid;
+            fsobj_id_t objid, parobjid;
+            uint64_t fileid, parentid;
+        } a = {0};
+        int r = getattrlist(path.fileSystemRepresentation, &al, &a, sizeof a, 0);
+        char back[1024] = "";
+        fsid_t fsid = a.fsid;   // an aligned copy: the attribute buffer is packed
+        ssize_t n = r ? -1 : fsgetpath(back, sizeof back, &fsid, a.fileid);
+        line(@"%@\n    stat dev=%d ino=%llu | attr fsid=%#x:%#x objid=%u parobjid=%u fileid=%llu parentid=%llu (r=%d)\n    fsgetpath -> %s",
+             path, st.st_dev, (unsigned long long)st.st_ino, a.fsid.val[0], a.fsid.val[1], a.objid.fid_objno, a.parobjid.fid_objno,
+             a.fileid, a.parentid, r, n < 0 ? strerror(errno) : back);
+        if (S_ISREG(st.st_mode)) {
+            // A regular file: the length getattrlist reports (what LaunchServices sizes its Mach-O read by) next to stat's,
+            // and the first bytes read through the file.
+            struct attrlist fl = {.bitmapcount = ATTR_BIT_MAP_COUNT, .fileattr = ATTR_FILE_DATALENGTH | ATTR_FILE_TOTALSIZE};
+            struct __attribute__((packed)) { uint32_t length; off_t total, data; } fa = {0};
+            int fr = getattrlist(path.fileSystemRepresentation, &fl, &fa, sizeof fa, 0);
+            uint32_t magic = 0;
+            int fd = open(path.fileSystemRepresentation, O_RDONLY);
+            ssize_t got = fd >= 0 ? pread(fd, &magic, sizeof magic, 0) : -1;
+            if (fd >= 0) close(fd);
+            line(@"    file stat size=%lld | attr totalsize=%lld datalength=%lld (r=%d %s) | magic=%#x (read %zd)",
+                 (long long)st.st_size, (long long)fa.total, (long long)fa.data, fr, fr ? strerror(errno) : "", magic, got);
+        }
+    }
+}
+
+// What LaunchServices' own file node (CoreServices FSNode) answers for each path -- _LSAddExecutableFormatInfo reads an
+// executable's load commands (and so the bundle's platform) only when the node gives it a path and a nonzero length.
+static void fsnodes(NSArray<NSString *> *paths) {
+    Class FSNode = NSClassFromString(@"FSNode");
+    for (NSString *path in paths) {
+        NSError *error = nil;
+        id node = ((id (*)(id, SEL, NSURL *, unsigned long, NSError **))objc_msgSend)(
+            [FSNode alloc], sel_registerName("initWithURL:flags:error:"), [NSURL fileURLWithPath:path], 0, &error);
+        if (!node) {
+            line(@"%@: FSNode %@", path, error);
+            continue;
+        }
+        char fsr[1024] = "";
+        NSError *e1 = nil, *e2 = nil, *e3 = nil, *e4 = nil;
+        BOOL hasPath = ((BOOL (*)(id, SEL, char *, NSError **))objc_msgSend)(node, sel_registerName("getFileSystemRepresentation:error:"), fsr, &e1);
+        unsigned long long length = 0, fileID = 0, volumeID = 0;
+        BOOL hasLength = ((BOOL (*)(id, SEL, unsigned long long *, NSError **))objc_msgSend)(node, sel_registerName("getLength:error:"), &length, &e2);
+        BOOL hasFile = ((BOOL (*)(id, SEL, unsigned long long *, NSError **))objc_msgSend)(node, sel_registerName("getFileIdentifier:error:"), &fileID, &e3);
+        BOOL hasVolume = ((BOOL (*)(id, SEL, unsigned long long *, NSError **))objc_msgSend)(node, sel_registerName("getVolumeIdentifier:error:"), &volumeID, &e4);
+        line(@"%@\n    path %@ %s %@\n    length %@ %llu %@\n    fileID %@ %llu %@ | volumeID %@ %#llx %@\n    directory=%@ regular=%@",
+             path, hasPath ? @"YES" : @"NO", fsr, e1 ?: @"", hasLength ? @"YES" : @"NO", length, e2 ?: @"", hasFile ? @"YES" : @"NO",
+             fileID, e3 ?: @"", hasVolume ? @"YES" : @"NO", volumeID, e4 ?: @"", flag(node, "isDirectory"), flag(node, "isRegularFile"));
+    }
+}
+
+// Re-register apps the way an install does, so LaunchServices files each app's plug-ins under it: the app's installd dictionary
+// and those of the plug-ins whose PluginOwnerBundleID names it go to registerContainerizedApplicationWithInfoDictionaries:, which
+// lsd (performPostInstallationRegistration) collapses into one registration -- the app with _LSBundlePlugins. The first-boot
+// seeding registers system apps and their plug-ins one by one instead, and a plug-in registered after its app gets no parent.
+static void relink(NSArray<NSString *> *bundleIDs) {
+    void *mi = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_NOW);
+    id (*enumerate)(NSDictionary *, void (^)(NSDictionary *, NSError *)) =
+        (id (*)(NSDictionary *, void (^)(NSDictionary *, NSError *)))dlsym(mi, "MobileInstallationEnumerateAllInstalledItemDictionaries");
+    if (!enumerate) {
+        line(@"relink: no MobileInstallationEnumerateAllInstalledItemDictionaries");
+        return;
+    }
+    // "all": every app under /Applications that owns a plug-in (the system apps the first-boot seeding left them orphaned from).
+    BOOL all = bundleIDs.count == 1 && [bundleIDs[0] isEqualToString:@"all"];
+    NSMutableDictionary<NSString *, NSMutableArray *> *groups = [NSMutableDictionary dictionary];
+    if (!all)
+        for (NSString *bundleID in bundleIDs)
+            groups[bundleID] = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSDictionary *> *apps = [NSMutableDictionary dictionary];
+    NSMutableArray<NSDictionary *> *plugins = [NSMutableArray array];
+    enumerate(@{}, ^(NSDictionary *item, NSError *error) {
+        if (error) return;
+        NSString *identifier = item[@"CFBundleIdentifier"], *type = item[@"ApplicationType"];
+        if ([type isEqual:@"PluginKitPlugin"]) [plugins addObject:item];
+        // A deletable system app comes twice: the app itself (System, in /Applications through owner-staged-apps) and its
+        // SystemAppPlaceholder. Its plug-ins belong to the app, so the placeholder never replaces it.
+        else if (identifier && !(apps[identifier] && [type isEqual:@"SystemAppPlaceholder"])) apps[identifier] = item;
+    });
+    for (NSDictionary *plugin in plugins) {
+        NSString *owner = plugin[@"PluginOwnerBundleID"];
+        NSDictionary *app = owner ? apps[owner] : nil;
+        if (!app) continue;
+        if (all && !groups[owner] && [app[@"Path"] hasPrefix:@"/Applications/"])
+            groups[owner] = [NSMutableArray array];
+        [groups[owner] addObject:plugin];
+    }
+    for (NSString *bundleID in groups)
+        if (apps[bundleID]) [groups[bundleID] insertObject:apps[bundleID] atIndex:0];   // the app first, its plug-ins after
+    if (all)
+        bundleIDs = [groups.allKeys sortedArrayUsingSelector:@selector(compare:)];
+    id workspace = call(NSClassFromString(@"LSApplicationWorkspace"), "defaultWorkspace");
+    SEL sel = sel_registerName("registerContainerizedApplicationWithInfoDictionaries:personaUniqueStrings:operationUUID:requestContext:saveObserver:registrationError:");
+    if (![workspace respondsToSelector:sel]) {
+        line(@"relink: LSApplicationWorkspace does not answer %s", sel_getName(sel));
+        return;
+    }
+    for (NSString *bundleID in bundleIDs) {
+        NSArray *items = groups[bundleID];
+        if (items.count == 0 || [items[0][@"ApplicationType"] isEqual:@"PluginKitPlugin"]) {
+            line(@"relink %@: installd has no app record for it", bundleID);
+            continue;
+        }
+        NSError *error = nil;
+        BOOL ok = ((BOOL (*)(id, SEL, NSArray *, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
+            workspace, sel, items, nil, [NSUUID UUID], nil, nil, &error);
+        line(@"relink %@ (%lu plug-ins): %@ %@", bundleID, (unsigned long)items.count - 1, ok ? @"YES" : @"NO", error ?: @"");
+    }
+}
+
+// What CoreFoundation's bundle machinery reads from a bundle directory -- what LaunchServices records a plug-in's extension
+// point from: CFBundle's identifier, its Info.plist URL, the NSExtension point in its info dictionary, and the dictionary read
+// straight from the directory, for comparing a bundle shown through the bindfs view with one on the system volume.
+extern CFURLRef _CFBundleCopyInfoPlistURL(CFBundleRef bundle);   // CoreFoundation, private
+static void bundle(NSArray<NSString *> *paths) {
+    for (NSString *path in paths) {
+        NSURL *url = [NSURL fileURLWithPath:path isDirectory:YES];
+        CFBundleRef b = CFBundleCreate(NULL, (CFURLRef)url);
+        NSDictionary *info = b ? (NSDictionary *)CFBundleGetInfoDictionary(b) : nil;
+        CFURLRef infoURL = b ? _CFBundleCopyInfoPlistURL(b) : NULL;
+        NSDictionary *direct = (NSDictionary *)CFBundleCopyInfoDictionaryInDirectory((CFURLRef)url);
+        line(@"%@\n    CFBundle %@ id=%@ infoURL=%@ keys=%lu point=%@\n    in-directory keys=%lu point=%@", path, b ? @"ok" : @"(nil)",
+             b ? (NSString *)CFBundleGetIdentifier(b) : nil, infoURL ? [(NSURL *)infoURL path] : nil, (unsigned long)info.count,
+             info[@"NSExtension"][@"NSExtensionPointIdentifier"], (unsigned long)direct.count,
+             direct[@"NSExtension"][@"NSExtensionPointIdentifier"]);
+    }
 }
 
 static void restrictions(NSArray<NSString *> *identifiers) {
@@ -233,7 +464,7 @@ int main(int argc, char **argv) {
             at += 2;
         }
         if (at >= argc) {
-            fprintf(stderr, "usage: lsdiag [-c] [-u UID] app|ext|restrictions|boot NAME...\n");
+            fprintf(stderr, "usage: lsdiag [-c] [-u UID] app|ext|plugins|restrictions|rebuild|register|midump|nodes|fsnode|relink|bundle|boot NAME...\n");
             return 2;
         }
         NSString *verb = @(argv[at++]);
@@ -250,6 +481,20 @@ int main(int argc, char **argv) {
             restrictions(identifiers);
         } else if ([verb isEqualToString:@"plugins"]) {
             plugins(identifiers);
+        } else if ([verb isEqualToString:@"rebuild"]) {
+            rebuild(identifiers);
+        } else if ([verb isEqualToString:@"register"]) {
+            registerApps(identifiers);
+        } else if ([verb isEqualToString:@"midump"]) {
+            midump(identifiers);
+        } else if ([verb isEqualToString:@"nodes"]) {
+            nodes(identifiers);
+        } else if ([verb isEqualToString:@"fsnode"]) {
+            fsnodes(identifiers);
+        } else if ([verb isEqualToString:@"relink"]) {
+            relink(identifiers);
+        } else if ([verb isEqualToString:@"bundle"]) {
+            bundle(identifiers);
         } else if ([verb isEqualToString:@"boot"]) {
             bootstrap(identifiers);
         } else {
