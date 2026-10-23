@@ -12,7 +12,13 @@ the environment wins):
 | `VM` | id of the UniXNU VM in the DroidVM daemon (`vm_list`) |
 | `DVMIPC` | path of the DroidVM daemon's IPC client, `dvmipc.py` |
 | `BUILD_HOST`, `BUILD_OUT` | `deploy.sh`: the build Mac (`user@host`) and `out/droidvm` of its UniXNU checkout |
-| `REPO` | `deploy.sh`, `swap-adt.sh`: the device repository, when the rig is not its `tools/rig` |
+| `REPO` | `deploy.sh`, `swap-adt.sh`, `payload-redeploy.sh`: the device repository, when the rig is not its `tools/rig` |
+| `BUILD_REPO` | `payload-redeploy.sh`: the device repository's checkout on the build Mac (board.toml, make-droidvm-disk.sh) |
+| `FORK` | `plugin-redeploy.sh`: the local UniXNU fork checkout whose plugin scripts and metal2vulkan patches are built |
+| `DATA_SEED` | `payload-redeploy.sh`: the Data seed in the tree's `build/droidvm-data` (default `data-12g-skip-ov.dbr`; another seed starts Data again) |
+| `GUEST_IP`, `GUEST_KEY` | `guest-ssh.sh`: the guest's IPv4 (`health.py`) and the ssh key (default `out/ssh/id_ed25519`) |
+| `CROSVM_BIN` | `crosvm-deploy.sh`: the crosvm build to install (the meta repo's `crosvm_out/crosvm`) |
+| `UNIFIEDLOG`, `LOG_BASE` | `guest-newlogs.sh`: mandiant/macos-UnifiedLogs' `unifiedlog_iterator`, and a full mirror made by `logarchive.py` (default `out/guest.logarchive`) |
 
 | Tool | Use |
 | --- | --- |
@@ -45,6 +51,12 @@ the environment wins):
 | `logarchive.py OUT` | Mirror the guest's unified log (diagnostics + uuidtext) for a tracev3 parser such as mandiant/macos-UnifiedLogs (`unifiedlog_iterator -m log-archive`) or macOS `log show --archive`; each tree is listed with its sizes in one request (`export.py tree`), and reruns fetch only what changed |
 | `logs.sh [--no-mirror] LOG-SHOW-OPTIONS...` | The guest's unified log through macOS's own `log show` on `BUILD_HOST`: mirror, copy the archive there, show it, e.g. `logs.sh --last 10m --predicate 'process == "Preferences"'` |
 | `make-data-store.sh [GIB]` | Make the labelled sparse disk of the persistent Data store on the phone |
+| `guest-ssh.sh [--key\|COMMAND]` | A root shell or command in the guest over its dropbear (port 2222), through `nc` on the phone; `--key` makes the key and puts it into the guest (after every new Data seed). stdin passes through, so it also copies files in |
+| `guest-newlogs.sh [N] [OUT.jsonl]` | Only the newest N tracev3 files of the guest's unified log, parsed to JSON lines with the uuidtext of a full mirror; fetches uuidtext the mirror lacks (rebuilt plugin or tools) |
+| `frame-burst.sh OUTDIR N PRE swipe X0 Y0 X1 Y1 MS\|tap X Y` | N framebuffers back to back (~25 ms apart) with the phone itself starting the input after PRE of them: what an animation really shows (tearing, stale layers), plus a contact sheet and per-frame change counts |
+| `payload-redeploy.sh [--keep-trust] [TOOL...]` | Remake the owner trust bundle and pin it in board.toml (here and on the Mac), build the payload around `DATA_SEED`, make the boot disk, deploy, restart, put the ssh key, stage owner tools |
+| `plugin-redeploy.sh` | Build the Metal plugin on the Mac from `FORK`, keep the running plugin trusted, stage the new one into the guest's Data, flush it, `payload-redeploy.sh`, and check it survived the reboot |
+| `crosvm-deploy.sh` | Install `CROSVM_BIN` as the app's crosvm (VM stopped), keeping a backup and the old binary's owner, mode and SELinux label; guest and crosvm must agree on the droidvm-gpu wire version |
 | `daemon-recover.sh` | Restart droidvmd the way the app does and recreate the VM from its saved config (`unixnu-vm.config.json`, rig-local; its `screens.simplefb` is 1366x1024: the guest is an iPad Pro 12.9-inch, whose home screen is laid out for 1366x1024 points, and at 1280x800 its icons and widgets overlapped; change a running daemon's copy with `vm_modify`) |
 
 After the phone itself restarts, open the DroidVM app once (or `insmod` the modules of its autostart set from
