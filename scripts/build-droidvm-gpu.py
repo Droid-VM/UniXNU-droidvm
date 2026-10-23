@@ -5,7 +5,7 @@ NativeAdreno's user client, IOKit surface, execbuf and memory (NativeAdrenoUserC
 NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled unchanged, except for a few lines of
 NativeAdrenoPublish.cpp, compiled from a staged copy: its client windows are absolute addresses of sheng's GPU address space
 (0x20000000..), and here the space is the KGSL VBO the host reserved, so they are offset from droidvm_gpu_window_base() (the VBO's
-start), and there are six of them instead of four (below). The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer)
+start), and there are ten of them instead of four (below). The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer)
 come from DroidVMGpu.cpp instead of their own sources. The staged AGXAccelerator (build-native-adreno-accelerator.py) rides
 along for droidvm-gpu-metal=1.
 
@@ -62,19 +62,18 @@ if publish.count(anchor) != 1:
     sys.exit('NativeAdrenoPublish.cpp include anchor not found')
 publish = publish.replace(anchor, anchor + '/* DroidVM: the clients\' windows start at the VBO (kits/droidvm/DroidVMGpu.cpp). */\n'
                           'extern "C" uint64_t droidvm_gpu_window_base(void);\n')
-# Six connections instead of NativeAdreno's four: the render server, the widget renderer, the wallpaper and the app icons take four,
-# and WebKit's GPU and WebContent processes (droidvm-gpu-clients com.apple.WebKit.*) need two more. The render server keeps its 1 GiB;
-# the others get 256 MiB each, following it, still inside the 3 GiB of the VBO that DroidVMGpu.cpp requires (sheng's aperture ends
-# at 0x80000000, so NativeAdreno splits it in three).
+# Ten connections instead of NativeAdreno's four: the render server, the widget renderer, the wallpaper and the app icons take four,
+# WebKit's GPU and WebContent processes (droidvm-gpu-clients com.apple.WebKit.*) more, and an app that draws with Metal itself (Maps)
+# one each. Each window is 1 GiB, following the render server's; the ten take 10 GiB of the KGSL VBO (128 GiB on the SM8650 host),
+# which DroidVMGpu.cpp requires. sheng's aperture ends at 0x80000000, so NativeAdreno splits it in three.
 table = re.search(r'enum : unsigned \{NativeAdrenoMaxClients=4\};\n'
                   r'static const struct \{uint64_t start,bytes;\} kClientWindows\[NativeAdrenoMaxClients\]=\{\n'
                   r'    \{0x20000000ull,0x40000000ull\}(,\{0x[0-9A-Fa-f]+ull,0x[0-9A-Fa-f]+ull\}){3}\};', publish)
 if not table:
     sys.exit('NativeAdrenoPublish.cpp no longer declares the four client windows')
-publish = publish.replace(table[0], 'enum : unsigned {NativeAdrenoMaxClients=6};\n'
-                          'static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={\n'
-                          '    {0x20000000ull,0x40000000ull},{0x60000000ull,0x10000000ull},{0x70000000ull,0x10000000ull},\n'
-                          '    {0x80000000ull,0x10000000ull},{0x90000000ull,0x10000000ull},{0xa0000000ull,0x10000000ull}};')
+windows = ','.join('{%#xull,0x40000000ull}' % (0x20000000 + (i << 30)) for i in range(10))
+publish = publish.replace(table[0], 'enum : unsigned {NativeAdrenoMaxClients=10};\n'
+                          'static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={\n    ' + windows + '};')
 staged = OUT / 'NativeAdrenoPublish.cpp'
 staged.write_text(publish)
 

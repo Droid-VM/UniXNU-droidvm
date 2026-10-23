@@ -109,7 +109,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "d838346243b0ccc87b20456cb1b1b7b79ae8a645ba8ac007d44a161740aaa7e2",
+  "06cb9b5c3a3f1392dfe520b593d3cbd431bb2a0fab06d15cb81a0145a7904959",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -191,7 +191,9 @@ kernel_args = [
   # CoreImage context otherwise falls back to OpenGL ES and crashes in CI::GLContext on every icon (sheng disables the job);
   # and WebKit's processes, com.apple.WebKit.* (a name ending in '*' names every process it begins; the kernel's grant compares
   # the first 16 characters): CoreGraphics draws a page's wide-color layers ('b3a8', 'w30r') only through the GPU, so without a
-  # device WebContent drew nothing into them and Safari's pages were black
+  # device WebContent drew nothing into them and Safari's pages were black. Maps is not one: VectorKit
+  # lost its device (DeviceLost) within seconds, and the render server's frames were wedged until a reboot; without one its map is
+  # blank but the app runs
   "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent,com.apple.WebKit.*",
 ]
 
