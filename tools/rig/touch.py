@@ -2,7 +2,7 @@
 """Touch the running guest's screen from the host: write the finger set NativeHidInput's digitizer reads every 8 ms
 (native_touch_seq/count/ids/xs/ys, a seqlock: odd while it is being written) through crosvm's /proc/<pid>/mem.
 
-  touch.py tap X Y                       a tap at screen pixel X,Y (1280x800 framebuffer)
+  touch.py tap X Y                       a tap at screen pixel X,Y of the framebuffer (handoff.env)
   touch.py swipe X0 Y0 X1 Y1 [STEPS]     press, move in STEPS, lift
   touch.py down X Y | move X Y | up      single steps
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Touch the guest's screen through the phone, the way a finger on the DroidVM app's display does.
 
-  input.py tap X Y                    a tap at guest pixel X,Y (the 1280x800 framebuffer, as fbgrab.sh shows it)
+  input.py tap X Y                    a tap at guest pixel X,Y (of the framebuffer, as fbgrab.sh shows it)
   input.py long X Y [MS]              a press held MS milliseconds (default 1000): context menus, edit mode
   input.py swipe X0 Y0 X1 Y1 [MS]     a swipe taking MS milliseconds (default 300)
   input.py unlock                     swipe up from the bottom edge (lock screen to home screen, or Home in an app)
@@ -21,6 +21,12 @@ import rigenv  # noqa: F401
 
 PHONE = os.environ['PHONE']
 GUEST_WIDTH, GUEST_HEIGHT = 1280, 800
+try:   # the framebuffer of the last boot, from DarwinBoot's hand-off (vm.sh writes it)
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'out', 'handoff.env')) as handoff:
+        facts = dict(line.strip().partition('=')[::2] for line in handoff if '=' in line)
+    GUEST_WIDTH, GUEST_HEIGHT = int(facts['FB_WIDTH']), int(facts['FB_HEIGHT'])
+except (OSError, KeyError, ValueError):
+    pass
 
 
 def adb(*command):

@@ -109,6 +109,10 @@ start() {
   echo "start $(date +%s)" > "$RIG_OUT/vm-request"
   "$RIG/daemon-recover.sh" >/dev/null || { echo "the DroidVM daemon did not come back"; return 1; }
   ipc vm_console_clear "{\"vm_id\":\"$VM\"}" >/dev/null 2>&1
+  # The console keeps earlier boots' output (the clear above does not reach it), so the hand-off below is the first one past these.
+  local port token before
+  port=$($A shell "su -c 'cat $RUN/droidvmd-port.txt'" | tr -dc 0-9); token=$($A shell "su -c 'cat $RUN/droidvmd-token.txt'" | tr -dc 0-9a-f)
+  before=$(python3 "$RIG/console.py" "$port" "$token" "$VM" serial1 2>/dev/null | grep -ao 'DARWINBOOT: video base' | wc -l)
   for attempt in 1 2 3; do
     ipc vm_start "{\"vm_id\":\"$VM\"}" >/dev/null 2>&1
     for i in $(seq 1 10); do pid=$(crosvm_pid); [ -n "$pid" ] && break; sleep 1; done
@@ -120,7 +124,7 @@ start() {
   for i in $(seq 1 30); do
     port=$($A shell "su -c 'cat $RUN/droidvmd-port.txt'" | tr -dc 0-9); token=$($A shell "su -c 'cat $RUN/droidvmd-token.txt'" | tr -dc 0-9a-f)
     python3 "$RIG/console.py" "$port" "$token" "$VM" serial1 > "$RIG_OUT/console.txt" 2>/dev/null
-    grep -q 'DARWINBOOT: video base' "$RIG_OUT/console.txt" && break
+    [ "$(grep -ao 'DARWINBOOT: video base' "$RIG_OUT/console.txt" | wc -l)" -gt "$before" ] && break
     sleep 2
   done
   python3 - "$RIG_OUT/console.txt" <<'PY'
