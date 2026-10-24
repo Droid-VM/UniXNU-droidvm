@@ -6,8 +6,9 @@
 # DATA_SEED names the seed in the tree's build/droidvm-data (default data-12g-skip-ov.dbr). A different seed than the running one
 # starts the guest's Data again: back up /private/var/ngpu first (PROGRESS.md in the meta repo, "Data reset").
 # The Mac's checkouts must hold the source here (mac-sync-check.sh; SYNC_CHECK=0 skips it). The new boot disk is compared with the
-# running one before the VM stops: a changed DarwinBoot, UEFI loader or Data seed is refused unless ALLOW_CHANGE names it
-# (ALLOW_CHANGE="darwinboot uefi seed"); a changed seed starts Data again. The running disk is kept as out/droidvm-disk.prev.img.
+# running one before the VM stops: a changed DarwinBoot, UEFI loader, device tree (ADT; its random seed aside) or Data seed is
+# refused unless ALLOW_CHANGE names it (ALLOW_CHANGE="darwinboot uefi adt seed"); a changed seed starts Data again. The ADT is made
+# from board.toml's [payload.adt] and package/crosvm-gunyah.dtb, the VM's own FDT: both must follow the VM's devices. The running disk is kept as out/droidvm-disk.prev.img.
 # Needs BUILD_HOST, BUILD_OUT, BUILD_REPO (the device repository's checkout on the Mac), FORK and unique-chip-id.txt beside this script.
 set -u
 RIG=$(cd "$(dirname "$0")" && pwd)
@@ -39,24 +40,31 @@ ssh "$MAC" "export PATH=/opt/homebrew/bin:\$PATH; T=$M/tree; mkdir -p $M/rig-log
 echo "payload built around $SEED"
 cd "$RIG"
 scp -q "$MAC:$M/payload/droidvm-disk.img" out/droidvm-disk.next.img || { echo "cannot fetch the new boot disk"; exit 1; }
-python3 - out/droidvm-disk.img out/droidvm-disk.next.img "${ALLOW_CHANGE:-}" <<'PY' || exit 1
+python3 - out/droidvm-disk.img out/droidvm-disk.next.img "${ALLOW_CHANGE:-}" "$DEV/scripts/dump-adt.py" <<'PY' || exit 1
 import os, subprocess, sys, tempfile, tomllib
-running, new, allowed = sys.argv[1], sys.argv[2], sys.argv[3].split()
+running, new, allowed, dump_adt = sys.argv[1], sys.argv[2], sys.argv[3].split(), sys.argv[4]
 parts = {'darwinboot': '::/EFI/UniXNU/Payloads/DarwinBoot.efi', 'uefi': '::/EFI/BOOT/BOOTAA64.EFI',
          'seed': '::/EFI/UniXNU/Payloads/scratch-data.img', 'adt': '::/EFI/UniXNU/Payloads/kernel.macho.adt',
          'trust': '::/EFI/UniXNU/Payloads/kernel.macho.trustcache', 'config': '::/EFI/UniXNU/unixnu.toml'}
-guarded = {'darwinboot', 'uefi', 'seed'}
+guarded = {'darwinboot', 'uefi', 'adt', 'seed'}
 def read(disk, path):
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, 'f')
         r = subprocess.run(['mcopy', '-n', '-i', disk, path, out], env=dict(os.environ, MTOOLS_SKIP_CHECK='1'), capture_output=True)
         return open(out, 'rb').read() if r.returncode == 0 else None
+def adt(disk):
+    """The ADT as dump-adt.py prints it, without the random seed every build draws anew."""
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(read(disk, parts['adt']) or b''); f.flush()
+        text = subprocess.run([sys.executable, '-I', dump_adt, f.name], capture_output=True, text=True).stdout
+    return [line for line in text.splitlines() if 'random-seed' not in line]
 def boot_args(disk):
     config = tomllib.loads((read(disk, parts['config']) or b'').decode())
     return {entry.get('id'): entry.get('args', '') for entry in config.get('entry', [])}
 if not os.path.exists(running):
     sys.exit('no running boot disk in out/ to compare with (deploy.sh fetches one)')
-changed = [name for name, path in parts.items() if read(running, path) != read(new, path)]
+changed = [name for name, path in parts.items()
+           if (adt(running) != adt(new) if name == 'adt' else read(running, path) != read(new, path))]
 print('boot disk changes:', ' '.join(changed) or 'none (the kernel is replaced by deploy.sh)')
 before, after = boot_args(running), boot_args(new)
 for entry, args in after.items():

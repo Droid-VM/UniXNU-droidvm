@@ -40,11 +40,15 @@ cd "$RIG"
 rm -rf out/plugin; mkdir -p out/plugin
 scp -q -r "$MAC:$M/tree/build/adreno-metal-plugin/NativeAdrenoMetal.bundle" out/plugin/
 B=/private/var/ngpu/addons/NativeAdrenoMetal.bundle
+FILES="NativeAdrenoMetal libvulkan_freedreno.dylib _CodeSignature/CodeResources Info.plist"
+# Each goes in beside the running one and is renamed over it: the running processes keep the old file mapped (writing a mapped
+# dylib in place breaks their code pages), and the System path (bindfs) shows the new one from the next boot.
 for f in NativeAdrenoMetal:0755 libvulkan_freedreno.dylib:0755 _CodeSignature/CodeResources:0644 Info.plist:0644; do
-  timeout 600 python3 export.py put "out/plugin/NativeAdrenoMetal.bundle/${f%%:*}" "$B/${f%%:*}" "${f##*:}" 2>&1 | tail -1
+  timeout 600 python3 export.py put "out/plugin/NativeAdrenoMetal.bundle/${f%%:*}" "$B/${f%%:*}.new" "${f##*:}" 2>&1 | tail -1
 done
 WANT=$(md5sum out/plugin/NativeAdrenoMetal.bundle/NativeAdrenoMetal | cut -c1-32)
-GSSH_TIMEOUT=200 ./guest-ssh.sh "/private/var/ngpu/bin/gfxprobe sync $B/NativeAdrenoMetal $B/libvulkan_freedreno.dylib $B/_CodeSignature/CodeResources $B/Info.plist"
+GSSH_TIMEOUT=200 ./guest-ssh.sh "cd $B && for f in $FILES; do /private/var/ngpu/bin/toybox mv -f \$f.new \$f || exit 1; done &&
+  /private/var/ngpu/bin/gfxprobe sync $B/NativeAdrenoMetal $B/libvulkan_freedreno.dylib $B/_CodeSignature/CodeResources $B/Info.plist"
 python3 -c "import time; time.sleep(20)"
 ./payload-redeploy.sh 2>&1 | tail -4
 GOT=$(GSSH_TIMEOUT=100 ./guest-ssh.sh "/private/var/ngpu/bin/toybox md5sum $B/NativeAdrenoMetal" 2>&1 | cut -c1-32)
