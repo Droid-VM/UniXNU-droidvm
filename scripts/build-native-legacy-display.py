@@ -107,6 +107,9 @@ for i in range(168,358):
     elif i==337:header+=' virtual IOReturn collectCompletionReports(uint32_t,void *,uint32_t *,uint32_t)=0;\n'
     elif i==288:header+=' virtual bool startHardware();\n'
     elif i==301:header+=' virtual bool getRefreshAttributes(uint64_t *,bool);\n'
+    # swap_wait_gated calls it when a swap has not completed in 5 s ("CommandWake didn't happen even after 5 seconds ... cancelling
+    # swaps"), logs its result and then cancels the family's own queue (slot 346): the platform's half of the cancel.
+    elif i==345:header+=' virtual bool cancelSwapsAfterTimeout()=0;\n'
     elif i in pure:header+=f' virtual __attribute__((noreturn)) void opaque{i}()=0;\n'
     else:header+=f' virtual __attribute__((deprecated("Unclassified ABI: never call from source"))) void opaque{i}();\n'
 header+='};\nstatic_assert(sizeof(IOMobileFramebufferLegacy)==0x18a0,"Actual original instance extent");\n'

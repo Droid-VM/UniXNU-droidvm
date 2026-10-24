@@ -65,7 +65,7 @@ def main():
         early_retires = value('native_legacy_early_retires', 8)
         print(f'present   producer wait {wait_enabled}, busy {value("droidvm_virtio_present_busy", 8)}/'
               f'{value("droidvm_virtio_present_probes", 8)}, status {value("droidvm_virtio_display_last_status")}, '
-              f'early retires {early_retires}')
+              f'early retires {early_retires}, swaps given up after 5 s {value("native_legacy_swap_timeouts", 8)}')
         healthy &= virtio_state == 2 and wait_enabled == 1 and early_retires == 0
     try:
         losses = struct.unpack('<32I', peek.read('droidvm_gpu_lost', 32 * 4)[1])
