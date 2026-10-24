@@ -100,16 +100,16 @@ volume = "DROIDVMESP"
 size_mib = 192
 loader = "driver"
 title = "DroidVM: iPadOS 17.7.11, CPU-rendered desktop"
-# guest RAM of the 5120 MiB pseudo-unprotected VM: "SHIM: /memory now 0x80600000+0x13f400000". crosvm takes the simple
-# framebuffer (screens.simplefb, 6 MiB at 1366x1024) off its top, so this follows the screen size: a larger value puts the panic
-# region inside the framebuffer
-dram_size = "0x13f400000"
+# guest RAM of the 5120 MiB pseudo-unprotected VM: "GH-SHIM: window gpa=0x80600000 size=0x13fa00000". There is no simple
+# framebuffer to take off its top any more (virtio-gpu scans out of guest memory); a VM that has one again (screens.simplefb, 6 MiB at
+# 1366x1024) needs 0x13f400000, or the panic region lands inside the framebuffer
+dram_size = "0x13fa00000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The original static/System trust caches, and the owner trust bundle built around them with the Adreno Metal plugin's CDHashes
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "4cfe75e276af2ca169198a161f19df4f5ba022d5fb7a3773f0a5c60415a78fd0",
+  "976ff87c61760cdcbb0f211bbe401cf9e46da6ae855495239a8a13ba943920a2",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -227,5 +227,8 @@ chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
 # --display-gamut sRGB: the display chain scans out 8-bit sRGB (BGRX), and with the panel's P3 every app and WebKit drew its layers
 # into wide-color surfaces ('w30r', 'b3a8') that CoreGraphics fills only through the GPU -- which WebKit's sandboxed GPU process
 # cannot map -- so Safari's pages stayed black; sRGB keeps them on 8-bit BGRA surfaces CoreGraphics draws on the CPU too.
+# --virtio-gpu-mmio: the display (--virtio-mmio-gpu, last), with 8 MiB of RAM DarwinBoot keeps for its BLT-only boot screen.
+# package/crosvm-gunyah.dtb is this VM's own FDT, which names that window.
 tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000",
-             "--gpu-mmio", "0x0a007000", "--net-mmio", "0x0a008000", "--reclaim-memory", "--display-gamut", "sRGB"]
+             "--gpu-mmio", "0x0a007000", "--net-mmio", "0x0a008000", "--virtio-gpu-mmio", "0x0a009000", "--boot-video-mib", "8",
+             "--reclaim-memory", "--display-gamut", "sRGB"]
