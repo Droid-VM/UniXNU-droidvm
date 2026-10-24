@@ -1793,6 +1793,379 @@ static void MCTest35(MCContext *context) {
     }
 }
 
+// A table cell reused for another row gets a label of another width, and its backing store's memory may be reused for the
+// new image with other rows: the compositor then makes a texture over the same pages with another width and row pitch. A
+// texture that kept the old width or pitch would shear the text across its rows (seen on GFXBench's test list, labels of
+// reused cells garbled for good). One page-aligned region gets a texture of each width in turn, with rows not 64-byte
+// aligned, through the same no-copy buffer and through a new no-copy buffer over the same memory each time; each is drawn 1:1
+// and every texel checked.
+static void MCTest36(MCContext *context) {
+    const NSUInteger length = 256 * 1024, height = MCUnalignedRowHeight;
+    const NSUInteger widths[] = {61, 100, 13, 333, 7, 200, 61};
+    void *memory = nullptr;
+    MCRequire(posix_memalign(&memory, (size_t)getpagesize(), length) == 0, @"posix_memalign failed");
+    NSUInteger alignment = MAX([context.device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatRGBA8Unorm], (NSUInteger)4);
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.vertexFunction = MCFunction(context, @"mc_fullscreen_uv_vertex");
+    descriptor.fragmentFunction = MCFunction(context, @"mc_texture_sample_fragment");
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = MCRenderPipeline(context, descriptor, @"reused memory 1:1 sample");
+    MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterNearest;
+    id<MTLSamplerState> sampler = [context.device newSamplerStateWithDescriptor:samplerDescriptor];
+    MCRequire(sampler != nil, @"newSamplerStateWithDescriptor: returned nil");
+    @try {
+        for (NSUInteger fresh = 0; fresh < 2; fresh++) {
+            id<MTLBuffer> kept = fresh ? nil : [context.device newBufferWithBytesNoCopy:memory length:length
+                                                                                options:MTLResourceStorageModeShared deallocator:nil];
+            MCRequire(fresh || kept != nil, @"newBufferWithBytesNoCopy:length:options:deallocator: returned nil");
+            NSUInteger round = 0;
+            for (NSUInteger width : widths) {
+                const NSUInteger rowBytes = MCUnalignedRowBytes(width, alignment);
+                uint8_t *bytes = static_cast<uint8_t *>(memory);
+                std::memset(bytes, 0xcc, rowBytes * height);
+                for (NSUInteger y = 0; y < height; y++)
+                    for (NSUInteger x = 0; x < width; x++) {
+                        uint8_t *p = bytes + y * rowBytes + x * 4;
+                        p[0] = (uint8_t)(x * 3u + round * 41u); p[1] = (uint8_t)(y * 13u + fresh * 101u); p[2] = (uint8_t)(x ^ (y * 7u)); p[3] = 255;
+                    }
+                @autoreleasepool {
+                    id<MTLBuffer> buffer = kept ?: [context.device newBufferWithBytesNoCopy:memory length:length
+                                                                                    options:MTLResourceStorageModeShared deallocator:nil];
+                    MCRequire(buffer != nil, @"newBufferWithBytesNoCopy:length:options:deallocator: returned nil");
+                    MTLTextureDescriptor *view = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                                    width:width height:height mipmapped:NO];
+                    view.storageMode = MTLStorageModeShared;
+                    view.usage = MTLTextureUsageShaderRead;
+                    id<MTLTexture> texture = [buffer newTextureWithDescriptor:view offset:0 bytesPerRow:rowBytes];
+                    MCRequire(texture != nil, @"newTextureWithDescriptor:offset:bytesPerRow: returned nil");
+                    id<MTLTexture> drawn = MCTexture(context, MTLPixelFormatRGBA8Unorm, width, height, MTLStorageModePrivate,
+                                                     MTLTextureUsageRenderTarget, NO);
+                    id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+                    id<MTLRenderCommandEncoder> encoder =
+                        [commandBuffer renderCommandEncoderWithDescriptor:MCRenderPass(drawn, MTLLoadActionDontCare, MTLStoreActionStore)];
+                    [encoder setRenderPipelineState:pipeline];
+                    [encoder setFragmentTexture:texture atIndex:0];
+                    [encoder setFragmentSamplerState:sampler atIndex:0];
+                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                    [encoder endEncoding];
+                    MCWaitForCommandBuffer(commandBuffer);
+                    MCRequireUnalignedRows(MCReadPrivateTexture(context, drawn, 0, 0), MCAlign(width * 4, 256), bytes, rowBytes,
+                                           width, fresh ? @"a new no-copy buffer over reused memory, sampled"
+                                                        : @"the same no-copy buffer, a texture of another width, sampled");
+                }
+                round++;
+            }
+        }
+    } @finally {
+        free(memory);
+    }
+}
+
+// Text reaches the compositor in IOSurfaces of one or two bytes a pixel, not BGRA: the render server textures 'LA08' surfaces
+// (luminance and alpha) as RG8Unorm, e.g. 900x150 with rows 1824 bytes apart, rounded to 32 bytes and not to 64. Each surface
+// below is filled on the CPU and read on the GPU through a texture of it, by a blit to a buffer and by drawing it 1:1 into an
+// RGBA8 target; every byte must come back.
+static void MCTest37(MCContext *context) {
+    struct Case { uint32_t fourcc; MTLPixelFormat format; NSUInteger bytesPerPixel, width, height; };
+    const Case cases[] = {{0x4C413038, MTLPixelFormatRG8Unorm, 2, 900, 150},   // 'LA08', rows 1824
+                          {0x4C413038, MTLPixelFormatRG8Unorm, 2, 333, 24},    // rows 672
+                          {0x4C303038, MTLPixelFormatR8Unorm, 1, 333, 24},     // 'L008', rows 352
+                          {0x4C303038, MTLPixelFormatR8Unorm, 1, 61, 17}};     // rows 64
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.vertexFunction = MCFunction(context, @"mc_fullscreen_uv_vertex");
+    descriptor.fragmentFunction = MCFunction(context, @"mc_texture_sample_fragment");
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = MCRenderPipeline(context, descriptor, @"small-format surface 1:1 sample");
+    MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterNearest;
+    id<MTLSamplerState> sampler = [context.device newSamplerStateWithDescriptor:samplerDescriptor];
+    MCRequire(sampler != nil, @"newSamplerStateWithDescriptor: returned nil");
+    for (const Case &c : cases) {
+        const NSUInteger rows = MCAlign(c.width * c.bytesPerPixel, 32);
+        NSDictionary *properties = @{(id)kIOSurfaceWidth: @(c.width), (id)kIOSurfaceHeight: @(c.height),
+                                     (id)kIOSurfaceBytesPerElement: @(c.bytesPerPixel), (id)kIOSurfaceBytesPerRow: @(rows),
+                                     (id)kIOSurfacePixelFormat: @(c.fourcc)};
+        IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+        MCRequire(surface != nullptr, [NSString stringWithFormat:@"IOSurfaceCreate %lux%lu returned null", (unsigned long)c.width,
+                                      (unsigned long)c.height]);
+        @try {
+            const NSUInteger surfaceRows = IOSurfaceGetBytesPerRow(surface);
+            MCRequire(IOSurfaceLock(surface, 0, nullptr) == KERN_SUCCESS, @"IOSurfaceLock failed");
+            uint8_t *bytes = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(surface));
+            for (NSUInteger y = 0; y < c.height; y++)
+                for (NSUInteger x = 0; x < c.width * c.bytesPerPixel; x++)
+                    bytes[y * surfaceRows + x] = (uint8_t)(x * 7u + y * 29u + (x / c.bytesPerPixel) / 3u);
+            IOSurfaceUnlock(surface, 0, nullptr);
+            NSString *what = [NSString stringWithFormat:@"%lux%lu %s surface, rows %lu", (unsigned long)c.width, (unsigned long)c.height,
+                              c.bytesPerPixel == 2 ? "LA08" : "L008", (unsigned long)surfaceRows];
+            MTLTextureDescriptor *view = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:c.format width:c.width
+                                                                                           height:c.height mipmapped:NO];
+            view.usage = MTLTextureUsageShaderRead;
+            id<MTLTexture> texture = [context.device newTextureWithDescriptor:view iosurface:surface plane:0];
+            MCRequire(texture != nil, [what stringByAppendingString:@": newTextureWithDescriptor:iosurface:plane: returned nil"]);
+            const NSUInteger tight = c.width * c.bytesPerPixel;
+            id<MTLBuffer> copy = MCBuffer(context, tight * c.height, MTLResourceStorageModeShared);
+            id<MTLTexture> drawn = MCTexture(context, MTLPixelFormatRGBA8Unorm, c.width, c.height, MTLStorageModePrivate,
+                                             MTLTextureUsageRenderTarget, NO);
+            id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+            [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(c.width, c.height, 1) toBuffer:copy destinationOffset:0
+           destinationBytesPerRow:tight destinationBytesPerImage:tight * c.height];
+            [blit endEncoding];
+            id<MTLRenderCommandEncoder> encoder =
+                [commandBuffer renderCommandEncoderWithDescriptor:MCRenderPass(drawn, MTLLoadActionDontCare, MTLStoreActionStore)];
+            [encoder setRenderPipelineState:pipeline];
+            [encoder setFragmentTexture:texture atIndex:0];
+            [encoder setFragmentSamplerState:sampler atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [encoder endEncoding];
+            MCWaitForCommandBuffer(commandBuffer);
+            const uint8_t *got = static_cast<const uint8_t *>(copy.contents);
+            for (NSUInteger y = 0; y < c.height; y++)
+                for (NSUInteger x = 0; x < tight; x++)
+                    MCRequire(got[y * tight + x] == bytes[y * surfaceRows + x],
+                              [NSString stringWithFormat:@"%@, blit to a buffer: row %lu byte %lu expected %u got %u", what,
+                               (unsigned long)y, (unsigned long)x, (unsigned)bytes[y * surfaceRows + x], (unsigned)got[y * tight + x]]);
+            NSData *readback = MCReadPrivateTexture(context, drawn, 0, 0);
+            const NSUInteger readRow = MCAlign(c.width * 4, 256);
+            for (NSUInteger y = 0; y < c.height; y++)
+                for (NSUInteger x = 0; x < c.width; x++)
+                    for (NSUInteger channel = 0; channel < c.bytesPerPixel; channel++) {
+                        const uint8_t want = bytes[y * surfaceRows + x * c.bytesPerPixel + channel];
+                        const uint8_t have = MCPixel(readback, readRow, x, y)[channel];
+                        MCRequire(have == want, [NSString stringWithFormat:@"%@, drawn 1:1: pixel (%lu,%lu) channel %lu expected %u got %u",
+                                                 what, (unsigned long)x, (unsigned long)y, (unsigned long)channel, (unsigned)want,
+                                                 (unsigned)have]);
+                    }
+        } @finally {
+            CFRelease(surface);
+        }
+    }
+}
+
+// Monochrome text reaches the compositor as A8Unorm masks in the client's shared memory: the render server wraps the memory in a
+// no-copy buffer and makes a texture of it with the SPI newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage: (seen:
+// 217x28, 206x100, 43x44, 26x12 A8 masks, RGBA8 images). Each mask size, in A8Unorm, R8Unorm and RGBA8Unorm, with rows rounded to
+// the device's linear alignment or to 16, 32 or 64 bytes and at offsets 0, 64 and 256, is made that way (or by the public newTextureWithDescriptor:offset:
+// bytesPerRow: where the buffer has no such SPI), drawn 1:1, and its channel checked texel by texel.
+static void MCTest38(MCContext *context) {
+    struct Size { NSUInteger w, h; };
+    const Size sizes[] = {{217, 28}, {206, 100}, {43, 44}, {26, 12}, {15, 15}};
+    struct Format { MTLPixelFormat format; NSUInteger bytes, channel; const char *name; };
+    const Format formats[] = {{MTLPixelFormatA8Unorm, 1, 3, "A8"}, {MTLPixelFormatR8Unorm, 1, 0, "R8"}, {MTLPixelFormatRGBA8Unorm, 4, 0, "RGBA8"}};
+    const NSUInteger roundings[] = {1, 16, 32, 64}, offsets[] = {0, 64, 256};
+    const NSUInteger length = 512 * 1024;
+    void *memory = nullptr;
+    MCRequire(posix_memalign(&memory, (size_t)getpagesize(), length) == 0, @"posix_memalign failed");
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.vertexFunction = MCFunction(context, @"mc_fullscreen_uv_vertex");
+    descriptor.fragmentFunction = MCFunction(context, @"mc_texture_sample_fragment");
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = MCRenderPipeline(context, descriptor, @"linear texture 1:1 sample");
+    MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterNearest;
+    id<MTLSamplerState> sampler = [context.device newSamplerStateWithDescriptor:samplerDescriptor];
+    MCRequire(sampler != nil, @"newSamplerStateWithDescriptor: returned nil");
+    SEL linear = sel_registerName("newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+    @try {
+        id<MTLBuffer> buffer = [context.device newBufferWithBytesNoCopy:memory length:length options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+        MCRequire(buffer != nil, @"newBufferWithBytesNoCopy:length:options:deallocator: returned nil");
+        const BOOL spi = [buffer respondsToSelector:linear];
+        for (const Format &f : formats)
+            for (const Size &z : sizes)
+                for (NSUInteger rounding : roundings)
+                    for (NSUInteger offset : offsets) {
+                        const NSUInteger alignment = MAX([context.device minimumLinearTextureAlignmentForPixelFormat:f.format], (NSUInteger)1);
+                        const NSUInteger rows = MCAlign(z.w * f.bytes, MAX(rounding, alignment)), image = rows * z.h;
+                        uint8_t *bytes = static_cast<uint8_t *>(memory) + offset;
+                        std::memset(memory, 0x5a, offset + image + 64);
+                        for (NSUInteger y = 0; y < z.h; y++)
+                            for (NSUInteger x = 0; x < z.w * f.bytes; x++) bytes[y * rows + x] = (uint8_t)(x * 11u + y * 37u + 1u);
+                        @autoreleasepool {
+                            MTLTextureDescriptor *view = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f.format width:z.w
+                                                                                                           height:z.h mipmapped:NO];
+                            view.storageMode = MTLStorageModeShared;
+                            view.usage = MTLTextureUsageShaderRead;
+                            id<MTLTexture> texture = spi
+                                ? ((id<MTLTexture> (*)(id, SEL, MTLTextureDescriptor *, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
+                                      buffer, linear, view, offset, rows, image)
+                                : [buffer newTextureWithDescriptor:view offset:offset bytesPerRow:rows];
+                            if (!texture) continue;   // a pitch or offset the device refuses is no wrong answer
+                            id<MTLTexture> drawn = MCTexture(context, MTLPixelFormatRGBA8Unorm, z.w, z.h, MTLStorageModePrivate,
+                                                             MTLTextureUsageRenderTarget, NO);
+                            id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+                            id<MTLRenderCommandEncoder> encoder = [commandBuffer
+                                renderCommandEncoderWithDescriptor:MCRenderPass(drawn, MTLLoadActionDontCare, MTLStoreActionStore)];
+                            [encoder setRenderPipelineState:pipeline];
+                            [encoder setFragmentTexture:texture atIndex:0];
+                            [encoder setFragmentSamplerState:sampler atIndex:0];
+                            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                            [encoder endEncoding];
+                            MCWaitForCommandBuffer(commandBuffer);
+                            NSData *readback = MCReadPrivateTexture(context, drawn, 0, 0);
+                            const NSUInteger readRow = MCAlign(z.w * 4, 256);
+                            for (NSUInteger y = 0; y < z.h; y++)
+                                for (NSUInteger x = 0; x < z.w; x++) {
+                                    const uint8_t want = bytes[y * rows + x * f.bytes + (f.bytes == 4 ? f.channel : 0)];
+                                    const uint8_t have = MCPixel(readback, readRow, x, y)[f.channel];
+                                    MCRequire(have == want, [NSString stringWithFormat:@"%s %lux%lu rows %lu offset %lu (%s): texel (%lu,%lu) "
+                                                             @"expected %u got %u", f.name, (unsigned long)z.w, (unsigned long)z.h,
+                                                             (unsigned long)rows, (unsigned long)offset, spi ? "linear SPI" : "public",
+                                                             (unsigned long)x, (unsigned long)y, (unsigned)want, (unsigned)have]);
+                                }
+                        }
+                    }
+    } @finally {
+        free(memory);
+    }
+}
+
+// The text masks exactly as the compositor gets them (taken from the render server: GFXBench's test list): the client's shared
+// memory is whole pages, the mask starts 64 bytes in, and the render server wraps all of it in a no-copy buffer and makes an A8
+// linear texture at offset 64. With so little room after the mask the runtime may not alias the memory and copies it into an
+// image of its own instead. Each mask is drawn 1:1 and checked, then rewritten in place with other text and drawn again
+// through the same texture, as a label that changes is redrawn into its backing store.
+static void MCTest39(MCContext *context) {
+    struct Mask { NSUInteger w, h, rows; };
+    const Mask masks[] = {{224, 20, 224}, {320, 20, 320}, {288, 20, 288}, {256, 20, 256}, {96, 20, 96}, {173, 20, 192},
+                          {110, 20, 128}, {534, 64, 544}, {608, 64, 608}, {680, 28, 704}};
+    const NSUInteger page = (NSUInteger)getpagesize(), header = 64;
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.vertexFunction = MCFunction(context, @"mc_fullscreen_uv_vertex");
+    descriptor.fragmentFunction = MCFunction(context, @"mc_texture_sample_fragment");
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = MCRenderPipeline(context, descriptor, @"text mask 1:1 sample");
+    MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterNearest;
+    id<MTLSamplerState> sampler = [context.device newSamplerStateWithDescriptor:samplerDescriptor];
+    MCRequire(sampler != nil, @"newSamplerStateWithDescriptor: returned nil");
+    SEL linear = sel_registerName("newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+    for (const Mask &mask : masks) {
+        if (mask.rows % MAX([context.device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatA8Unorm], (NSUInteger)1)) continue;
+        const NSUInteger length = MCAlign(header + mask.rows * mask.h, page);
+        void *memory = nullptr;
+        MCRequire(posix_memalign(&memory, page, length) == 0, @"posix_memalign failed");
+        @try {
+            uint8_t *bytes = static_cast<uint8_t *>(memory) + header;
+            id<MTLBuffer> buffer = [context.device newBufferWithBytesNoCopy:memory length:length options:MTLResourceStorageModeShared
+                                                                deallocator:nil];
+            MCRequire(buffer != nil, @"newBufferWithBytesNoCopy:length:options:deallocator: returned nil");
+            MTLTextureDescriptor *view = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatA8Unorm width:mask.w
+                                                                                           height:mask.h mipmapped:NO];
+            view.storageMode = MTLStorageModeShared;
+            view.usage = MTLTextureUsageShaderRead;
+            const BOOL spi = [buffer respondsToSelector:linear];
+            id<MTLTexture> texture = spi
+                ? ((id<MTLTexture> (*)(id, SEL, MTLTextureDescriptor *, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
+                      buffer, linear, view, header, mask.rows, mask.rows * mask.h)
+                : [buffer newTextureWithDescriptor:view offset:header bytesPerRow:mask.rows];
+            MCRequire(texture != nil, [NSString stringWithFormat:@"A8 %lux%lu rows %lu: no texture", (unsigned long)mask.w,
+                                       (unsigned long)mask.h, (unsigned long)mask.rows]);
+            for (NSUInteger round = 0; round < 2; round++) {
+                std::memset(memory, 0, length);
+                for (NSUInteger y = 0; y < mask.h; y++)
+                    for (NSUInteger x = 0; x < mask.w; x++) bytes[y * mask.rows + x] = (uint8_t)(x * 5u + y * 41u + round * 97u + 1u);
+                id<MTLTexture> drawn = MCTexture(context, MTLPixelFormatRGBA8Unorm, mask.w, mask.h, MTLStorageModePrivate,
+                                                 MTLTextureUsageRenderTarget, NO);
+                id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+                id<MTLRenderCommandEncoder> encoder =
+                    [commandBuffer renderCommandEncoderWithDescriptor:MCRenderPass(drawn, MTLLoadActionDontCare, MTLStoreActionStore)];
+                [encoder setRenderPipelineState:pipeline];
+                [encoder setFragmentTexture:texture atIndex:0];
+                [encoder setFragmentSamplerState:sampler atIndex:0];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [encoder endEncoding];
+                MCWaitForCommandBuffer(commandBuffer);
+                NSData *readback = MCReadPrivateTexture(context, drawn, 0, 0);
+                const NSUInteger readRow = MCAlign(mask.w * 4, 256);
+                for (NSUInteger y = 0; y < mask.h; y++)
+                    for (NSUInteger x = 0; x < mask.w; x++) {
+                        const uint8_t want = bytes[y * mask.rows + x], have = MCPixel(readback, readRow, x, y)[3];
+                        MCRequire(have == want, [NSString stringWithFormat:@"A8 mask %lux%lu rows %lu in %lu bytes at offset %lu (%s), %@: "
+                                                 @"texel (%lu,%lu) expected %u got %u", (unsigned long)mask.w, (unsigned long)mask.h,
+                                                 (unsigned long)mask.rows, (unsigned long)length, (unsigned long)header,
+                                                 spi ? "linear SPI" : "public", round ? @"rewritten in place" : @"first drawn",
+                                                 (unsigned long)x, (unsigned long)y, (unsigned)want, (unsigned)have]);
+                    }
+            }
+        } @finally {
+            free(memory);
+        }
+    }
+}
+
+// The render server keeps no-copy buffers over clients' shared memory alive in its caches while the memory behind an address
+// changes: a client's mapping is replaced and another is mapped at the same address. A GPU import found again by its address
+// would read the pages the first buffer was made over: the CPU sees the new text mask, the GPU draws the old pages (garbage or
+// another layer's image). Each round maps new pages at the same address (MAP_FIXED) while the earlier rounds' buffers are
+// still alive, makes a new no-copy buffer and an A8 texture over it, and the GPU must read the new pattern.
+static void MCTest40(MCContext *context) {
+    const NSUInteger length = 64 * 1024, width = 224, height = 20, rows = 224, rounds = 4, span = rows * height;
+    id<MTLBuffer> copy = MCBuffer(context, span, MTLResourceStorageModeShared);
+    NSMutableArray *alive = [NSMutableArray array];
+    void *address = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    MCRequire(address != MAP_FAILED, @"mmap failed");
+    auto pattern = [](NSUInteger round, NSUInteger i) { return (uint8_t)(i * 13u + round * 71u + 5u); };
+    // How the GPU's bytes compare with this round's pattern and the earlier rounds' (the pages the address had before).
+    auto verdict = [&](NSUInteger round, NSString *path) {
+        const uint8_t *got = static_cast<const uint8_t *>(copy.contents);
+        NSUInteger wrong = 0, earlier = 0;
+        for (NSUInteger i = 0; i < span; i++) {
+            if (got[i] == pattern(round, i)) continue;
+            wrong++;
+            for (NSUInteger r = 0; r < round; r++) if (got[i] == pattern(r, i)) { earlier++; break; }
+        }
+        MCRequire(wrong == 0, [NSString stringWithFormat:@"round %lu, %@: the GPU read %lu of %lu bytes other than the pages now at the "
+                                                         @"address, %lu of them an earlier round's", (unsigned long)round, path,
+                               (unsigned long)wrong, (unsigned long)span, (unsigned long)earlier]);
+    };
+    @try {
+        for (NSUInteger round = 0; round < rounds; round++) {
+            if (round) {
+                void *again = mmap(address, length, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
+                MCRequire(again == address, @"mmap MAP_FIXED did not map the same address");
+            }
+            uint8_t *bytes = static_cast<uint8_t *>(address) + 64;
+            for (NSUInteger i = 0; i < span; i++) bytes[i] = pattern(round, i);
+            id<MTLBuffer> buffer = [context.device newBufferWithBytesNoCopy:address length:length
+                                                                    options:MTLResourceStorageModeShared deallocator:nil];
+            MCRequire(buffer != nil, @"newBufferWithBytesNoCopy:length:options:deallocator: returned nil");
+            [alive addObject:buffer];   // kept, as a cache keeps it
+            id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+            [blit copyFromBuffer:buffer sourceOffset:64 toBuffer:copy destinationOffset:0 size:span];
+            [blit endEncoding];
+            MCWaitForCommandBuffer(commandBuffer);
+            verdict(round, @"a buffer-to-buffer blit");
+            MTLTextureDescriptor *view = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatA8Unorm width:width
+                                                                                           height:height mipmapped:NO];
+            view.storageMode = MTLStorageModeShared;
+            view.usage = MTLTextureUsageShaderRead;
+            id<MTLTexture> texture = [buffer newTextureWithDescriptor:view offset:64 bytesPerRow:rows];
+            MCRequire(texture != nil, @"newTextureWithDescriptor:offset:bytesPerRow: returned nil");
+            [alive addObject:texture];
+            commandBuffer = [context.queue commandBuffer];
+            blit = [commandBuffer blitCommandEncoder];
+            [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(width, height, 1) toBuffer:copy destinationOffset:0 destinationBytesPerRow:rows
+             destinationBytesPerImage:span];
+            [blit endEncoding];
+            MCWaitForCommandBuffer(commandBuffer);
+            verdict(round, @"an A8 texture over it");
+        }
+    } @finally {
+        [alive removeAllObjects];
+        munmap(address, length);
+    }
+}
+
 typedef id<MTLCommandBuffer> (^MCBenchmarkCommandBlock)(NSUInteger slot, uint64_t serial);
 typedef void (^MCBenchmarkOutputValidator)(NSArray<NSNumber *> *lastSerials);
 
@@ -2222,6 +2595,11 @@ static NSArray<NSString *> *MCCaseNames(void) {
         @"33 small rectangles into a large texture (an atlas)",
         @"34 one texture rewritten and drawn by 16 command buffers in flight",
         @"35 IOSurface emptied (purgeable) and drawn again",
+        @"36 textures of other widths over reused no-copy memory",
+        @"37 one- and two-byte IOSurfaces (L008, LA08) with rows not 64-byte aligned",
+        @"38 A8, R8 and RGBA8 linear textures over a no-copy buffer (the compositor's text masks)",
+        @"39 A8 text masks in whole-page shared memory at offset 64, redrawn in place",
+        @"40 new pages at an address an earlier no-copy buffer still covers",
     ];
 }
 
@@ -2271,6 +2649,16 @@ static NSArray<NSArray<NSString *> *> *MCCaseSelectors(void) {
         @[@"commit (16 in flight)", @"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
           @"MTLLoadActionClear", @"setFragmentTexture:atIndex:", @"texture.sample"],
         @[@"IOSurfaceSetPurgeable", @"newTextureWithDescriptor:iosurface:plane:", @"IOSurfaceLock", @"IOSurfaceUnlock"],
+        @[@"newBufferWithBytesNoCopy:length:options:deallocator:", @"newTextureWithDescriptor:offset:bytesPerRow:", @"texture.sample"],
+        @[@"IOSurfaceCreate", @"newTextureWithDescriptor:iosurface:plane:", @"MTLPixelFormatRG8Unorm", @"MTLPixelFormatR8Unorm",
+          @"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:",
+          @"texture.sample"],
+        @[@"newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:", @"newBufferWithBytesNoCopy:length:options:deallocator:",
+          @"MTLPixelFormatA8Unorm", @"texture.sample"],
+        @[@"newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:", @"newBufferWithBytesNoCopy:length:options:deallocator:",
+          @"MTLPixelFormatA8Unorm", @"texture.sample", @"CPU rewrite of a sampled no-copy texture"],
+        @[@"mmap MAP_FIXED", @"newBufferWithBytesNoCopy:length:options:deallocator:", @"newTextureWithDescriptor:offset:bytesPerRow:",
+          @"MTLPixelFormatA8Unorm"],
     ];
 }
 
@@ -2311,6 +2699,11 @@ static void MCRunCaseBody(MCContext *context, NSUInteger index) {
         case 32: MCTest33(context); break;
         case 33: MCTest34(context); break;
         case 34: MCTest35(context); break;
+        case 35: MCTest36(context); break;
+        case 36: MCTest37(context); break;
+        case 37: MCTest38(context); break;
+        case 38: MCTest39(context); break;
+        case 39: MCTest40(context); break;
         default: MCRequire(NO, @"invalid fixed test index");
     }
 }
@@ -2423,6 +2816,15 @@ static NSDictionary *MCFixedDimensions(void) {
                     @"rectangles_from_textures": @3},
         @"in_flight_hazards": @{@"width": @256, @"height": @64, @"command_buffers": @16, @"writes": @[@"blit", @"render pass clear"]},
         @"purged_surface": @{@"width": @256, @"height": @256, @"format": @"BGRA"},
+        @"reused_memory_widths": @{@"widths": @[@61, @100, @13, @333, @7, @200, @61], @"height": @9,
+                                   @"buffers": @[@"the same no-copy buffer", @"a new no-copy buffer each time"]},
+        @"small_format_surfaces": @[@"LA08 900x150 rows 1824", @"LA08 333x24 rows 672", @"L008 333x24 rows 352", @"L008 61x17 rows 64"],
+        @"text_masks": @{@"sizes": @[@"217x28", @"206x100", @"43x44", @"26x12", @"15x15"], @"formats": @[@"A8Unorm", @"R8Unorm", @"RGBA8Unorm"],
+                         @"row_rounding": @[@1, @16, @32, @64], @"offsets": @[@0, @64, @256]},
+        @"page_text_masks": @{@"masks": @[@"224x20 r224", @"320x20 r320", @"288x20 r288", @"256x20 r256", @"96x20 r96", @"173x20 r192",
+                                           @"110x20 r128", @"534x64 r544", @"608x64 r608", @"680x28 r704"], @"offset": @64,
+                               @"buffer": @"whole pages around offset + rows * height", @"rounds": @2},
+        @"remapped_under_live_buffer": @{@"bytes": @65536, @"mask": @"A8 224x20 r224 at 64", @"rounds": @4},
         @"benchmark_render": @{@"width": @512, @"height": @512, @"seconds": @2},
         @"benchmark_compute_floats": @{@"count": @1048576, @"seconds": @2},
         @"benchmark_blit_bytes": @{@"bytes": @16777216, @"seconds": @2},
@@ -2459,7 +2861,7 @@ static NSDictionary *MCBaseReport(id<MTLDevice> device, NSString *libraryPath) {
         @"covered_selectors": @[],
         @"uncovered_categories": MCUncoveredCategories(),
         @"correctness_cases": @[],
-        @"correctness_case_count": @35,
+        @"correctness_case_count": @40,
         @"benchmark": @{@"status": @"NOT_REQUESTED", @"passed": [NSNull null], @"workloads": @[]},
     };
 }
