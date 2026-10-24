@@ -40,7 +40,13 @@ entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-containe
                                          'com.apple.private.coreservices.can-register-install-results': True,
                                          'com.apple.private.MobileContainerManager.allowed': True,
                                          'com.apple.private.security.storage.AppBundles': True,
-                                         'com.apple.private.security.storage.AppDataContainers': True}))
+                                         'com.apple.private.security.storage.AppDataContainers': True,
+                                         # launch-args: FrontBoard's open-application service with debug options (arguments,
+                                         # environment, standard output and error), as Xcode launches an app it debugs.
+                                         'com.apple.frontboard.launchapplications': True,
+                                         'com.apple.frontboard.debugapplications': True,
+                                         'com.apple.springboard.launchapplications': True,
+                                         'com.apple.springboard.debugapplications': True}))
 subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'org.droidvm.lsdiag',
                 '--entitlements', entitlements, binary], check=True)
 detail = subprocess.run(['codesign', '--display', '--verbose=4', binary], capture_output=True, text=True, check=True).stderr

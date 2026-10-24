@@ -8,6 +8,9 @@
 //   lsdiag owner-install APP_PATH...      move trusted org.droidvm apps into MCM bundle containers, keep CLI symlinks
 //   lsdiag -u 501 owner-register APP_PATH...   register those trusted apps with installation metadata
 //   lsdiag -u 501 launch BUNDLE_ID...      request a foreground launch (device must be unlocked)
+//   lsdiag -u 501 launch-args OUT BUNDLE_ID [ARG...]   launch an app as a debugger does (FrontBoard's open-application service
+//                                       with debug options): ARGs on its command line, any running instance ended first, its
+//                                       standard output and error in OUT.out and OUT.err, and NSLog copied to them
 //   lsdiag [-u UID] midump [FILTER...]    the item dictionaries installd gives LaunchServices (type, plug-in owner)
 //   lsdiag [-u UID] relink [-clean] BUNDLE_ID...|all   re-register apps with their plug-ins as an install does (plug-ins get
 //                                       their app); -clean drops each plug-in's records first (unregisterPlugin:)
@@ -340,6 +343,49 @@ static void launchApps(NSArray<NSString *> *identifiers) {
         BOOL ok = ((BOOL (*)(id, SEL, NSString *))objc_msgSend)(workspace, launch, identifier);
         line(@"launch %@: %@", identifier, ok ? @"YES" : @"NO");
     }
+}
+
+// FrontBoardServices' open-application service with debug options, which Xcode's launches use: the arguments, the environment
+// (OS_ACTIVITY_DT_MODE copies os_log/NSLog to standard error) and where standard output and error go. Run as mobile (-u 501).
+static void launchWithArguments(NSArray<NSString *> *words) {
+    if (words.count < 2) { line(@"launch-args: OUT BUNDLE_ID [ARG...]"); return; }
+    dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_NOW);
+    Class serviceClass = NSClassFromString(@"FBSOpenApplicationService"), optionsClass = NSClassFromString(@"FBSOpenApplicationOptions");
+    id service = serviceClass ? call(serviceClass, "serviceWithDefaultShellEndpoint") : nil;
+    if (!service || !optionsClass) { line(@"launch-args: FBSOpenApplicationService unavailable"); return; }
+    NSString *out = words[0], *identifier = words[1];
+    NSArray *arguments = [words subarrayWithRange:NSMakeRange(2, words.count - 2)];
+    // The option keys are FrontBoardServices' exported constants; one it does not export is left out (and printed).
+    NSString * (^key)(const char *) = ^NSString *(const char *name) {
+        NSString *const *constant = (NSString *const *)dlsym(RTLD_DEFAULT, name);
+        if (!constant) line(@"launch-args: %s not exported", name);
+        return constant ? *constant : nil;
+    };
+    NSMutableDictionary *debug = [NSMutableDictionary dictionary], *dictionary = [NSMutableDictionary dictionary];
+    void (^put)(NSMutableDictionary *, const char *, id) = ^(NSMutableDictionary *into, const char *name, id value) {
+        NSString *k = key(name);
+        if (k) into[k] = value;
+    };
+    put(debug, "FBSDebugOptionKeyArguments", arguments);
+    put(debug, "FBSDebugOptionKeyEnvironment", @{@"OS_ACTIVITY_DT_MODE": @"YES"});
+    put(debug, "FBSDebugOptionKeyStandardOutPath", [out stringByAppendingString:@".out"]);
+    put(debug, "FBSDebugOptionKeyStandardErrorPath", [out stringByAppendingString:@".err"]);
+    put(dictionary, "FBSOpenApplicationOptionKeyDebuggingOptions", debug);
+    put(dictionary, "FBSOpenApplicationOptionKeyKillExisting", @YES);
+    put(dictionary, "FBSOpenApplicationOptionKeyUnlockDevice", @YES);
+    put(dictionary, "FBSOpenApplicationOptionKeyActivateSuspended", @NO);
+    line(@"launch-args options %@", dictionary);
+    id options = ((id (*)(id, SEL, NSDictionary *))objc_msgSend)(optionsClass, sel_registerName("optionsWithDictionary:"), dictionary);
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block NSString *result = @"no answer in 30 s";
+    ((void (*)(id, SEL, NSString *, id, void (^)(id, NSError *)))objc_msgSend)(service,
+        sel_registerName("openApplication:withOptions:completion:"), identifier, options, ^(id process, NSError *error) {
+            // Owned, not autoreleased: this runs on FrontBoard's queue, whose pool drains before the main thread prints it (no ARC here).
+            result = error ? [[NSString alloc] initWithFormat:@"failed: %@", error] : [[NSString alloc] initWithFormat:@"launched: %@", process];
+            dispatch_semaphore_signal(done);
+        });
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+    line(@"launch-args %@ %@: %@", identifier, [arguments componentsJoinedByString:@" "], result);
 }
 
 // The item dictionaries installd hands LaunchServices when it builds its database
@@ -860,6 +906,8 @@ int main(int argc, char **argv) {
             installOwnerApps(identifiers);
         } else if ([verb isEqualToString:@"launch"]) {
             launchApps(identifiers);
+        } else if ([verb isEqualToString:@"launch-args"]) {
+            launchWithArguments(identifiers);
         } else if ([verb isEqualToString:@"midump"]) {
             midump(identifiers);
         } else if ([verb isEqualToString:@"nodes"]) {
