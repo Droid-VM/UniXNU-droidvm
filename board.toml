@@ -100,10 +100,12 @@ volume = "DROIDVMESP"
 size_mib = 192
 loader = "driver"
 title = "DroidVM: iPadOS 17.7.11, CPU-rendered desktop"
-# guest RAM of the 5120 MiB pseudo-unprotected VM: "GH-SHIM: window gpa=0x80600000 size=0x13fa00000". There is no simple
-# framebuffer to take off its top any more (virtio-gpu scans out of guest memory); a VM that has one again (screens.simplefb, 6 MiB at
-# 1366x1024) needs 0x13f400000, or the panic region lands inside the framebuffer
-dram_size = "0x13fa00000"
+# guest RAM of the 5120 MiB pseudo-unprotected VM: "GH-SHIM: window gpa=0x80600000 size=0x13f200000". The VM's
+# --pre-alloc drm-host-mb=8 takes 8 MiB of --mem for drm2kgsl's host pool (0x1bf800000, the FDT's drm2kgsl_host node, published to
+# the guest as /arm-io/virtio-gpu drm-host-pool); without it the window is 0x13fa00000. There is no simple framebuffer to take off its
+# top any more (virtio-gpu scans out of guest memory); a VM that has one again (screens.simplefb, 6 MiB at 1366x1024) needs 6 MiB less,
+# or the panic region lands inside the framebuffer
+dram_size = "0x13f200000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The original static/System trust caches, and the owner trust bundle built around them with the Adreno Metal plugin's CDHashes
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
