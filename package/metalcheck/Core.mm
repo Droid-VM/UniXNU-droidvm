@@ -1367,6 +1367,138 @@ static void MCTest29(MCContext *context) {
     }
 }
 
+// The rows of a small CPU-drawn image as the compositor gets them: a shared-memory bitmap whose row pitch is the
+// width rounded to the linear alignment, rarely a multiple of 64 bytes (text labels, the status bar clock). Each
+// width is copied into a private texture by a blit at that pitch, and viewed as a texture over the buffer at that
+// pitch and sampled 1:1; both must give back every texel. A row read at another pitch shows as a row shift.
+static const NSUInteger MCUnalignedRowWidths[] = {7, 13, 61, 77, 100, 333};
+static const NSUInteger MCUnalignedRowHeight = 9;
+
+static NSUInteger MCUnalignedRowBytes(NSUInteger width, NSUInteger alignment) {
+    NSUInteger rowBytes = MCAlign(width * 4, alignment);
+    return rowBytes % 64 ? rowBytes : rowBytes + alignment;
+}
+
+static void MCRequireUnalignedRows(NSData *readback, NSUInteger readRowBytes, const uint8_t *source,
+                                   NSUInteger rowBytes, NSUInteger width, NSString *path) {
+    const uint8_t *actual = static_cast<const uint8_t *>(readback.bytes);
+    for (NSUInteger y = 0; y < MCUnalignedRowHeight; y++) {
+        for (NSUInteger x = 0; x < width * 4; x++) {
+            uint8_t want = source[y * rowBytes + x], got = actual[y * readRowBytes + x];
+            MCRequire(got == want, [NSString stringWithFormat:@"%@ width %lu rows %lu bytes apart: row %lu byte %lu "
+                                   @"expected %u got %u", path, (unsigned long)width, (unsigned long)rowBytes,
+                                   (unsigned long)y, (unsigned long)x, (unsigned)want, (unsigned)got]);
+        }
+    }
+}
+
+static void MCTest30(MCContext *context) {
+    NSUInteger alignment = [context.device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatRGBA8Unorm];
+    MCRequire(alignment > 0 && alignment < 64 && !(alignment & (alignment - 1)),
+              [NSString stringWithFormat:@"minimumLinearTextureAlignmentForPixelFormat: %lu leaves no row pitch "
+                                         @"that is not a multiple of 64", (unsigned long)alignment]);
+    alignment = MAX(alignment, (NSUInteger)4);
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.vertexFunction = MCFunction(context, @"mc_fullscreen_uv_vertex");
+    descriptor.fragmentFunction = MCFunction(context, @"mc_texture_sample_fragment");
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = MCRenderPipeline(context, descriptor, @"unaligned rows 1:1 sample");
+    MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterNearest;
+    samplerDescriptor.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    samplerDescriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> sampler = [context.device newSamplerStateWithDescriptor:samplerDescriptor];
+    MCRequire(sampler != nil, @"newSamplerStateWithDescriptor: returned nil");
+    for (NSUInteger width : MCUnalignedRowWidths) {
+        const NSUInteger height = MCUnalignedRowHeight, rowBytes = MCUnalignedRowBytes(width, alignment);
+        id<MTLBuffer> buffer = MCBuffer(context, rowBytes * height, MTLResourceStorageModeShared);
+        uint8_t *bytes = static_cast<uint8_t *>(buffer.contents);
+        std::memset(bytes, 0xee, buffer.length);
+        for (NSUInteger y = 0; y < height; y++) {
+            for (NSUInteger x = 0; x < width; x++) {
+                uint8_t *pixel = bytes + y * rowBytes + x * 4;
+                pixel[0] = (uint8_t)(x * 7u + y * 3u);
+                pixel[1] = (uint8_t)(y * 37u + 1u);
+                pixel[2] = (uint8_t)(x ^ (y * 11u));
+                pixel[3] = 255;
+            }
+        }
+        id<MTLTexture> copied = MCTexture(context, MTLPixelFormatRGBA8Unorm, width, height, MTLStorageModePrivate,
+                                          MTLTextureUsageShaderRead, NO);
+        id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+        MCRequire(commandBuffer != nil, @"commandBuffer returned nil");
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        MCRequire(blit != nil, @"blitCommandEncoder returned nil");
+        [blit copyFromBuffer:buffer sourceOffset:0 sourceBytesPerRow:rowBytes sourceBytesPerImage:rowBytes * height
+                  sourceSize:MTLSizeMake(width, height, 1) toTexture:copied destinationSlice:0 destinationLevel:0
+           destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        MCWaitForCommandBuffer(commandBuffer);
+        MCRequireUnalignedRows(MCReadPrivateTexture(context, copied, 0, 0), MCAlign(width * 4, 256), bytes, rowBytes,
+                               width, @"buffer-to-texture blit");
+
+        MTLTextureDescriptor *viewDescriptor =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height
+                                                           mipmapped:NO];
+        viewDescriptor.storageMode = MTLStorageModeShared;
+        viewDescriptor.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> view = [buffer newTextureWithDescriptor:viewDescriptor offset:0 bytesPerRow:rowBytes];
+        MCRequire(view != nil, [NSString stringWithFormat:@"newTextureWithDescriptor:offset:bytesPerRow:%lu returned nil "
+                                                          @"for width %lu", (unsigned long)rowBytes, (unsigned long)width]);
+        id<MTLTexture> drawn = MCTexture(context, MTLPixelFormatRGBA8Unorm, width, height, MTLStorageModePrivate,
+                                         MTLTextureUsageRenderTarget, NO);
+        commandBuffer = [context.queue commandBuffer];
+        MCRequire(commandBuffer != nil, @"commandBuffer returned nil");
+        id<MTLRenderCommandEncoder> encoder =
+            [commandBuffer renderCommandEncoderWithDescriptor:MCRenderPass(drawn, MTLLoadActionDontCare, MTLStoreActionStore)];
+        MCRequire(encoder != nil, @"renderCommandEncoderWithDescriptor: returned nil");
+        [encoder setRenderPipelineState:pipeline];
+        [encoder setFragmentTexture:view atIndex:0];
+        [encoder setFragmentSamplerState:sampler atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder endEncoding];
+        MCWaitForCommandBuffer(commandBuffer);
+        MCRequireUnalignedRows(MCReadPrivateTexture(context, drawn, 0, 0), MCAlign(width * 4, 256), bytes, rowBytes,
+                               width, @"texture over the buffer, sampled");
+    }
+}
+
+// CoreAnimation hands the render server each CPU-drawn layer as the client's shared memory wrapped in a no-copy buffer,
+// rewritten in place for the next frame. Whatever the CPU last wrote there must be what the GPU reads, even while those
+// lines are still in the CPU's caches: a stale line mixes the old frame's rows into the new one. Each round rewrites the
+// whole region with another pattern and copies it out on the GPU at once; every 64-byte line must hold the new pattern.
+static void MCTest31(MCContext *context) {
+    const NSUInteger length = 256 * 1024, rounds = 8, line = 64;
+    void *memory = nullptr;
+    MCRequire(posix_memalign(&memory, (size_t)getpagesize(), length) == 0, @"posix_memalign failed");
+    std::memset(memory, 0, length);
+    id<MTLBuffer> wrapped = [context.device newBufferWithBytesNoCopy:memory length:length options:MTLResourceStorageModeShared
+                                                         deallocator:^(void *pointer, NSUInteger) { free(pointer); }];
+    if (!wrapped) free(memory);
+    MCRequire(wrapped != nil, @"newBufferWithBytesNoCopy:length:options:deallocator: returned nil");
+    id<MTLBuffer> copy = MCBuffer(context, length, MTLResourceStorageModeShared);
+    uint32_t *words = static_cast<uint32_t *>(memory);
+    for (NSUInteger round = 0; round < rounds; round++) {
+        for (NSUInteger i = 0; i < length / 4; i++) words[i] = (uint32_t)(round * 0x01010101u) ^ (uint32_t)(i * 2654435761u);
+        id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+        MCRequire(commandBuffer != nil, @"commandBuffer returned nil");
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        MCRequire(blit != nil, @"blitCommandEncoder returned nil");
+        [blit copyFromBuffer:wrapped sourceOffset:0 toBuffer:copy destinationOffset:0 size:length];
+        [blit endEncoding];
+        MCWaitForCommandBuffer(commandBuffer);
+        const uint8_t *want = static_cast<const uint8_t *>(memory), *got = static_cast<const uint8_t *>(copy.contents);
+        NSUInteger stale = 0, first = NSNotFound;
+        for (NSUInteger at = 0; at < length; at += line) {
+            if (std::memcmp(want + at, got + at, line)) { stale++; if (first == NSNotFound) first = at; }
+        }
+        MCRequire(stale == 0, [NSString stringWithFormat:@"round %lu: the GPU read %lu of %lu cache lines the CPU had just "
+                                                         @"rewritten as they were before, the first at byte %lu",
+                               (unsigned long)round, (unsigned long)stale, (unsigned long)(length / line), (unsigned long)first]);
+    }
+}
+
 typedef id<MTLCommandBuffer> (^MCBenchmarkCommandBlock)(NSUInteger slot, uint64_t serial);
 typedef void (^MCBenchmarkOutputValidator)(NSArray<NSNumber *> *lastSerials);
 
@@ -1790,6 +1922,8 @@ static NSArray<NSString *> *MCCaseNames(void) {
         @"27 MTLSharedEvent cross-queue dependency",
         @"28 IOSurface BGRA render/readback",
         @"29 IOSurface framebuffer rotation SPI",
+        @"30 rows not 64-byte aligned: blit and texture over a buffer",
+        @"31 CPU writes to a no-copy buffer reach the GPU",
     ];
 }
 
@@ -1827,6 +1961,10 @@ static NSArray<NSArray<NSString *> *> *MCCaseSelectors(void) {
           @"rotation", @"isFramebufferOnly", @"isDrawable", @"respondsToSelector:", @"setScissorRect:",
           @"setFragmentBytes:length:atIndex:", @"drawPrimitives:vertexStart:vertexCount:",
           @"IOSurfaceLock", @"IOSurfaceGetBaseAddress", @"IOSurfaceUnlock"],
+        @[@"minimumLinearTextureAlignmentForPixelFormat:",
+          @"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+          @"newTextureWithDescriptor:offset:bytesPerRow:", @"setFragmentTexture:atIndex:", @"texture.sample"],
+        @[@"newBufferWithBytesNoCopy:length:options:deallocator:", @"copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"],
     ];
 }
 
@@ -1861,6 +1999,8 @@ static void MCRunCaseBody(MCContext *context, NSUInteger index) {
         case 26: MCTest27(context); break;
         case 27: MCTest28(context); break;
         case 28: MCTest29(context); break;
+        case 29: MCTest30(context); break;
+        case 30: MCTest31(context); break;
         default: MCRequire(NO, @"invalid fixed test index");
     }
 }
@@ -1965,6 +2105,9 @@ static NSDictionary *MCFixedDimensions(void) {
                                                        @"rotation_2": @{@"width": @256, @"height": @64},
                                                    },
                                                    @"rotations": @[@1, @2, @3, @4]},
+        @"unaligned_rows": @{@"widths": @[@7, @13, @61, @77, @100, @333], @"height": @9, @"format": @"RGBA8Unorm",
+                              @"bytes_per_row": @"width * 4 rounded to the linear alignment, never a multiple of 64"},
+        @"no_copy_coherency": @{@"bytes": @262144, @"rounds": @8, @"line_bytes": @64},
         @"benchmark_render": @{@"width": @512, @"height": @512, @"seconds": @2},
         @"benchmark_compute_floats": @{@"count": @1048576, @"seconds": @2},
         @"benchmark_blit_bytes": @{@"bytes": @16777216, @"seconds": @2},
@@ -2001,7 +2144,7 @@ static NSDictionary *MCBaseReport(id<MTLDevice> device, NSString *libraryPath) {
         @"covered_selectors": @[],
         @"uncovered_categories": MCUncoveredCategories(),
         @"correctness_cases": @[],
-        @"correctness_case_count": @29,
+        @"correctness_case_count": @31,
         @"benchmark": @{@"status": @"NOT_REQUESTED", @"passed": [NSNull null], @"workloads": @[]},
     };
 }

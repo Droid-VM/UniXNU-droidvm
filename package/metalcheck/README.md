@@ -35,6 +35,8 @@ Metal Check is a fixed, deterministic correctness probe for selected public Meta
 | 27 | MTLSharedEvent cross-queue dependency |
 | 28 | IOSurface BGRA render/readback |
 | 29 | IOSurface framebuffer rotation SPI: four rotations, non-square plane, four quadrant CPU pixel oracle |
+| 30 | Rows not 64-byte aligned (widths 7 to 333, pitch rounded to the linear alignment): buffer-to-texture blit, and a texture over the buffer sampled 1:1; every byte checked. The compositor's small CPU-drawn bitmaps (labels, the status bar clock) arrive with such pitches |
+| 31 | CPU writes to a no-copy buffer reach the GPU: 256 KiB of page-aligned memory rewritten eight times, each copied out by a blit at once; no 64-byte line may read stale. CoreAnimation wraps a client's CPU-drawn layer this way |
 
 Only case 19 is optional: it may report `SKIP` when `supportsTextureSampleCount:4` is false. Every other case is required; an unexpected `SKIP`, missing resource or pipeline, command error, or oracle mismatch is a `FAIL`.
 
