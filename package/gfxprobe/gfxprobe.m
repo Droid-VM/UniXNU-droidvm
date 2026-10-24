@@ -15,6 +15,8 @@
 //                                       (a blit of a texture over the surface): the words the GPU did not see as the CPU left them
 //   gfxprobe sync PATH...               F_FULLFSYNC each file, then sync(): a file staged into the Data overlay (export.py put)
 //                                       reaches the store before the VM stops (vm.sh stop is no clean shutdown)
+//   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
+//                                       newLibraryWithSource: does through MTLCompilerService) and write the metallib it returns
 //
 // FORMAT is an MTLPixelFormat number (80 BGRA8Unorm, 81 _sRGB, 115 RGBA16Float, 552-555 the XR formats; RenderBox sets bit 31
 // for a variant of its own), FLAGS RenderBox's create flags (hex). Each line prints the surface's IOSurface pixel format, plane
@@ -93,6 +95,55 @@ static void describe(NSString *what, IOSurfaceRef surface, id<MTLDevice> device,
 
 // libsystem_sandbox: enter a sandbox profile by name (SANDBOX_NAMED), as a process launchd starts with one does.
 extern int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
+
+// MTLCompiler.framework (private): the service behind Metal's newLibraryWithSource:. Request 13 compiles Metal source into a metallib
+// (AIR, no GPU code): two little-endian u64 lengths, then the source (NUL-padded to a multiple of 4 bytes) and the compiler options
+// (NUL-terminated). The reply, to a block called before the request returns, is a header whose u32s at 8 and 12 are its own size and
+// that of the warnings after it, then the metallib (as tinygrad's ops_metal.py drives it on macOS).
+typedef void (^CodeGenReply)(int32_t status, const void *reply, size_t length, const char *message);
+static int compileMetal(const char *sourcePath, const char *outPath, const char *options) {
+    void *library = dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_NOW);
+    void *(*create)(const char *) = library ? dlsym(library, "MTLCodeGenServiceCreate") : NULL;
+    void (*build)(void *, void *, uint32_t, const void *, size_t, CodeGenReply) =
+        library ? dlsym(library, "MTLCodeGenServiceBuildRequest") : NULL;
+    if (!create || !build) {
+        printf("MTLCompiler: %s\n", dlerror());
+        return 1;
+    }
+    NSData *source = [NSData dataWithContentsOfFile:@(sourcePath)];
+    if (!source) {
+        printf("%s: cannot read\n", sourcePath);
+        return 1;
+    }
+    const uint64_t sourceBytes = (source.length + 1 + 3) & ~(uint64_t)3, optionBytes = strlen(options) + 1;
+    NSMutableData *request = [NSMutableData dataWithLength:16 + sourceBytes + optionBytes];
+    uint8_t *bytes = request.mutableBytes;
+    memcpy(bytes, &sourceBytes, 8);
+    memcpy(bytes + 8, &optionBytes, 8);
+    memcpy(bytes + 16, source.bytes, source.length);
+    memcpy(bytes + 16 + sourceBytes, options, optionBytes);
+    void *service = create("gfxprobe");
+    printf("service %p, options: %s\n", service, options);
+    __block int result = 1;
+    __block BOOL called = NO;
+    const CFTimeInterval began = CFAbsoluteTimeGetCurrent();
+    build(service, NULL, 13, bytes, request.length, ^(int32_t status, const void *reply, size_t length, const char *message) {
+        called = YES;
+        printf("status %d, reply %zu bytes, %.1f ms%s%s\n", status, length, (CFAbsoluteTimeGetCurrent() - began) * 1000,
+               message && *message ? ", message: " : "", message ? message : "");
+        if (status || !reply || length < 16) return;
+        uint32_t header, warnings;
+        memcpy(&header, (const uint8_t *)reply + 8, 4);
+        memcpy(&warnings, (const uint8_t *)reply + 12, 4);
+        if ((uint64_t)header + warnings > length) return;
+        if (warnings) printf("warnings: %.*s\n", (int)warnings, (const char *)reply + header);
+        NSData *metallib = [NSData dataWithBytes:(const uint8_t *)reply + header + warnings length:length - header - warnings];
+        printf("metallib %zu bytes, magic %.4s\n", metallib.length, (const char *)metallib.bytes);
+        result = [metallib writeToFile:@(outPath) atomically:NO] ? 0 : 1;
+    });
+    if (!called) printf("MTLCodeGenServiceBuildRequest returned without calling back\n");
+    return result;
+}
 
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -173,6 +224,8 @@ int main(int argc, char **argv) {
             sync();
             return failed;
         }
+        if (argc >= 4 && !strcmp(argv[1], "msl"))
+            return compileMetal(argv[2], argv[3], argc >= 5 ? argv[4] : "-std=metal3.1 --driver-mode=metal -x metal");
         if (argc < 5) {
             fprintf(stderr, "usage: gfxprobe rb|ca|cg|plain|open W H ARG... | sync PATH...\n");
             return 2;
