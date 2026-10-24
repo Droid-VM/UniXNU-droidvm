@@ -6,6 +6,7 @@
 #import <simd/simd.h>
 #import <mach/mach.h>
 #include <sys/mman.h>
+#include <vector>
 #import <objc/message.h>
 
 #include <cmath>
@@ -1574,6 +1575,224 @@ static void MCTest32(MCContext *context) {
     }
 }
 
+// The compositor packs small layer images into a large texture it then samples from (an atlas): rectangles of odd size at
+// odd places, uploaded from buffers whose rows are not 64-byte aligned, or copied from other textures. A rectangle written at
+// the wrong place or with the wrong rows would show another layer's text, or garbled rows, inside a label. A 1024x512
+// private render-target texture (the driver may tile or compress it) is cleared, then each rectangle is written by a blit
+// from a buffer and others by a blit from a texture; every texel of the whole texture is checked.
+static void MCTest33(MCContext *context) {
+    const NSUInteger width = 1024, height = 512;
+    struct Rect { NSUInteger x, y, w, h; };
+    const Rect fromBuffer[] = {{1, 1, 7, 9}, {13, 5, 61, 17}, {100, 37, 77, 20}, {333, 101, 333, 25}, {700, 200, 13, 40},
+                               {5, 300, 100, 9}, {1000, 3, 23, 30}, {511, 480, 129, 31}};
+    const Rect fromTexture[] = {{40, 140, 61, 13}, {250, 250, 200, 21}, {900, 333, 99, 17}};
+    id<MTLTexture> atlas = MCTexture(context, MTLPixelFormatBGRA8Unorm, width, height, MTLStorageModePrivate,
+                                     MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, NO);
+    std::vector<uint8_t> want(width * height * 4);
+    const uint8_t clear[4] = {0x10, 0x20, 0x30, 0xff};   // BGRA bytes of the clear color below
+    for (NSUInteger i = 0; i < width * height; i++) std::memcpy(&want[i * 4], clear, 4);
+    auto texel = [](NSUInteger rect, NSUInteger x, NSUInteger y, uint8_t out[4]) {
+        out[0] = (uint8_t)(x * 5u + rect * 31u); out[1] = (uint8_t)(y * 11u + 7u); out[2] = (uint8_t)((x ^ y) + rect); out[3] = 255;
+    };
+    id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+    MCRequire(commandBuffer != nil, @"commandBuffer returned nil");
+    MTLRenderPassDescriptor *pass = MCRenderPass(atlas, MTLLoadActionClear, MTLStoreActionStore);
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0x30 / 255.0, 0x20 / 255.0, 0x10 / 255.0, 1);
+    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    MCRequire(encoder != nil, @"renderCommandEncoderWithDescriptor: returned nil");
+    [encoder endEncoding];
+    NSUInteger alignment = MAX([context.device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm], (NSUInteger)4);
+    NSMutableArray *keep = [NSMutableArray array];
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    MCRequire(blit != nil, @"blitCommandEncoder returned nil");
+    NSUInteger index = 0;
+    for (const Rect &r : fromBuffer) {
+        const NSUInteger rowBytes = MCUnalignedRowBytes(r.w, alignment);
+        id<MTLBuffer> source = MCBuffer(context, rowBytes * r.h, MTLResourceStorageModeShared);
+        [keep addObject:source];
+        uint8_t *bytes = static_cast<uint8_t *>(source.contents);
+        for (NSUInteger y = 0; y < r.h; y++)
+            for (NSUInteger x = 0; x < r.w; x++) {
+                texel(index, x, y, bytes + y * rowBytes + x * 4);
+                std::memcpy(&want[((r.y + y) * width + r.x + x) * 4], bytes + y * rowBytes + x * 4, 4);
+            }
+        [blit copyFromBuffer:source sourceOffset:0 sourceBytesPerRow:rowBytes sourceBytesPerImage:rowBytes * r.h
+                  sourceSize:MTLSizeMake(r.w, r.h, 1) toTexture:atlas destinationSlice:0 destinationLevel:0
+           destinationOrigin:MTLOriginMake(r.x, r.y, 0)];
+        index++;
+    }
+    for (const Rect &r : fromTexture) {
+        // The source has a margin, so the copy starts inside it, as a sub-image of a larger image does.
+        id<MTLTexture> source = MCTexture(context, MTLPixelFormatBGRA8Unorm, r.w + 3, r.h + 2, MTLStorageModeShared,
+                                          MTLTextureUsageShaderRead, NO);
+        [keep addObject:source];
+        std::vector<uint8_t> pixels((r.w + 3) * (r.h + 2) * 4, 0x77);
+        for (NSUInteger y = 0; y < r.h; y++)
+            for (NSUInteger x = 0; x < r.w; x++) {
+                uint8_t *p = &pixels[((y + 1) * (r.w + 3) + x + 2) * 4];
+                texel(index, x, y, p);
+                std::memcpy(&want[((r.y + y) * width + r.x + x) * 4], p, 4);
+            }
+        [source replaceRegion:MTLRegionMake2D(0, 0, r.w + 3, r.h + 2) mipmapLevel:0 withBytes:pixels.data()
+                  bytesPerRow:(r.w + 3) * 4];
+        [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(2, 1, 0)
+                   sourceSize:MTLSizeMake(r.w, r.h, 1) toTexture:atlas destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(r.x, r.y, 0)];
+        index++;
+    }
+    [blit endEncoding];
+    MCWaitForCommandBuffer(commandBuffer);
+    NSData *readback = MCReadPrivateTexture(context, atlas, 0, 0);
+    const NSUInteger readRow = MCAlign(width * 4, 256);
+    const uint8_t *got = static_cast<const uint8_t *>(readback.bytes);
+    for (NSUInteger y = 0; y < height; y++)
+        for (NSUInteger x = 0; x < width; x++) {
+            const uint8_t *g = got + y * readRow + x * 4, *w = &want[(y * width + x) * 4];
+            MCRequire(!std::memcmp(g, w, 4), [NSString stringWithFormat:@"atlas texel (%lu,%lu) expected %02x%02x%02x%02x got "
+                                                                        @"%02x%02x%02x%02x", (unsigned long)x, (unsigned long)y,
+                                               w[0], w[1], w[2], w[3], g[0], g[1], g[2], g[3]]);
+        }
+}
+
+// The compositor writes a layer image into a texture and draws from it, frame after frame, without waiting for the GPU in
+// between: Metal orders a command buffer's write to a tracked texture after the reads of the command buffers before it on the
+// queue, and its draws after its write. Sixteen command buffers are committed back to back; each writes its round's colour
+// into one texture they all share (a blit from a buffer, or a render pass that clears it) and then draws that texture 1:1 into
+// an output of its own. Every output must hold its own round's colour: a write that overtakes an earlier round's draw, or a
+// draw that runs before its round's write, shows another round's colour (another layer's image) in it.
+static void MCTest34(MCContext *context) {
+    const NSUInteger width = 256, height = 64, rounds = 16;
+    id<MTLTexture> sharedTexture = MCTexture(context, MTLPixelFormatRGBA8Unorm, width, height, MTLStorageModePrivate,
+                                             MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, NO);
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.vertexFunction = MCFunction(context, @"mc_fullscreen_uv_vertex");
+    descriptor.fragmentFunction = MCFunction(context, @"mc_texture_sample_fragment");
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = MCRenderPipeline(context, descriptor, @"in-flight 1:1 sample");
+    MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterNearest;
+    id<MTLSamplerState> sampler = [context.device newSamplerStateWithDescriptor:samplerDescriptor];
+    MCRequire(sampler != nil, @"newSamplerStateWithDescriptor: returned nil");
+    auto colour = [](NSUInteger mode, NSUInteger round, uint8_t out[4]) {
+        out[0] = (uint8_t)(17u * round + 5u + 100u * mode); out[1] = (uint8_t)(255u - 13u * round);
+        out[2] = (uint8_t)(31u * round + 7u * mode); out[3] = 255;
+    };
+    for (NSUInteger mode = 0; mode < 2; mode++) {
+        NSMutableArray<id<MTLCommandBuffer>> *commandBuffers = [NSMutableArray array];
+        NSMutableArray *outputs = [NSMutableArray array], *keep = [NSMutableArray array];
+        for (NSUInteger round = 0; round < rounds; round++) {
+            uint8_t c[4]; colour(mode, round, c);
+            id<MTLTexture> output = MCTexture(context, MTLPixelFormatRGBA8Unorm, width, height, MTLStorageModePrivate,
+                                              MTLTextureUsageRenderTarget, NO);
+            [outputs addObject:output];
+            id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+            MCRequire(commandBuffer != nil, @"commandBuffer returned nil");
+            if (mode == 0) {
+                id<MTLBuffer> source = MCBuffer(context, width * height * 4, MTLResourceStorageModeShared);
+                [keep addObject:source];
+                uint8_t *bytes = static_cast<uint8_t *>(source.contents);
+                for (NSUInteger i = 0; i < width * height; i++) std::memcpy(bytes + i * 4, c, 4);
+                id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+                [blit copyFromBuffer:source sourceOffset:0 sourceBytesPerRow:width * 4 sourceBytesPerImage:width * height * 4
+                          sourceSize:MTLSizeMake(width, height, 1) toTexture:sharedTexture destinationSlice:0 destinationLevel:0
+                   destinationOrigin:MTLOriginMake(0, 0, 0)];
+                [blit endEncoding];
+            } else {
+                MTLRenderPassDescriptor *write = MCRenderPass(sharedTexture, MTLLoadActionClear, MTLStoreActionStore);
+                write.colorAttachments[0].clearColor = MTLClearColorMake(c[0] / 255.0, c[1] / 255.0, c[2] / 255.0, 1);
+                [[commandBuffer renderCommandEncoderWithDescriptor:write] endEncoding];
+            }
+            id<MTLRenderCommandEncoder> encoder =
+                [commandBuffer renderCommandEncoderWithDescriptor:MCRenderPass(output, MTLLoadActionDontCare, MTLStoreActionStore)];
+            MCRequire(encoder != nil, @"renderCommandEncoderWithDescriptor: returned nil");
+            [encoder setRenderPipelineState:pipeline];
+            [encoder setFragmentTexture:sharedTexture atIndex:0];
+            [encoder setFragmentSamplerState:sampler atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [encoder endEncoding];
+            [commandBuffers addObject:commandBuffer];
+        }
+        MCWaitForCommandBuffers(commandBuffers, YES);
+        for (NSUInteger round = 0; round < rounds; round++) {
+            uint8_t c[4]; colour(mode, round, c);
+            NSData *readback = MCReadPrivateTexture(context, outputs[round], 0, 0);
+            const NSUInteger row = MCAlign(width * 4, 256);
+            NSUInteger wrong = 0, other = NSNotFound;
+            for (NSUInteger y = 0; y < height; y++)
+                for (NSUInteger x = 0; x < width; x++) {
+                    const uint8_t *g = MCPixel(readback, row, x, y);
+                    if (std::memcmp(g, c, 4)) {
+                        wrong++;
+                        for (NSUInteger r = 0; r < rounds && other == NSNotFound; r++) {
+                            uint8_t o[4]; colour(mode, r, o); if (!std::memcmp(g, o, 4)) other = r;
+                        }
+                    }
+                }
+            MCRequire(wrong == 0, [NSString stringWithFormat:@"%@ round %lu: %lu of %lu texels are not this round's colour%@",
+                                   mode ? @"render-pass write" : @"blit write", (unsigned long)round, (unsigned long)wrong,
+                                   (unsigned long)(width * height),
+                                   other == NSNotFound ? @"" : [NSString stringWithFormat:@" (some are round %lu's)", (unsigned long)other]]);
+        }
+    }
+}
+
+// A backing store the compositor does not show is marked volatile, and under memory pressure its pages are taken; when the
+// client draws into it again it is made nonvolatile and gets other pages. A GPU import of the surface made before that still
+// holds the old pages, and would show what the surface held before (another layer's image) or a mix of both. The surface is
+// filled with A and read on the GPU through a texture of it; then it is emptied (kIOSurfacePurgeableEmpty), made nonvolatile
+// again and filled with B on the CPU; the same texture and a new texture of the surface must both read B.
+static void MCTest35(MCContext *context) {
+    const NSUInteger side = 256, length = side * side * 4;   // 256 KiB: whole pages of their own
+    NSDictionary *properties = @{(id)kIOSurfaceWidth: @(side), (id)kIOSurfaceHeight: @(side), (id)kIOSurfaceBytesPerElement: @4,
+                                 (id)kIOSurfaceBytesPerRow: @(side * 4), (id)kIOSurfacePixelFormat: @(0x42475241)};
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+    MCRequire(surface != nullptr, @"IOSurfaceCreate returned null");
+    id<MTLBuffer> copy = MCBuffer(context, length, MTLResourceStorageModeShared);
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                          width:side height:side mipmapped:NO];
+    descriptor.usage = MTLTextureUsageShaderRead;
+    auto fill = [&](uint32_t seed) {
+        MCRequire(IOSurfaceLock(surface, 0, nullptr) == KERN_SUCCESS, @"IOSurfaceLock failed");
+        uint32_t *words = static_cast<uint32_t *>(IOSurfaceGetBaseAddress(surface));
+        for (NSUInteger i = 0; i < length / 4; i++) words[i] = seed ^ (uint32_t)(i * 2654435761u);
+        IOSurfaceUnlock(surface, 0, nullptr);
+    };
+    auto read = [&](id<MTLTexture> texture, uint32_t seed, NSString *what) {
+        id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(side, side, 1) toBuffer:copy destinationOffset:0
+       destinationBytesPerRow:side * 4 destinationBytesPerImage:length];
+        [blit endEncoding];
+        MCWaitForCommandBuffer(commandBuffer);
+        const uint32_t *got = static_cast<const uint32_t *>(copy.contents);
+        NSUInteger wrong = 0, first = NSNotFound;
+        for (NSUInteger i = 0; i < length / 4; i++)
+            if (got[i] != (seed ^ (uint32_t)(i * 2654435761u))) { wrong++; if (first == NSNotFound) first = i * 4; }
+        MCRequire(wrong == 0, [NSString stringWithFormat:@"%@: %lu of %lu words are not the surface's contents, the first at byte %lu",
+                               what, (unsigned long)wrong, (unsigned long)(length / 4), (unsigned long)first]);
+    };
+    @try {
+        fill(0x11111111u);
+        id<MTLTexture> before = [context.device newTextureWithDescriptor:descriptor iosurface:surface plane:0];
+        MCRequire(before != nil, @"newTextureWithDescriptor:iosurface:plane: returned nil");
+        read(before, 0x11111111u, @"before the surface was emptied");
+        uint32_t old = 0;
+        MCRequire(IOSurfaceSetPurgeable(surface, kIOSurfacePurgeableEmpty, &old) == KERN_SUCCESS,
+                  @"IOSurfaceSetPurgeable(kIOSurfacePurgeableEmpty) failed");
+        MCRequire(IOSurfaceSetPurgeable(surface, kIOSurfacePurgeableNonVolatile, &old) == KERN_SUCCESS,
+                  @"IOSurfaceSetPurgeable(kIOSurfacePurgeableNonVolatile) failed");
+        fill(0x5a5a5a5au);
+        read(before, 0x5a5a5a5au, @"the texture made before, after the surface was emptied and drawn again");
+        id<MTLTexture> after = [context.device newTextureWithDescriptor:descriptor iosurface:surface plane:0];
+        MCRequire(after != nil, @"newTextureWithDescriptor:iosurface:plane: returned nil");
+        read(after, 0x5a5a5a5au, @"a new texture, after the surface was emptied and drawn again");
+    } @finally {
+        CFRelease(surface);
+    }
+}
+
 typedef id<MTLCommandBuffer> (^MCBenchmarkCommandBlock)(NSUInteger slot, uint64_t serial);
 typedef void (^MCBenchmarkOutputValidator)(NSArray<NSNumber *> *lastSerials);
 
@@ -2000,6 +2219,9 @@ static NSArray<NSString *> *MCCaseNames(void) {
         @"30 rows not 64-byte aligned: blit and texture over a buffer",
         @"31 CPU writes to a no-copy buffer reach the GPU",
         @"32 new pages at a reused address: no-copy buffers and IOSurfaces",
+        @"33 small rectangles into a large texture (an atlas)",
+        @"34 one texture rewritten and drawn by 16 command buffers in flight",
+        @"35 IOSurface emptied (purgeable) and drawn again",
     ];
 }
 
@@ -2043,6 +2265,12 @@ static NSArray<NSArray<NSString *> *> *MCCaseSelectors(void) {
         @[@"newBufferWithBytesNoCopy:length:options:deallocator:", @"copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"],
         @[@"mmap MAP_FIXED", @"newBufferWithBytesNoCopy:length:options:deallocator:", @"IOSurfaceCreate",
           @"newTextureWithDescriptor:iosurface:plane:", @"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:"],
+        @[@"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+          @"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+          @"MTLLoadActionClear"],
+        @[@"commit (16 in flight)", @"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+          @"MTLLoadActionClear", @"setFragmentTexture:atIndex:", @"texture.sample"],
+        @[@"IOSurfaceSetPurgeable", @"newTextureWithDescriptor:iosurface:plane:", @"IOSurfaceLock", @"IOSurfaceUnlock"],
     ];
 }
 
@@ -2080,6 +2308,9 @@ static void MCRunCaseBody(MCContext *context, NSUInteger index) {
         case 29: MCTest30(context); break;
         case 30: MCTest31(context); break;
         case 31: MCTest32(context); break;
+        case 32: MCTest33(context); break;
+        case 33: MCTest34(context); break;
+        case 34: MCTest35(context); break;
         default: MCRequire(NO, @"invalid fixed test index");
     }
 }
@@ -2188,6 +2419,10 @@ static NSDictionary *MCFixedDimensions(void) {
                               @"bytes_per_row": @"width * 4 rounded to the linear alignment, never a multiple of 64"},
         @"no_copy_coherency": @{@"bytes": @262144, @"rounds": @8, @"line_bytes": @64},
         @"reused_address": @{@"bytes": @65536, @"rounds": @6, @"iosurface": @{@"width": @128, @"height": @128, @"format": @"BGRA"}},
+        @"atlas": @{@"width": @1024, @"height": @512, @"format": @"BGRA8Unorm", @"rectangles_from_buffers": @8,
+                    @"rectangles_from_textures": @3},
+        @"in_flight_hazards": @{@"width": @256, @"height": @64, @"command_buffers": @16, @"writes": @[@"blit", @"render pass clear"]},
+        @"purged_surface": @{@"width": @256, @"height": @256, @"format": @"BGRA"},
         @"benchmark_render": @{@"width": @512, @"height": @512, @"seconds": @2},
         @"benchmark_compute_floats": @{@"count": @1048576, @"seconds": @2},
         @"benchmark_blit_bytes": @{@"bytes": @16777216, @"seconds": @2},
@@ -2224,7 +2459,7 @@ static NSDictionary *MCBaseReport(id<MTLDevice> device, NSString *libraryPath) {
         @"covered_selectors": @[],
         @"uncovered_categories": MCUncoveredCategories(),
         @"correctness_cases": @[],
-        @"correctness_case_count": @32,
+        @"correctness_case_count": @35,
         @"benchmark": @{@"status": @"NOT_REQUESTED", @"passed": [NSNull null], @"workloads": @[]},
     };
 }
