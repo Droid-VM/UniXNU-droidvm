@@ -2166,6 +2166,68 @@ static void MCTest40(MCContext *context) {
     }
 }
 
+// Metal source compiled at run time (newLibraryWithSource:), as GFXBench compiles every shader and WebKit's WebGL (ANGLE) its
+// translated ones: a kernel with a preprocessor macro, compiled synchronously and through the completion handler, then run; and
+// source with an error, which must fail with a compile error naming it.
+static void MCTest41(MCContext *context) {
+    NSString *source = @"#include <metal_stdlib>\n"
+                        "using namespace metal;\n"
+                        "kernel void mc_runtime_square(device uint *out [[buffer(0)]], uint i [[thread_position_in_grid]]) {\n"
+                        "    out[i] = i * i + OFFSET;\n"
+                        "}\n";
+    MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+    options.preprocessorMacros = @{@"OFFSET": @"7u"};
+    NSError *error = nil;
+    id<MTLLibrary> library = [context.device newLibraryWithSource:source options:options error:&error];
+    MCRequire(library != nil, [NSString stringWithFormat:@"newLibraryWithSource:options:error: returned nil: %@",
+                                error.localizedDescription ?: @"no NSError"]);
+    __block id<MTLLibrary> asyncLibrary = nil;
+    __block NSError *asyncError = nil;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    options.preprocessorMacros = @{@"OFFSET": @"11u"};
+    [context.device newLibraryWithSource:source options:options completionHandler:^(id<MTLLibrary> made, NSError *failed) {
+        asyncLibrary = made;
+        asyncError = failed;
+        dispatch_semaphore_signal(done);
+    }];
+    MCRequire(dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)MCCommandTimeoutSeconds * NSEC_PER_SEC)) == 0,
+              @"newLibraryWithSource:options:completionHandler: never called back");
+    MCRequire(asyncLibrary != nil, [NSString stringWithFormat:@"newLibraryWithSource:options:completionHandler: gave no library: %@",
+                                    asyncError.localizedDescription ?: @"no NSError"]);
+    const NSUInteger count = 256;
+    const uint32_t offsets[2] = {7, 11};
+    id<MTLLibrary> libraries[2] = {library, asyncLibrary};
+    for (NSUInteger which = 0; which < 2; which++) {
+        id<MTLFunction> function = [libraries[which] newFunctionWithName:@"mc_runtime_square"];
+        MCRequire(function != nil, @"the compiled library has no mc_runtime_square");
+        id<MTLComputePipelineState> pipeline = [context.device newComputePipelineStateWithFunction:function error:&error];
+        MCRequire(pipeline != nil, [NSString stringWithFormat:@"compute pipeline from compiled source failed: %@",
+                                    error.localizedDescription ?: @"no NSError"]);
+        id<MTLBuffer> output = MCBuffer(context, count * sizeof(uint32_t), MTLResourceStorageModeShared);
+        std::memset(output.contents, 0xff, count * sizeof(uint32_t));
+        id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:output offset:0 atIndex:0];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [encoder endEncoding];
+        MCWaitForCommandBuffer(commandBuffer);
+        const uint32_t *values = static_cast<const uint32_t *>(output.contents);
+        for (NSUInteger i = 0; i < count; i++)
+            MCRequire(values[i] == (uint32_t)(i * i) + offsets[which],
+                      [NSString stringWithFormat:@"%s library: element %lu expected %u got %u", which ? "asynchronous" : "synchronous",
+                       (unsigned long)i, (unsigned)((uint32_t)(i * i) + offsets[which]), values[i]]);
+    }
+    error = nil;
+    id<MTLLibrary> broken = [context.device newLibraryWithSource:@"kernel void mc_broken(device uint *out [[buffer(0)]]) { out[0] = undeclared; }"
+                                                         options:nil error:&error];
+    MCRequire(broken == nil, @"source with an undeclared identifier compiled");
+    MCRequire(error != nil && [error.domain isEqualToString:MTLLibraryErrorDomain] && error.code == MTLLibraryErrorCompileFailure &&
+              [error.localizedDescription rangeOfString:@"undeclared"].location != NSNotFound,
+              [NSString stringWithFormat:@"a compile failure reported as %@ %ld: %@", error.domain, (long)error.code,
+               error.localizedDescription]);
+}
+
 typedef id<MTLCommandBuffer> (^MCBenchmarkCommandBlock)(NSUInteger slot, uint64_t serial);
 typedef void (^MCBenchmarkOutputValidator)(NSArray<NSNumber *> *lastSerials);
 
@@ -2335,6 +2397,43 @@ static simd_float4 MCBenchmarkColor(uint64_t serial) {
     float red = (float)((serial % 251u) + 1u) / 255.0f;
     float green = (float)(((serial / 251u) % 251u) + 1u) / 255.0f;
     return simd_make_float4(red, green, 0.5f, 1.0f);
+}
+
+// One command buffer at a time, each waited for before the next is made: how long a commit takes to be scheduled, to run and to
+// be seen complete when nothing else is queued, the latency a compositor's frame pays on top of its own GPU work. An empty command
+// buffer and one with a 4-byte fill, 100 of each after one to warm up. Measured only; it neither passes nor fails the benchmark.
+static NSDictionary *MCMeasureRoundTrip(MCContext *context) {
+    id<MTLBuffer> target = MCBuffer(context, 256, MTLResourceStorageModePrivate);
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    for (NSString *kind in @[@"empty", @"fill-4B"]) {
+        NSMutableArray<NSNumber *> *scheduled = [NSMutableArray array], *completed = [NSMutableArray array];
+        NSMutableArray<NSNumber *> *gpu = [NSMutableArray array];
+        for (NSUInteger i = 0; i <= 100; i++) {
+            id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+            MCRequire(commandBuffer != nil, @"round trip commandBuffer returned nil");
+            if ([kind isEqualToString:@"fill-4B"]) {
+                id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoder];
+                MCRequire(encoder != nil, @"round trip blitCommandEncoder returned nil");
+                [encoder fillBuffer:target range:NSMakeRange(0, 4) value:(uint8_t)i];
+                [encoder endEncoding];
+            }
+            __block double scheduledAt = 0.0;   // the scheduled handler runs before completion, which the wait below sees
+            [commandBuffer addScheduledHandler:^(id<MTLCommandBuffer>) { scheduledAt = CACurrentMediaTime(); }];
+            const CFTimeInterval committedAt = CACurrentMediaTime();
+            MCWaitForCommandBuffer(commandBuffer);   // commits it
+            const CFTimeInterval completedAt = CACurrentMediaTime();
+            if (!i) continue;
+            if (scheduledAt > 0.0) [scheduled addObject:@((scheduledAt - committedAt) * 1000.0)];
+            [completed addObject:@((completedAt - committedAt) * 1000.0)];
+            if (commandBuffer.GPUStartTime > 0.0 && commandBuffer.GPUEndTime > commandBuffer.GPUStartTime)
+                [gpu addObject:@((commandBuffer.GPUEndTime - commandBuffer.GPUStartTime) * 1000.0)];
+        }
+        NSMutableDictionary *entry = [@{@"commit_to_complete_ms": MCDistribution(completed)} mutableCopy];
+        if (scheduled.count) entry[@"commit_to_scheduled_ms"] = MCDistribution(scheduled);
+        if (gpu.count) entry[@"gpu_time_ms"] = MCDistribution(gpu);
+        result[kind] = entry;
+    }
+    return result;
 }
 
 static NSDictionary *MCRunBenchmarks(MCContext *context) {
@@ -2541,6 +2640,14 @@ static NSDictionary *MCRunBenchmarks(MCContext *context) {
             }
         }
     }
+    NSDictionary *roundTrip = nil;
+    if (failureReason == nil) {
+        @try {
+            roundTrip = MCMeasureRoundTrip(context);
+        } @catch (NSException *exception) {
+            roundTrip = @{@"status": @"FAIL", @"reason": exception.reason != nil ? exception.reason : exception.name};
+        }
+    }
     BOOL passed = failureReason == nil && workloads.count == 3;
     NSMutableDictionary *result = [@{
         @"status": passed ? @"PASS" : @"FAIL",
@@ -2553,6 +2660,7 @@ static NSDictionary *MCRunBenchmarks(MCContext *context) {
                              @"blitCommandEncoder", @"getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:"],
         @"workloads": workloads,
     } mutableCopy];
+    if (roundTrip != nil) result[@"round_trip"] = roundTrip;
     if (failureReason != nil) result[@"reason"] = failureReason;
     if (aborted) result[@"aborted"] = @YES;
     return result;
@@ -2600,6 +2708,7 @@ static NSArray<NSString *> *MCCaseNames(void) {
         @"38 A8, R8 and RGBA8 linear textures over a no-copy buffer (the compositor's text masks)",
         @"39 A8 text masks in whole-page shared memory at offset 64, redrawn in place",
         @"40 new pages at an address an earlier no-copy buffer still covers",
+        @"41 Metal source compiled at run time, synchronously and through the completion handler",
     ];
 }
 
@@ -2659,6 +2768,8 @@ static NSArray<NSArray<NSString *> *> *MCCaseSelectors(void) {
           @"MTLPixelFormatA8Unorm", @"texture.sample", @"CPU rewrite of a sampled no-copy texture"],
         @[@"mmap MAP_FIXED", @"newBufferWithBytesNoCopy:length:options:deallocator:", @"newTextureWithDescriptor:offset:bytesPerRow:",
           @"MTLPixelFormatA8Unorm"],
+        @[@"newLibraryWithSource:options:error:", @"newLibraryWithSource:options:completionHandler:", @"MTLCompileOptions.preprocessorMacros",
+          @"MTLLibraryErrorCompileFailure"],
     ];
 }
 
@@ -2704,6 +2815,7 @@ static void MCRunCaseBody(MCContext *context, NSUInteger index) {
         case 37: MCTest38(context); break;
         case 38: MCTest39(context); break;
         case 39: MCTest40(context); break;
+        case 40: MCTest41(context); break;
         default: MCRequire(NO, @"invalid fixed test index");
     }
 }
@@ -2825,6 +2937,7 @@ static NSDictionary *MCFixedDimensions(void) {
                                            @"110x20 r128", @"534x64 r544", @"608x64 r608", @"680x28 r704"], @"offset": @64,
                                @"buffer": @"whole pages around offset + rows * height", @"rounds": @2},
         @"remapped_under_live_buffer": @{@"bytes": @65536, @"mask": @"A8 224x20 r224 at 64", @"rounds": @4},
+        @"runtime_source": @{@"elements": @256, @"macros": @[@"OFFSET=7u", @"OFFSET=11u"], @"failure": @"undeclared identifier"},
         @"benchmark_render": @{@"width": @512, @"height": @512, @"seconds": @2},
         @"benchmark_compute_floats": @{@"count": @1048576, @"seconds": @2},
         @"benchmark_blit_bytes": @{@"bytes": @16777216, @"seconds": @2},
@@ -2861,7 +2974,7 @@ static NSDictionary *MCBaseReport(id<MTLDevice> device, NSString *libraryPath) {
         @"covered_selectors": @[],
         @"uncovered_categories": MCUncoveredCategories(),
         @"correctness_cases": @[],
-        @"correctness_case_count": @40,
+        @"correctness_case_count": @41,
         @"benchmark": @{@"status": @"NOT_REQUESTED", @"passed": [NSNull null], @"workloads": @[]},
     };
 }
