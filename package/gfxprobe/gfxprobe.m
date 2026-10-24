@@ -18,6 +18,10 @@
 //   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
 //                                       newLibraryWithSource: does through MTLCompilerService) and write the metallib it returns
 //
+//   gfxprobe virtgpu                    one DRM context through the accelerator's virtgpu methods (DroidVMVirtgpuABI.h), as mesa's
+//                                       vdrm drives them: capset, context, the msm shmem, GET_PARAM ccmds, a guest-alloc BO (GEM_NEW
+//                                       and a HOST3D_GUEST blob) written through its mapping, a fenced NOP waited for, then closed
+//
 // FORMAT is an MTLPixelFormat number (80 BGRA8Unorm, 81 _sRGB, 115 RGBA16Float, 552-555 the XR formats; RenderBox sets bit 31
 // for a variant of its own), FLAGS RenderBox's create flags (hex). Each line prints the surface's IOSurface pixel format, plane
 // count, bytes per row, allocation and base address, and whether the device made a texture. RB::create_iosurface is not
@@ -95,6 +99,114 @@ static void describe(NSString *what, IOSurfaceRef surface, id<MTLDevice> device,
 
 // libsystem_sandbox: enter a sandbox profile by name (SANDBOX_NAMED), as a process launchd starts with one does.
 extern int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
+
+#include "../DroidVMVirtgpuABI.h"
+extern kern_return_t IOConnectCallStructMethod(mach_port_t, uint32_t, const void *, size_t, void *, size_t *);
+static mach_port_t vgConnection;
+static uint32_t vgSelector;
+static kern_return_t vgCall(uint32_t op, const void *in, size_t inSize, void *out, size_t outSize) {
+    NSMutableData *buffer = [NSMutableData dataWithLength:8 + inSize];
+    const uint32_t header[2] = {0x4e544e4c, DROIDVM_VIRTGPU_METHOD + op};
+    memcpy(buffer.mutableBytes, header, 8);
+    if (inSize) memcpy((uint8_t *)buffer.mutableBytes + 8, in, inSize);
+    size_t outBytes = outSize;
+    return IOConnectCallStructMethod(vgConnection, vgSelector, buffer.bytes, buffer.length, outSize ? out : NULL, outSize ? &outBytes : NULL);
+}
+// One msm ccmd through EXECBUFFER (no fence), answered in the shmem: the response's length is written first (the host copies back
+// at most that), then the host's seqno must reach the request's.
+static kern_return_t vgCcmd(volatile uint8_t *shmem, uint32_t *seqno, void *request, uint32_t size, uint32_t responseBytes) {
+    uint32_t *header = request;   // vdrm_ccmd_req: cmd, len, seqno, rsp_off
+    header[1] = size; header[2] = ++*seqno; header[3] = 0;
+    const uint32_t responseOffset = *(volatile uint32_t *)(shmem + 4);
+    if (responseBytes) *(volatile uint32_t *)(shmem + responseOffset) = responseBytes;
+    struct { struct droidvm_virtgpu_execbuffer e; uint8_t command[256]; } exec = {{0, 0, size, 0}, {0}};
+    memcpy(exec.command, request, size);
+    struct droidvm_virtgpu_execbuffer_reply reply = {0};
+    kern_return_t kr = vgCall(DROIDVM_VIRTGPU_EXECBUFFER, &exec, sizeof exec.e + size, &reply, sizeof reply);
+    for (int i = 0; !kr && *(volatile uint32_t *)shmem < *seqno && i < 1000; i++) usleep(1000);
+    return kr ? kr : *(volatile uint32_t *)shmem >= *seqno ? KERN_SUCCESS : KERN_OPERATION_TIMED_OUT;
+}
+static uint64_t vgGetParam(volatile uint8_t *shmem, uint32_t *seqno, uint32_t param, kern_return_t *kr) {
+    uint8_t request[16 + 4 + 24] = {0};
+    const uint32_t cmd = 2 /* IOCTL_SIMPLE */, ioctl = 0xc0186440 /* DRM_IOCTL_MSM_GET_PARAM */, msm[2] = {0x10 /* 3D0 */, param};
+    memcpy(request, &cmd, 4); memcpy(request + 16, &ioctl, 4); memcpy(request + 20, msm, 8);
+    *kr = vgCcmd(shmem, seqno, request, sizeof request, 8 + 24);
+    const volatile uint8_t *response = shmem + *(volatile uint32_t *)(shmem + 4);
+    uint64_t value = 0; int32_t ret = 0;
+    memcpy(&ret, (const uint8_t *)response + 4, 4); memcpy(&value, (const uint8_t *)response + 16, 8);
+    if (!*kr && ret) *kr = (kern_return_t)ret;
+    return value;
+}
+static int virtgpuProbe(void) {
+    io_object_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOAcceleratorES"));
+    kern_return_t kr = service ? IOServiceOpen(service, mach_task_self(), DROIDVM_VIRTGPU_OPEN_TYPE, &vgConnection) : KERN_FAILURE;
+    if (service) IOObjectRelease(service);
+    printf("open IOAcceleratorES type 0x%x: 0x%x\n", DROIDVM_VIRTGPU_OPEN_TYPE, kr);
+    if (kr) return 1;
+    const uint32_t probe[2] = {0x4e544e4c, 0xffffffffu};
+    for (vgSelector = 0; vgSelector < 256; vgSelector++)
+        if (IOConnectCallStructMethod(vgConnection, vgSelector, probe, sizeof probe, NULL, NULL) == KERN_SUCCESS) break;
+    printf("tunnel selector %u\n", vgSelector);
+    const uint64_t params[] = {DROIDVM_VIRTGPU_PARAM_ABI_VERSION, DROIDVM_VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS, DROIDVM_VIRTGPU_PARAM_CONTEXT_INIT,
+                               DROIDVM_VIRTGPU_PARAM_HOST_VISIBLE, DROIDVM_VIRTGPU_PARAM_CREATE_GUEST_HANDLE};
+    for (unsigned i = 0; i < sizeof params / sizeof *params; i++) {
+        struct droidvm_virtgpu_getparam in = {params[i]}; struct droidvm_virtgpu_getparam_reply out = {0};
+        kr = vgCall(DROIDVM_VIRTGPU_GETPARAM, &in, sizeof in, &out, sizeof out);
+        printf("GETPARAM %#llx: 0x%x value %#llx\n", params[i], kr, out.value);
+    }
+    uint8_t caps[160] = {0};
+    struct droidvm_virtgpu_get_caps getCaps = {6, 0};
+    kr = vgCall(DROIDVM_VIRTGPU_GET_CAPS, &getCaps, sizeof getCaps, caps, sizeof caps);
+    uint32_t gpuId = 0, contextType = 0; uint64_t vaStart = 0, vaSize = 0;
+    memcpy(&contextType, caps + 16, 4); memcpy(&vaStart, caps + 32, 8); memcpy(&vaSize, caps + 40, 8); memcpy(&gpuId, caps + 48, 4);
+    printf("GET_CAPS(DRM): 0x%x context type %u gpu %u va %#llx+%#llx\n", kr, contextType, gpuId, vaStart, vaSize);
+    struct droidvm_virtgpu_context_init init = {6, 64}; struct droidvm_virtgpu_context_init_reply context = {0};
+    kr = vgCall(DROIDVM_VIRTGPU_CONTEXT_INIT, &init, sizeof init, &context, sizeof context);
+    printf("CONTEXT_INIT: 0x%x context %u\n", kr, context.context_id);
+    if (kr) return 1;
+    struct droidvm_virtgpu_create_blob shmemBlob = {DROIDVM_VIRTGPU_BLOB_MEM_HOST3D, DROIDVM_VIRTGPU_BLOB_FLAG_MAPPABLE, 16384, 0, 0, 0};
+    struct droidvm_virtgpu_create_blob_reply shmem = {0};
+    kr = vgCall(DROIDVM_VIRTGPU_CREATE_BLOB, &shmemBlob, sizeof shmemBlob, &shmem, sizeof shmem);
+    struct droidvm_virtgpu_handle shmemHandle = {shmem.handle, 0}; struct droidvm_virtgpu_map_reply shmemMap = {0};
+    if (!kr) kr = vgCall(DROIDVM_VIRTGPU_MAP, &shmemHandle, sizeof shmemHandle, &shmemMap, sizeof shmemMap);
+    printf("shmem: 0x%x handle %u resource %u mapped at %#llx (%llu bytes)\n", kr, shmem.handle, shmem.resource_id, shmemMap.address, shmemMap.size);
+    if (kr) return 1;
+    volatile uint8_t *shmemBytes = (volatile uint8_t *)shmemMap.address;
+    uint32_t seqno = 0;
+    const CFAbsoluteTime began = CFAbsoluteTimeGetCurrent();
+    const uint64_t ccmdGpuId = vgGetParam(shmemBytes, &seqno, 0x01, &kr);
+    printf("GET_PARAM(GPU_ID) ccmd: 0x%x value %llu (%.2f ms)\n", kr, ccmdGpuId, (CFAbsoluteTimeGetCurrent() - began) * 1000);
+    const uint64_t contextVa = vgGetParam(shmemBytes, &seqno, 0x0e /* VA_START */, &kr);
+    printf("GET_PARAM(VA_START) ccmd: 0x%x value %#llx\n", kr, contextVa);
+    // A guest-alloc BO: GEM_NEW names its iova and blob id, the blob brings the pages.
+    struct { struct droidvm_virtgpu_create_blob b; uint32_t header[4]; uint64_t iova, size; uint32_t flags, blobId; } bo = {
+        {DROIDVM_VIRTGPU_BLOB_MEM_HOST3D_GUEST, DROIDVM_VIRTGPU_BLOB_FLAG_MAPPABLE | DROIDVM_VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE, 65536, 1, 40, 0},
+        {3 /* GEM_NEW */, 40, ++seqno, 0}, contextVa + 0x100000, 65536, 0x80000000u /* GUEST_ALLOC */ | 0x00020000u /* WC */, 1};
+    struct droidvm_virtgpu_create_blob_reply boReply = {0};
+    kr = vgCall(DROIDVM_VIRTGPU_CREATE_BLOB, &bo, sizeof bo, &boReply, sizeof boReply);
+    struct droidvm_virtgpu_handle boHandle = {boReply.handle, 0}; struct droidvm_virtgpu_map_reply boMap = {0};
+    if (!kr) kr = vgCall(DROIDVM_VIRTGPU_MAP, &boHandle, sizeof boHandle, &boMap, sizeof boMap);
+    unsigned matched = 0;
+    if (!kr) {
+        volatile uint32_t *words = (volatile uint32_t *)boMap.address;
+        for (unsigned i = 0; i < 16384; i++) words[i] = i * 2654435761u;
+        for (unsigned i = 0; i < 16384; i++) matched += words[i] == i * 2654435761u;
+    }
+    printf("guest BO: 0x%x handle %u resource %u at %#llx, %u/16384 words written and read back\n", kr, boReply.handle,
+           boReply.resource_id, boMap.address, matched);
+    // A fenced submission: a NOP ccmd on ring 1, then its fence waited for.
+    struct { struct droidvm_virtgpu_execbuffer e; uint32_t nop[4]; } exec = {{DROIDVM_VIRTGPU_EXEC_FENCE, 1, 16, 0}, {1 /* NOP */, 16, ++seqno, 0}};
+    struct droidvm_virtgpu_execbuffer_reply fenced = {0};
+    const CFAbsoluteTime submitted = CFAbsoluteTimeGetCurrent();
+    kr = vgCall(DROIDVM_VIRTGPU_EXECBUFFER, &exec, sizeof exec, &fenced, sizeof fenced);
+    struct droidvm_virtgpu_wait_fence waitFence = {1, 0, fenced.fence, 1000000000ull};
+    if (!kr) kr = vgCall(DROIDVM_VIRTGPU_WAIT_FENCE, &waitFence, sizeof waitFence, NULL, 0);
+    printf("fenced NOP: 0x%x fence %llu signalled after %.2f ms\n", kr, fenced.fence, (CFAbsoluteTimeGetCurrent() - submitted) * 1000);
+    kern_return_t closed = vgCall(DROIDVM_VIRTGPU_GEM_CLOSE, &boHandle, sizeof boHandle, NULL, 0);
+    closed |= vgCall(DROIDVM_VIRTGPU_GEM_CLOSE, &shmemHandle, sizeof shmemHandle, NULL, 0);
+    printf("GEM_CLOSE: 0x%x; close: 0x%x\n", closed, IOServiceClose(vgConnection));
+    return ccmdGpuId == gpuId && matched == 16384 && !kr ? 0 : 1;
+}
 
 // MTLCompiler.framework (private): the service behind Metal's newLibraryWithSource:. Request 13 compiles Metal source into a metallib
 // (AIR, no GPU code): two little-endian u64 lengths, then the source (NUL-padded to a multiple of 4 bytes) and the compiler options
@@ -224,6 +336,8 @@ int main(int argc, char **argv) {
             sync();
             return failed;
         }
+        if (argc >= 2 && !strcmp(argv[1], "virtgpu"))
+            return virtgpuProbe();
         if (argc >= 4 && !strcmp(argv[1], "msl"))
             return compileMetal(argv[2], argv[3], argc >= 5 ? argv[4] : "-std=metal3.1 --driver-mode=metal -x metal");
         if (argc < 5) {

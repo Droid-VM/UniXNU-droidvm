@@ -141,3 +141,353 @@ void selftest3D() {
     (void)command(&destroy, sizeof destroy, nullptr, 0, &reply, sizeof reply);
 }
 }
+
+// ---- user space: the virtgpu methods of the accelerator's user client (DroidVMVirtgpuABI.h) -------------------------------------
+// One client per connection that called a method: its DRM context, its resources by handle and its fenced submissions in flight.
+// A client's lock serializes its methods (a Metal device's threads share one connection); a fence wait sleeps without it.
+#include "DroidVMVirtgpuABI.h"
+#include <IOKit/IOBufferMemoryDescriptor.h>
+extern "C" void proc_selfname(char *, int);
+extern "C" {
+// clients now, contexts made, blobs made, maps made, submissions, fenced submissions, fence waits that timed out, refusals
+volatile uint64_t droidvm_virtgpu_stats[8];
+}
+namespace DroidVMVirtioGpu {
+namespace {
+enum : uint32_t { MaxClients = 64, MaxRings = 64, MaxPending = 256, FirstContext = 16, ContiguousLimit = 4u << 20,
+                  MaxBlobEntries = (MaxCommand - sizeof(CreateBlob)) / sizeof(Entry) };
+struct Resource {
+    uint32_t handle, id;
+    uint64_t size;
+    bool hostVisible;
+    IOBufferMemoryDescriptor *pages;   // a guest blob's own pages
+    IOMemoryDescriptor *window;        // a host blob's range of the pool, once mapped
+    IOMemoryMap *map;                  // in the client's task
+};
+struct Pending { uint32_t ticket, ring; uint64_t fence; };
+struct Client {
+    void *connection;
+    IOLock *lock;
+    uint32_t context, rings, nextHandle, resourceCount, resourceCapacity, pendingCount;
+    Resource *resources;
+    Pending pending[MaxPending];
+    uint64_t nextFence[MaxRings], completed[MaxRings];
+};
+Client *gClients[MaxClients];
+IOLock *gClientsLock;
+uint32_t gNextContext = FirstContext;
+uint64_t gCapsetMask;
+bool gCapsetsQueried;
+void count(unsigned index) { droidvm_virtgpu_stats[index] = droidvm_virtgpu_stats[index] + 1; }
+uint64_t nowUsLocal() { uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000; }
+Client *client(void *connection, bool create) {
+    if (!gClientsLock) {   // the first call comes from a user client, long after IOKit is up
+        IOLock *made = IOLockAlloc();
+        if (made && !OSCompareAndSwapPtr(nullptr, made, reinterpret_cast<void *volatile *>(&gClientsLock))) IOLockFree(made);
+        if (!gClientsLock) return nullptr;
+    }
+    IOLockLock(gClientsLock);
+    Client *found = nullptr; int empty = -1;
+    for (int i = 0; i < int(MaxClients); ++i) {
+        if (gClients[i] && gClients[i]->connection == connection) { found = gClients[i]; break; }
+        if (!gClients[i] && empty < 0) empty = i;
+    }
+    if (!found && create && empty >= 0) {
+        found = IONewZero(Client, 1);
+        if (found) {
+            found->connection = connection; found->lock = IOLockAlloc(); found->nextHandle = 1;
+            if (!found->lock) { IODelete(found, Client, 1); found = nullptr; }
+            else { gClients[empty] = found; count(0); }
+        }
+    }
+    IOLockUnlock(gClientsLock);
+    return found;
+}
+Resource *resource(Client *c, uint32_t handle) {
+    for (uint32_t i = 0; i < c->resourceCount; ++i) if (c->resources[i].handle == handle) return &c->resources[i];
+    return nullptr;
+}
+// Takes every finished fenced submission off the client's list; with `fence` set, whether that fence on `ring` has signalled.
+void reapPending(Client *c) {
+    for (uint32_t i = 0; i < c->pendingCount;) {
+        IOReturn result;
+        if (!poll(c->pending[i].ticket, &result)) { ++i; continue; }
+        const Pending done = c->pending[i];
+        if (done.fence > c->completed[done.ring]) c->completed[done.ring] = done.fence;
+        c->pending[i] = c->pending[--c->pendingCount];
+    }
+}
+// Waits for every submission of the client in flight (before its resources' pages go back), at most `timeoutUs`.
+void drain(Client *c, uint64_t timeoutUs) {
+    const uint64_t begin = nowUsLocal();
+    for (reapPending(c); c->pendingCount && nowUsLocal() - begin < timeoutUs; reapPending(c)) IOSleep(1);
+}
+IOReturn submitCommand(Client *c, const void *command, uint32_t size) {
+    Submit submit = {{CmdSubmit3D, 0, 0, c->context, 0, {}}, size, 0};
+    Header reply = {};
+    uint32_t ticket = 0;
+    IOReturn status = post(&submit, sizeof submit, command, size, sizeof reply, false, &ticket);
+    return status ? status : wait(ticket, 5000000, &reply, sizeof reply);
+}
+void releaseResource(Client *c, Resource &r) {
+    Header reply = {};
+    if (r.map) { r.map->release(); r.map = nullptr; }
+    if (r.window) {
+        ResourceCommand unmap = {{CmdUnmapBlob, 0, 0, c->context, 0, {}}, r.id, 0};
+        (void)command(&unmap, sizeof unmap, nullptr, 0, &reply, sizeof reply);
+        r.window->release(); r.window = nullptr;
+    }
+    (void)unref(r.id);
+    // The host has dropped its import of the pages with the resource; only then do they go back.
+    if (r.pages) { r.pages->release(); r.pages = nullptr; }
+}
+void queryCapsets() {
+    if (gCapsetsQueried) return;
+    for (uint32_t index = 0; index < 16; ++index) {
+        struct { Header h; uint32_t index, padding; } ask = {{CmdGetCapsetInfo, 0, 0, 0, 0, {}}, index, 0};
+        CapsetInfo info = {};
+        if (command(&ask, sizeof ask, nullptr, 0, &info, sizeof info) || info.h.type != RespCapsetInfo) break;
+        if (info.id < 64) gCapsetMask |= uint64_t(1) << info.id;
+    }
+    gCapsetsQueried = true;
+}
+IOReturn getParam(const droidvm_virtgpu_getparam &in, droidvm_virtgpu_getparam_reply &out) {
+    uint64_t base, size;
+    switch (in.param) {
+    case DROIDVM_VIRTGPU_PARAM_3D_FEATURES: out.value = (features() & FeatureVirgl) != 0; break;
+    case DROIDVM_VIRTGPU_PARAM_CAPSET_QUERY_FIX: out.value = 1; break;
+    case DROIDVM_VIRTGPU_PARAM_RESOURCE_BLOB: out.value = (features() & FeatureBlob) != 0; break;
+    case DROIDVM_VIRTGPU_PARAM_HOST_VISIBLE: out.value = pool(base, size); break;
+    case DROIDVM_VIRTGPU_PARAM_CROSS_DEVICE: out.value = 0; break;
+    case DROIDVM_VIRTGPU_PARAM_CONTEXT_INIT: out.value = (features() & FeatureContextInit) != 0; break;
+    case DROIDVM_VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS: queryCapsets(); out.value = gCapsetMask; break;
+    case DROIDVM_VIRTGPU_PARAM_CREATE_GUEST_HANDLE: out.value = (features() & (1u << 6)) != 0; break;
+    case DROIDVM_VIRTGPU_PARAM_ABI_VERSION: out.value = DROIDVM_VIRTGPU_ABI_VERSION; break;
+    default: return kIOReturnUnsupported;
+    }
+    return kIOReturnSuccess;
+}
+IOReturn getCaps(const droidvm_virtgpu_get_caps &in, void *out, size_t outSize) {
+    static uint8_t answer[4096];   // under the client's lock; one capset at a time across clients is enough
+    if (!outSize || outSize > sizeof answer - sizeof(Header)) return kIOReturnBadArgument;
+    struct { Header h; uint32_t id, version; } ask = {{CmdGetCapset, 0, 0, 0, 0, {}}, in.capset_id, in.version};
+    IOLockLock(gClientsLock);
+    IOReturn status = command(&ask, sizeof ask, nullptr, 0, answer, uint32_t(sizeof(Header) + outSize));
+    if (!status && reinterpret_cast<Header *>(answer)->type != RespCapset) status = kIOReturnIOError;
+    if (!status) memcpy(out, answer + sizeof(Header), outSize);
+    IOLockUnlock(gClientsLock);
+    return status;
+}
+IOReturn contextInit(Client *c, const droidvm_virtgpu_context_init &in, droidvm_virtgpu_context_init_reply &out) {
+    if (c->context) return kIOReturnExclusiveAccess;
+    if (!in.num_rings || in.num_rings > MaxRings) return kIOReturnBadArgument;
+    IOLockLock(gClientsLock); const uint32_t context = gNextContext++; IOLockUnlock(gClientsLock);
+    CtxCreate create = {{CmdCtxCreate, 0, 0, context, 0, {}}, 0, in.capset_id, {}};
+    proc_selfname(create.name, sizeof create.name);
+    create.nameLength = uint32_t(strnlen(create.name, sizeof create.name));
+    Header reply = {};
+    IOReturn status = command(&create, sizeof create, nullptr, 0, &reply, sizeof reply);
+    if (status) return status;
+    c->context = context; c->rings = in.num_rings; out.context_id = context; count(1);
+    return kIOReturnSuccess;
+}
+IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint8_t *ccmd, droidvm_virtgpu_create_blob_reply &out) {
+    if (!c->context) return kIOReturnNotReady;
+    const bool guest = in.blob_mem == DROIDVM_VIRTGPU_BLOB_MEM_HOST3D_GUEST;
+    if ((!guest && in.blob_mem != DROIDVM_VIRTGPU_BLOB_MEM_HOST3D) || !in.size || in.size > (uint64_t(1) << 32) || (in.cmd_size & 3))
+        return kIOReturnBadArgument;
+    if (c->resourceCount == c->resourceCapacity) {
+        const uint32_t capacity = c->resourceCapacity ? c->resourceCapacity * 2 : 64;
+        Resource *grown = IONewZero(Resource, capacity);
+        if (!grown) return kIOReturnNoMemory;
+        if (c->resources) { memcpy(grown, c->resources, sizeof(Resource) * c->resourceCount); IODelete(c->resources, Resource, c->resourceCapacity); }
+        c->resources = grown; c->resourceCapacity = capacity;
+    }
+    // The ccmd that describes the blob to the host (GEM_NEW: its iova) goes first, as Linux's virtgpu sends it.
+    IOReturn status = in.cmd_size ? submitCommand(c, ccmd, in.cmd_size) : kIOReturnSuccess;
+    if (status) return status;
+    Resource r = {}; r.handle = c->nextHandle++; r.id = resourceId(); r.size = in.size; r.hostVisible = !guest;
+    Entry *entries = nullptr; uint32_t entryCount = 0;
+    if (guest) {
+        // Guest memory the host imports (a pseudo-unprotected VM shares all of its RAM): wired pages, contiguous when small.
+        const uint64_t bytes = (in.size + 4095) & ~uint64_t(4095);
+        if (bytes <= ContiguousLimit)
+            r.pages = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous),
+                                                                      bytes, ~uint64_t(4095));
+        if (!r.pages) r.pages = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, bytes, 4096);
+        if (!r.pages) return kIOReturnNoMemory;
+        bzero(r.pages->getBytesNoCopy(), bytes);
+        entries = IONewData(Entry, MaxBlobEntries);
+        if (!entries) { r.pages->release(); return kIOReturnNoMemory; }
+        for (uint64_t offset = 0; offset < bytes;) {
+            IOByteCount length = 0;
+            const addr64_t physical = r.pages->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
+            if (!physical || !length) { status = kIOReturnVMError; break; }
+            if (length > bytes - offset) length = bytes - offset;
+            if (entryCount && entries[entryCount - 1].address + entries[entryCount - 1].length == physical &&
+                entries[entryCount - 1].length + length <= 0x80000000u) entries[entryCount - 1].length += uint32_t(length);
+            else if (entryCount == MaxBlobEntries) { status = kIOReturnNoResources; break; }
+            else entries[entryCount++] = {physical, uint32_t(length), 0};
+            offset += length;
+        }
+    }
+    if (!status) {
+        CreateBlob blob = {{CmdCreateBlob, 0, 0, c->context, 0, {}}, r.id, in.blob_mem, in.blob_flags, entryCount, in.blob_id, in.size};
+        Header reply = {};
+        status = command(&blob, sizeof blob, entries, entryCount * uint32_t(sizeof(Entry)), &reply, sizeof reply);
+    }
+    if (entries) IODeleteData(entries, Entry, MaxBlobEntries);
+    if (status) { if (r.pages) r.pages->release(); return status; }
+    c->resources[c->resourceCount++] = r;
+    out.handle = r.handle; out.resource_id = r.id; count(2);
+    return kIOReturnSuccess;
+}
+IOReturn mapResource(Client *c, uint32_t handle, task_t task, droidvm_virtgpu_map_reply &out) {
+    Resource *r = resource(c, handle);
+    if (!r) return kIOReturnBadArgument;
+    if (!r->map) {
+        IOMemoryDescriptor *memory = r->pages;
+        if (r->hostVisible) {
+            uint64_t base, size;
+            if (!pool(base, size)) return kIOReturnUnsupported;
+            MapBlob mapBlob = {{CmdMapBlob, 0, 0, c->context, 0, {}}, r->id, 0, 0};
+            MapInfo info = {};
+            IOReturn status = command(&mapBlob, sizeof mapBlob, nullptr, 0, &info, sizeof info);
+            if (status) return status;
+            const uint64_t bytes = (r->size + 4095) & ~uint64_t(4095);
+            if (info.h.type != RespMapInfo || !(info.mapInfo & MapInfoPool) || info.poolOffset + bytes > size) return kIOReturnUnsupported;
+            r->window = IOMemoryDescriptor::withPhysicalAddress(base + info.poolOffset, bytes, kIODirectionInOut);
+            if (!r->window) return kIOReturnNoMemory;
+            memory = r->window;
+        }
+        // Write-back: the host's KGSL imports guest pages IO-coherent, and the pool is ordinary shared memory.
+        r->map = memory->createMappingInTask(task, 0, IOOptionBits(kIOMapAnywhere) | IOOptionBits(kIOMapCopybackCache));
+        if (!r->map) return kIOReturnVMError;
+        count(3);
+    }
+    out.address = r->map->getAddress(); out.size = r->map->getLength();
+    return kIOReturnSuccess;
+}
+IOReturn execbuffer(Client *c, const droidvm_virtgpu_execbuffer &in, const uint8_t *commands, droidvm_virtgpu_execbuffer_reply &out) {
+    if (!c->context) return kIOReturnNotReady;
+    if (!in.size || (in.size & 3) || in.size > DROIDVM_VIRTGPU_MAX_COMMAND) return kIOReturnBadArgument;
+    count(4);
+    if (!(in.flags & DROIDVM_VIRTGPU_EXEC_FENCE)) { out.fence = 0; return submitCommand(c, commands, in.size); }
+    if (in.ring_idx >= c->rings) return kIOReturnBadArgument;
+    for (reapPending(c); c->pendingCount == MaxPending; reapPending(c)) IOSleep(1);
+    // Numbered on its ring: the host retires a ring's fences in order, and crosvm returns the command when its fence signals.
+    const uint64_t fence = c->nextFence[in.ring_idx] + 1;
+    Submit submit = {{CmdSubmit3D, uint32_t(FlagFence) | uint32_t(FlagRingIndex), fence, c->context, uint8_t(in.ring_idx), {}}, in.size, 0};
+    uint32_t ticket = 0;
+    IOReturn status = post(&submit, sizeof submit, commands, in.size, sizeof(Header), false, &ticket);
+    if (status) return status;
+    c->nextFence[in.ring_idx] = fence;
+    c->pending[c->pendingCount++] = {ticket, in.ring_idx, fence};
+    out.fence = fence; count(5);
+    return kIOReturnSuccess;
+}
+IOReturn waitFence(Client *c, const droidvm_virtgpu_wait_fence &in) {
+    if (in.ring_idx >= MaxRings) return kIOReturnBadArgument;
+    const uint64_t begin = nowUsLocal(), timeoutUs = in.timeout_ns / 1000;
+    for (;;) {
+        IOLockLock(c->lock);
+        reapPending(c);
+        const bool done = c->completed[in.ring_idx] >= in.fence || in.fence > c->nextFence[in.ring_idx];
+        IOLockUnlock(c->lock);
+        if (done) return kIOReturnSuccess;
+        if (nowUsLocal() - begin >= timeoutUs) { if (timeoutUs) count(6); return kIOReturnTimeout; }
+        if (nowUsLocal() - begin < 2000) IODelay(20); else IOSleep(1);
+    }
+}
+IOReturn closeResource(Client *c, uint32_t handle) {
+    Resource *r = resource(c, handle);
+    if (!r) return kIOReturnBadArgument;
+    drain(c, 5000000);   // the GPU may still use it: the context's submissions in flight finish first
+    releaseResource(c, *r);
+    *r = c->resources[--c->resourceCount];
+    return kIOReturnSuccess;
+}
+}
+}
+extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t task, const void *in, size_t inSize, void *out, size_t outSize) {
+    using namespace DroidVMVirtioGpu;
+    if (!ready()) return kIOReturnNotReady;
+    if (op >= DROIDVM_VIRTGPU_OPS) { count(7); return kIOReturnUnsupported; }
+    Client *c = client(connection, true);
+    if (!c) return kIOReturnNoResources;
+    auto fixed = [&](size_t inBytes, size_t outBytes, bool variableIn = false) {
+        return (variableIn ? inSize >= inBytes : inSize == inBytes) && outSize == outBytes && (!inBytes || in) && (!outBytes || out);
+    };
+    if (op == DROIDVM_VIRTGPU_WAIT_FENCE) {   // sleeps; takes the client's lock only to look
+        if (!fixed(sizeof(droidvm_virtgpu_wait_fence), 0)) return kIOReturnBadArgument;
+        return waitFence(c, *static_cast<const droidvm_virtgpu_wait_fence *>(in));
+    }
+    IOReturn status = kIOReturnBadArgument;
+    IOLockLock(c->lock);
+    switch (op) {
+    case DROIDVM_VIRTGPU_GETPARAM:
+        if (fixed(sizeof(droidvm_virtgpu_getparam), sizeof(droidvm_virtgpu_getparam_reply)))
+            status = getParam(*static_cast<const droidvm_virtgpu_getparam *>(in), *static_cast<droidvm_virtgpu_getparam_reply *>(out));
+        break;
+    case DROIDVM_VIRTGPU_GET_CAPS:
+        if (inSize == sizeof(droidvm_virtgpu_get_caps) && in && out && outSize)
+            status = getCaps(*static_cast<const droidvm_virtgpu_get_caps *>(in), out, outSize);
+        break;
+    case DROIDVM_VIRTGPU_CONTEXT_INIT:
+        if (fixed(sizeof(droidvm_virtgpu_context_init), sizeof(droidvm_virtgpu_context_init_reply)))
+            status = contextInit(c, *static_cast<const droidvm_virtgpu_context_init *>(in), *static_cast<droidvm_virtgpu_context_init_reply *>(out));
+        break;
+    case DROIDVM_VIRTGPU_CREATE_BLOB:
+        if (fixed(sizeof(droidvm_virtgpu_create_blob), sizeof(droidvm_virtgpu_create_blob_reply), true)) {
+            auto blob = static_cast<const droidvm_virtgpu_create_blob *>(in);
+            if (blob->cmd_size <= DROIDVM_VIRTGPU_MAX_COMMAND && inSize == sizeof *blob + blob->cmd_size)
+                status = createBlob(c, *blob, static_cast<const uint8_t *>(in) + sizeof *blob, *static_cast<droidvm_virtgpu_create_blob_reply *>(out));
+        }
+        break;
+    case DROIDVM_VIRTGPU_MAP:
+        if (fixed(sizeof(droidvm_virtgpu_handle), sizeof(droidvm_virtgpu_map_reply)))
+            status = mapResource(c, static_cast<const droidvm_virtgpu_handle *>(in)->handle, task, *static_cast<droidvm_virtgpu_map_reply *>(out));
+        break;
+    case DROIDVM_VIRTGPU_EXECBUFFER:
+        if (fixed(sizeof(droidvm_virtgpu_execbuffer), sizeof(droidvm_virtgpu_execbuffer_reply), true)) {
+            auto exec = static_cast<const droidvm_virtgpu_execbuffer *>(in);
+            if (inSize == sizeof *exec + exec->size)
+                status = execbuffer(c, *exec, static_cast<const uint8_t *>(in) + sizeof *exec, *static_cast<droidvm_virtgpu_execbuffer_reply *>(out));
+        }
+        break;
+    case DROIDVM_VIRTGPU_RESOURCE_INFO:
+        if (fixed(sizeof(droidvm_virtgpu_handle), sizeof(droidvm_virtgpu_resource_info_reply))) {
+            Resource *r = resource(c, static_cast<const droidvm_virtgpu_handle *>(in)->handle);
+            auto reply = static_cast<droidvm_virtgpu_resource_info_reply *>(out);
+            if (r) { reply->resource_id = r->id; reply->pad = 0; reply->size = r->size; status = kIOReturnSuccess; }
+        }
+        break;
+    case DROIDVM_VIRTGPU_GEM_CLOSE:
+        if (fixed(sizeof(droidvm_virtgpu_handle), 0)) status = closeResource(c, static_cast<const droidvm_virtgpu_handle *>(in)->handle);
+        break;
+    }
+    IOLockUnlock(c->lock);
+    if (status) count(7);
+    return status;
+}
+// The connection closed (or its process ended): its submissions finish, its resources go, its context is destroyed.
+extern "C" void droidvm_virtgpu_close(void *connection) {
+    using namespace DroidVMVirtioGpu;
+    Client *c = client(connection, false);
+    if (!c) return;
+    IOLockLock(gClientsLock);
+    for (uint32_t i = 0; i < MaxClients; ++i) if (gClients[i] == c) gClients[i] = nullptr;
+    IOLockUnlock(gClientsLock);
+    IOLockLock(c->lock);
+    drain(c, 5000000);
+    for (uint32_t i = 0; i < c->resourceCount; ++i) releaseResource(c, c->resources[i]);
+    if (c->resources) IODelete(c->resources, Resource, c->resourceCapacity);
+    if (c->context) {
+        Header destroy = {CmdCtxDestroy, 0, 0, c->context, 0, {}}, reply = {};
+        (void)command(&destroy, sizeof destroy, nullptr, 0, &reply, sizeof reply);
+    }
+    IOLockUnlock(c->lock);
+    IOLockFree(c->lock);
+    IODelete(c, Client, 1);
+    droidvm_virtgpu_stats[0] = droidvm_virtgpu_stats[0] - 1;
+}
