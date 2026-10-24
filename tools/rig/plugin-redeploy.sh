@@ -4,6 +4,8 @@
 # into the guest's Data (flushed with gfxprobe sync before anything stops the VM: a stop right after a put truncated the binary),
 # then payload-redeploy.sh (new trust, reboot) and check the plugin survived the reboot.
 #   plugin-redeploy.sh        FORK: the local UniXNU fork checkout whose scripts/ and patches/metal2vulkan/ are built
+# Those are copied to the Mac; anything else the plugin is built from (the NativeMetal submodule above all) must already be there:
+# mac-sync-check.sh refuses the build otherwise.
 set -u
 RIG=$(cd "$(dirname "$0")" && pwd)
 . "$RIG/rigenv.sh"
@@ -13,7 +15,10 @@ F=${FORK:?set FORK to the local UniXNU fork checkout}
 for f in build-adreno-metal-plugin.py build-native-metal-bridge.py; do
   scp -q "$F/scripts/$f" "$MAC:$M/../../scripts/$f" && scp -q "$F/scripts/$f" "$MAC:$M/tree/scripts/$f" || exit 1
 done
-scp -q "$F"/patches/metal2vulkan/*.patch "$MAC:$M/tree/patches/metal2vulkan/" || exit 1
+for d in "$M/../../patches/metal2vulkan/" "$M/tree/patches/metal2vulkan/"; do scp -q "$F"/patches/metal2vulkan/*.patch "$MAC:$d" || exit 1; done
+if [ "${SYNC_CHECK:-1}" != 0 ]; then
+  "$RIG/mac-sync-check.sh" || { echo "the Mac does not build the source here, e.g. NativeMetal edits (SYNC_CHECK=0 to build anyway)"; exit 1; }
+fi
 ssh "$MAC" "T=$M/tree; mkdir -p $M/rig-logs; cd \$T && python3 - \$T <<'PY'
 import json, sys
 T = sys.argv[1]; p = T + '/build/owner-trust-extra/plugin-seed.json'; d = json.load(open(p))
