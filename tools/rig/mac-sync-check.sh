@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Whether the build Mac builds the source that is here: its device repository (BUILD_REPO) and UniXNU checkout (BUILD_OUT/../..)
-# must be at the same commits as REPO and FORK, with the same uncommitted edits and the same submodule commits and edits.
+# must hold the same commits as REPO and FORK (tools/rig aside), with the same uncommitted edits and the same submodule commits and edits.
 # The Mac's checkouts are moved by hand (git bundles; pushes go to wip branches only), so they drift. Silent on a match; else one
 # line per difference and exit 1. Untracked files are not compared, nor tools/rig (the rig does not build anything). The build tree's
 # copies of scripts and patches must equal their sources.
@@ -13,11 +13,12 @@ M=${BUILD_OUT:?set BUILD_OUT to out/droidvm of the UniXNU checkout on the build 
 MREPO=${BUILD_REPO:?set BUILD_REPO to the device repository checkout on the build Mac}
 F=${FORK:?set FORK to the local UniXNU fork checkout}
 DEV=${REPO:-$RIG/../..}
-# One "KEY VALUE" line per fact: HEAD, each edited tracked file's blob hash, each submodule's commit and edited files.
+# One "KEY VALUE" line per fact: the commit's tree, each edited tracked file's blob hash, each submodule's commit and edited files.
 STATE=$(cat <<'SH'
 cd "$1" || exit 1
 blob() { if [ -e "$1" ]; then git hash-object "$1"; else echo deleted; fi; }
-echo "HEAD $(git rev-parse HEAD)"
+# The committed tree without tools/rig, so a commit that only touches the rig needs no move on the Mac.
+echo "tree $(git ls-tree -r HEAD | grep -v $'\ttools/rig/' | git hash-object --stdin)"
 git diff --name-only --ignore-submodules=all HEAD -- . ':(exclude)tools/rig' | while IFS= read -r f; do echo "file:$f $(blob "$f")"; done
 git submodule foreach --quiet 'echo "sub:$sm_path $(git rev-parse HEAD)"
   git diff --name-only HEAD | while IFS= read -r f; do
