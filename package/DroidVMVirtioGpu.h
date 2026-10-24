@@ -22,6 +22,8 @@ bool poll(uint32_t ticket, IOReturn *result, void *reply = nullptr, uint32_t cap
 IOReturn wait(uint32_t ticket, uint64_t timeoutUs, void *reply = nullptr, uint32_t capacity = 0, uint32_t *actual = nullptr);
 uint32_t resourceId();
 IOReturn unref(uint32_t);
+// vgpu-selftest=1: one DRM context through the host's drm2kgsl at boot (DroidVMVirtioGpu3D.cpp).
+void selftest3D();
 }
 extern "C" void droidvm_virtio_gpu_display_start(void);
 extern "C" bool droidvm_virtio_gpu_offer(void *, IOMemoryDescriptor *, uint64_t, uint32_t, uint32_t);

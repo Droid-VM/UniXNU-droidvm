@@ -226,7 +226,7 @@ while i<len(args):
 cmd+=['-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unnecessary-virtual-specifier','-Wno-c99-designator','-Wno-reorder-init-list',
       '-Wno-deprecated-enum-enum-conversion','-I',str(ROOT/'.cache/xnu-work/osfmk')]
 run(cmd,cwd=r['directory'])
-virtio_gpu_sources=[ROOT/'kits/droidvm'/name for name in ('DroidVMVirtioGpu.cpp','DroidVMVirtioGpuDisplay.cpp')]
+virtio_gpu_sources=[ROOT/'kits/droidvm'/name for name in ('DroidVMVirtioGpu.cpp','DroidVMVirtioGpu3D.cpp','DroidVMVirtioGpuDisplay.cpp')]
 virtio_gpu_objects=[]
 for gpu_source in virtio_gpu_sources:
     gpu_obj=OUT/(gpu_source.stem+'.o')

@@ -191,6 +191,7 @@ kernel_args = [
   # the host phone's GPU through crosvm --droidvm-gpu (kits/droidvm/DroidVMGpu.cpp): NativeAdreno's service over KGSL
   # (droidvm-gpu-selftest=1 first runs one CP_MEM_WRITE through it; left out, the command line is at its 1000-byte limit)
   "droidvm-gpu=1",
+  "vgpu-selftest=1",
   # the AGXAccelerator for the original Metal discovery, and the plugin bundle (staged in the Data seed by add-gpu-plugin-data.py)
   # mounted over /System/Library/Extensions
   "droidvm-gpu-metal=1",

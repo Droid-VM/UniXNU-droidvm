@@ -187,6 +187,7 @@ void worker(void *, wait_result_t) {
 extern "C" void droidvm_virtio_gpu_display_start(void) {
     if (started) return; started = true;
     if (!DroidVMVirtioGpu::start()) return;
+    DroidVMVirtioGpu::selftest3D();
     unsigned blob = 1; PE_parse_boot_argn("droidvm-virtio-gpu-blob", &blob, sizeof blob);
     droidvm_virtio_display_blob = blob && ((DroidVMVirtioGpu::features() & 0x48) == 0x48);
     frameLock = IOLockAlloc(); if (!frameLock) { droidvm_virtio_display_state = 3; return; }
