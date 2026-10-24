@@ -5,6 +5,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <simd/simd.h>
 #import <mach/mach.h>
+#include <sys/mman.h>
 #import <objc/message.h>
 
 #include <cmath>
@@ -1499,6 +1500,80 @@ static void MCTest31(MCContext *context) {
     }
 }
 
+// A client's freed backing store is often replaced by a new one at the same address: other pages behind the same virtual
+// addresses. A GPU import remembered by address (host pages, an IOSurface mapping) would keep reading the old pages, which
+// draws another layer's text in a label's place. Each round maps new pages at the address the previous round used (no-copy
+// buffers, MAP_FIXED), or makes a new IOSurface of the same size (which the kernel tends to map where the last one was), fills
+// them with that round's pattern and copies them out on the GPU; every round must read its own pattern.
+static void MCTest32(MCContext *context) {
+    const NSUInteger length = 64 * 1024, rounds = 6;
+    id<MTLBuffer> copy = MCBuffer(context, length, MTLResourceStorageModeShared);
+    auto check = [&](const void *want, NSString *what, NSUInteger round) {
+        NSUInteger stale = 0, first = NSNotFound;
+        for (NSUInteger at = 0; at < length; at += 64) {
+            if (std::memcmp(static_cast<const uint8_t *>(want) + at, static_cast<const uint8_t *>(copy.contents) + at, 64)) {
+                stale++; if (first == NSNotFound) first = at;
+            }
+        }
+        MCRequire(stale == 0, [NSString stringWithFormat:@"%@ round %lu: %lu of %lu lines are not this round's, the first at byte %lu",
+                               what, (unsigned long)round, (unsigned long)stale, (unsigned long)(length / 64), (unsigned long)first]);
+    };
+    auto fill = [](uint32_t *words, NSUInteger count, NSUInteger round) {
+        for (NSUInteger i = 0; i < count; i++) words[i] = (uint32_t)((round + 1) * 0x9e3779b9u) ^ (uint32_t)(i * 2246822519u);
+    };
+    void *address = nullptr;
+    for (NSUInteger round = 0; round < rounds; round++) {
+        void *memory = mmap(address, length, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | (address ? MAP_FIXED : 0), -1, 0);
+        MCRequire(memory != MAP_FAILED, @"mmap failed");
+        MCRequire(!address || memory == address, @"mmap MAP_FIXED did not map the same address");
+        address = memory;
+        fill(static_cast<uint32_t *>(memory), length / 4, round);
+        @autoreleasepool {
+            id<MTLBuffer> wrapped = [context.device newBufferWithBytesNoCopy:memory length:length
+                                                                     options:MTLResourceStorageModeShared deallocator:nil];
+            MCRequire(wrapped != nil, @"newBufferWithBytesNoCopy:length:options:deallocator: returned nil");
+            id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+            [blit copyFromBuffer:wrapped sourceOffset:0 toBuffer:copy destinationOffset:0 size:length];
+            [blit endEncoding];
+            MCWaitForCommandBuffer(commandBuffer);
+            check(memory, @"no-copy buffer over new pages at the same address", round);
+        }
+        // The buffer is gone; the next round maps other pages at this address (MAP_FIXED replaces these).
+    }
+    munmap(address, length);
+
+    const NSUInteger side = 128;   // 128 x 128 BGRA, 512-byte rows: 64 KiB
+    for (NSUInteger round = 0; round < rounds; round++) {
+        NSDictionary *properties = @{(id)kIOSurfaceWidth: @(side), (id)kIOSurfaceHeight: @(side), (id)kIOSurfaceBytesPerElement: @4,
+                                     (id)kIOSurfaceBytesPerRow: @(side * 4), (id)kIOSurfacePixelFormat: @(0x42475241)};
+        IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+        MCRequire(surface != nullptr, @"IOSurfaceCreate returned null");
+        @try {
+            MCRequire(IOSurfaceLock(surface, 0, nullptr) == KERN_SUCCESS, @"IOSurfaceLock failed");
+            fill(static_cast<uint32_t *>(IOSurfaceGetBaseAddress(surface)), length / 4, round);
+            IOSurfaceUnlock(surface, 0, nullptr);
+            @autoreleasepool {
+                MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                                      width:side height:side mipmapped:NO];
+                descriptor.usage = MTLTextureUsageShaderRead;
+                id<MTLTexture> texture = [context.device newTextureWithDescriptor:descriptor iosurface:surface plane:0];
+                MCRequire(texture != nil, @"newTextureWithDescriptor:iosurface:plane: returned nil");
+                id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+                [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(side, side, 1) toBuffer:copy destinationOffset:0
+               destinationBytesPerRow:side * 4 destinationBytesPerImage:length];
+                [blit endEncoding];
+                MCWaitForCommandBuffer(commandBuffer);
+                check(IOSurfaceGetBaseAddress(surface), @"new IOSurface of the same size", round);
+            }
+        } @finally {
+            CFRelease(surface);
+        }
+    }
+}
+
 typedef id<MTLCommandBuffer> (^MCBenchmarkCommandBlock)(NSUInteger slot, uint64_t serial);
 typedef void (^MCBenchmarkOutputValidator)(NSArray<NSNumber *> *lastSerials);
 
@@ -1924,6 +1999,7 @@ static NSArray<NSString *> *MCCaseNames(void) {
         @"29 IOSurface framebuffer rotation SPI",
         @"30 rows not 64-byte aligned: blit and texture over a buffer",
         @"31 CPU writes to a no-copy buffer reach the GPU",
+        @"32 new pages at a reused address: no-copy buffers and IOSurfaces",
     ];
 }
 
@@ -1965,6 +2041,8 @@ static NSArray<NSArray<NSString *> *> *MCCaseSelectors(void) {
           @"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
           @"newTextureWithDescriptor:offset:bytesPerRow:", @"setFragmentTexture:atIndex:", @"texture.sample"],
         @[@"newBufferWithBytesNoCopy:length:options:deallocator:", @"copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"],
+        @[@"mmap MAP_FIXED", @"newBufferWithBytesNoCopy:length:options:deallocator:", @"IOSurfaceCreate",
+          @"newTextureWithDescriptor:iosurface:plane:", @"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:"],
     ];
 }
 
@@ -2001,6 +2079,7 @@ static void MCRunCaseBody(MCContext *context, NSUInteger index) {
         case 28: MCTest29(context); break;
         case 29: MCTest30(context); break;
         case 30: MCTest31(context); break;
+        case 31: MCTest32(context); break;
         default: MCRequire(NO, @"invalid fixed test index");
     }
 }
@@ -2108,6 +2187,7 @@ static NSDictionary *MCFixedDimensions(void) {
         @"unaligned_rows": @{@"widths": @[@7, @13, @61, @77, @100, @333], @"height": @9, @"format": @"RGBA8Unorm",
                               @"bytes_per_row": @"width * 4 rounded to the linear alignment, never a multiple of 64"},
         @"no_copy_coherency": @{@"bytes": @262144, @"rounds": @8, @"line_bytes": @64},
+        @"reused_address": @{@"bytes": @65536, @"rounds": @6, @"iosurface": @{@"width": @128, @"height": @128, @"format": @"BGRA"}},
         @"benchmark_render": @{@"width": @512, @"height": @512, @"seconds": @2},
         @"benchmark_compute_floats": @{@"count": @1048576, @"seconds": @2},
         @"benchmark_blit_bytes": @{@"bytes": @16777216, @"seconds": @2},
@@ -2144,7 +2224,7 @@ static NSDictionary *MCBaseReport(id<MTLDevice> device, NSString *libraryPath) {
         @"covered_selectors": @[],
         @"uncovered_categories": MCUncoveredCategories(),
         @"correctness_cases": @[],
-        @"correctness_case_count": @31,
+        @"correctness_case_count": @32,
         @"benchmark": @{@"status": @"NOT_REQUESTED", @"passed": [NSNull null], @"workloads": @[]},
     };
 }
