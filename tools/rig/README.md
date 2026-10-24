@@ -24,11 +24,11 @@ the environment wins):
 | --- | --- |
 | `vm.sh restart\|start\|stop\|attach\|health` | Run the VM: stop it through crosvm's control socket, give the hugepage pool 10 s to reclaim and report it; before a start make sure the pool is whole (`acquire=3` when short, refuse if still short); start, wait for the first frame or a panic, put its display on the phone until a touch reaches the guest, unlock, print `health.py` (the procedure: `hugepage-harness.md` at the root of the DroidVM meta repo) |
 | `hostwatch.py [--boot-wait S]` | One line per event while a VM runs, for a monitor: host reboot (boot id or uptime), adb lost, VM up/gone in the hugepage pool's `vm_owners` (requested stop vs crash), the pool 10 s after, a start with no VM (boot failure) |
-| `health.py` | One line each for the kernel (panic?), Data, userland, display and input, the network (en0, the guest's addresses on the phone's wlan0) and new crash reports |
+| `health.py` | One line each for the kernel (panic?), Data, userland, display and input (including virtio display state and producer-wait mode), the network (en0, the guest's addresses on the phone's wlan0) and new crash reports |
 | `panic.py [--raw]` | Whether the kernel has panicked, and its panic log with kernel addresses symbolized: a panic does not stop this VM, only the panicking vCPU spins |
 | `crashes.py [--all\|--list] [NAME...]` | The guest's new crash reports (ReportCrash's .ips), fetched to `out/crashes/` and summarized: exception, where an uncaught exception was thrown, the crashed thread; a JetsamEvent's killed processes and their reasons |
 | `input.py tap\|long\|swipe\|unlock\|text` | Touch the guest screen through the app's display (Android `input`, real timing), in pixels of the framebuffer (handoff.env: 1366x1024, the iPad Pro 12.9-inch's points); the mapping comes from SurfaceFlinger |
-| `deploy.sh [--ubsan keep\|nop]` | Fetch the kernel built on the Mac, add the early probes, regenerate the ADT, refresh the boot disk, push it |
+| `deploy.sh [--kernel-only] [patch-early-probe.py args]` | Fetch the Mac kernel, add the early probes and push it. `--kernel-only` keeps the rig's boot disk, including its ADT, trust, Data seed and DarwinBoot; deploy extracts the ADT to `out/`, while `swap-adt.sh` rebuilds it |
 | `reboot-vm.sh [WAIT]` | Restart the VM through the DroidVM daemon and print the serial console (UEFI, UniXNU, DarwinBoot) |
 | `peek.py SYMBOL\|0xPA\|va:VA [LEN] [--q\|--str]` | Read guest memory by kernel symbol, physical or kernel virtual address |
 | `dmesg.py` | Print the XNU message buffer (`msgbufp`) |
@@ -36,6 +36,9 @@ the environment wins):
 | `fbgrab.sh OUT.png` | Coherent framebuffer capture (`memgrab`: mmap the guest memfd, `dc civac`, copy) |
 | `memgrab.c` | The phone-side helper of `fbgrab.sh` (static aarch64 build) |
 | `swap-adt.sh` | Regenerate only the ADT on the boot disk |
+| `metalcheck-run.py [--benchmark | --stress-seconds S [--memory-mib M]] [--output DIR]` | Run the preinstalled guest Metal Check CLI and collect its report, progress, guest GPU-loss counters, and memory-pressure samples; requires a running VM and active `hostwatch.py` |
+| `display-soak.py [--cycles N]` | Exercise Today View and Spotlight; checks command/GPU errors, fallback counters, compositor (`backboardd`) PID and crash reports. Requires active `hostwatch.py` and an attached VM display |
+| `display-profile.py [--cycles N] [--compare-no-wait]` | Default runs only with producer wait ON using existing guest swap/present timing rings. `--compare-no-wait` runs a possibly flickering ON/OFF/OFF/ON diagnostic and restores ON in `finally`. Measures guest swap cadence, not panel FPS; the <=100 ms subset filters pauses and can also hide severe stalls |
 | `console-watch.sh [SECONDS]` | Keep the newest serial console on this machine while the VM boots, stamped with host time (survives a phone that goes down) |
 | `procs.py`, `trace.py` | The droidvm-monitor worker's process samples and UI thread traces (`droidvm-monitor=<ms>`) |
 | `trace.py --focus NAME [--symbolize]` | Trace any process's threads (role T) while the guest runs, e.g. an app that hangs; `--symbolize` names the frames with `dsc_sym.py` on `BUILD_HOST` |
@@ -45,7 +48,7 @@ the environment wins):
 | `home.py` | Press Home |
 | `touch.py tap X Y`, `touch.py swipe X0 Y0 X1 Y1` | Touch the guest screen (pixels of the framebuffer) by writing NativeHidInput's finger set |
 | `load-modules.sh` | Load the DroidVM app's kernel modules after the phone itself restarted |
-| `show-vm.sh` | Bring a fresh display of the VM to the front of the phone (a VM restart closes it; `vm.sh attach` also checks that input arrives) |
+| `show-vm.sh` | Bring a fresh native VM display to the front; selects the enabled `gpu-0` or `simplefb` screen and dimensions from config (a VM restart closes it) |
 | `export.py kill PID [SIGNAL]` | Signal a guest process, e.g. a SpringBoard deadlocked at launch (launchd restarts it) |
 | `export.py mem PID ADDRESS [LENGTH]`, `umem.py` | Read a guest process's user memory (hex dump; `umem.read`/`umem.q` for scripted pointer walks) |
 | `logarchive.py OUT` | Mirror the guest's unified log (diagnostics + uuidtext) for a tracev3 parser such as mandiant/macos-UnifiedLogs (`unifiedlog_iterator -m log-archive`) or macOS `log show --archive`; each tree is listed with its sizes in one request (`export.py tree`), and reruns fetch only what changed |
@@ -57,7 +60,7 @@ the environment wins):
 | `payload-redeploy.sh [--keep-trust] [TOOL...]` | Remake the owner trust bundle and pin it in board.toml (here and on the Mac), build the payload around `DATA_SEED`, make the boot disk, deploy, restart, put the ssh key, stage owner tools |
 | `plugin-redeploy.sh` | Build the Metal plugin on the Mac from `FORK`, keep the running plugin trusted, stage the new one into the guest's Data, flush it, `payload-redeploy.sh`, and check it survived the reboot |
 | `crosvm-deploy.sh` | Install `CROSVM_BIN` as the app's crosvm (VM stopped), keeping a backup and the old binary's owner, mode and SELinux label; guest and crosvm must agree on the droidvm-gpu wire version |
-| `daemon-recover.sh` | Restart droidvmd the way the app does and recreate the VM from its saved config (`unixnu-vm.config.json`, rig-local; its `screens.simplefb` is 1366x1024: the guest is an iPad Pro 12.9-inch, whose home screen is laid out for 1366x1024 points, and at 1280x800 its icons and widgets overlapped; change a running daemon's copy with `vm_modify`) |
+| `daemon-recover.sh` | Restart droidvmd the way the app does and recreate the VM from its saved config (`unixnu-vm.config.json`, rig-local); change a running daemon's copy with `vm_modify` |
 
 After the phone itself restarts, open the DroidVM app once (or `insmod` the modules of its autostart set from
 `files/../usr/lib/modules/<kmi>/`): a pseudo-unprotected VM shares its RAM through `/dev/gunyah_share`, and
@@ -65,3 +68,19 @@ without the Gunyah Host Share module crosvm exits with "failed to initialize vir
 
 The panic log lands in the `/pram` region of the ADT (default: the last 512 KiB of guest RAM); `panic.py` finds it
 from crosvm's RAM mapping and prints it.
+
+## Metal Check
+
+Start `hostwatch.py` in one terminal while the VM is running, then use another terminal in this directory:
+
+```sh
+python3 metalcheck-run.py --benchmark --output out/metalcheck-guest-benchmark
+python3 metalcheck-run.py --stress-seconds 300 --memory-mib 128 \
+  --output out/metalcheck-guest-stress-300s-128mib
+```
+
+`--benchmark` runs correctness plus the three benchmark workloads. `--stress-seconds` accepts 1–86400 and runs correctness before stress; all required correctness cases must pass before stress begins. `--memory-mib` accepts 0–512 and defaults to 128. Use either `--benchmark` or `--stress-seconds`. The output directory must not already exist; without `--output`, the runner creates a timestamped directory under `out/`.
+
+Each run directory contains `report.json`, `app.json`, `stdout.log`, `progress.log`, and `pressure.jsonl`. The pressure samples include guest GPU-loss and GPU-error counters, guest page counts and memory level, and host memory-pressure data. The runner marks changed guest GPU-loss counters and other monitored GPU/kernel errors as failures.
+
+The enhanced guest correctness-and-benchmark report at `../../../droidvm/out/metalcheck-guest-enhanced/report.json` records 28 `PASS`, 0 `FAIL`, 0 `SKIP`, passing render/compute/blit benchmarks, and no observed guest GPU loss. This does not establish complete Metal conformance. The first 304-second guest stress run passed 9 rounds. The optimized run passed 20 API/oracle rounds in 302 seconds, but its visual review failed: stale frames and text corruption remained despite zero loss counters. See `out/metalcheck-guest-stress-final/report.json`; `report-automated.json` retains the original API/counter result. The runner explicitly labels its automatic result as API/counters only, with `visual_check=NOT_ASSESSED`; final displayed pixels need independent checking.

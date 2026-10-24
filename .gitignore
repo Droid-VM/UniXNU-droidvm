@@ -3,3 +3,6 @@ unixnu.lock
 tools/rig/rig.env
 tools/rig/out/
 tools/rig/__pycache__/
+
+# Python bytecode produced by local build helpers.
+__pycache__/

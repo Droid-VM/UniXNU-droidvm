@@ -18,6 +18,10 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
     --virtio-mmio-input (package/DroidVMVirtioInput.c), compatible "droidvm,virtio-input"
   - /arm-io/gpu: the "virtio,mmio" node at --gpu-mmio instead, crosvm's --droidvm-gpu device
     (package/DroidVMGpu.cpp, the host's KGSL), compatible "droidvm,gpu"
+  - /arm-io/virtio-gpu: --virtio-gpu-mmio, distinct from the legacy KGSL proxy. Its drm-host-pool
+    property carries the absolute GPA and size of the FDT's pre-shared drm2kgsl_host pool.
+  - /chosen/darwinboot-video-memory: --boot-video-mib reserves ordinary RAM below the panic
+    region for a BLT-only GOP handoff. It needs no crosvm simplefb device or framebuffer MMIO.
   - /chosen darwinboot-memory-limit (--reclaim-memory): DarwinBoot also gives the kernel the RAM after its window that the
     firmware frees at ExitBootServices, up to this address (the panic region); /defaults kern.maxvnodes is sized for it
   - /chosen dram-base, dram-size: the guest RAM. A pseudo-unprotected VM declares only its small
@@ -159,11 +163,17 @@ def describe(fdt):
     dram_base, dram_size = min(memory)
     virtio = sorted(reg_pairs(props['reg'])[0] for path, props in fdt.items()
                     if 'virtio,mmio' in strings_of(props.get('compatible', b'')))
+    drm_host = [pair for path, props in fdt.items()
+                if path.startswith('/reserved-memory/drm2kgsl_host@')
+                for pair in reg_pairs(props['reg'])]
+    if len(drm_host) > 1:
+        raise SystemExit('FDT has more than one drm2kgsl_host pool')
     for address, size in virtio:
         if not ARMIO_BASE <= address < address + size <= ARMIO_BASE + ARMIO_SIZE:
             raise SystemExit(f'virtio-mmio window {address:#x}+{size:#x} lies outside the arm-io window')
     return dict(cpu_regs=[reg for reg, _ in cpus], gic=(dist, dist_size, redist, redist_size),
-                psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size, virtio_mmio=virtio)
+                psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size,
+                virtio_mmio=virtio, drm_host_pool=drm_host)
 
 
 def main():
@@ -208,6 +218,10 @@ def main():
                         help='Base of the FDT virtio-mmio window of the droidvm-gpu device (/arm-io/gpu)')
     parser.add_argument('--net-mmio', type=lambda value: int(value, 0), default=None,
                         help='Base of the FDT virtio-mmio window of the virtio-net device (/arm-io/net)')
+    parser.add_argument('--virtio-gpu-mmio', type=lambda value: int(value, 0), default=None,
+                        help='Base of the standard virtio-gpu window (/arm-io/virtio-gpu)')
+    parser.add_argument('--boot-video-mib', type=int, default=0,
+                        help='Reserve ordinary RAM for the BLT-only GOP boot framebuffer (requires --reclaim-memory)')
     parser.add_argument('--reclaim-memory', action='store_true',
                         help='/chosen/darwinboot-memory-limit: DarwinBoot also hands the kernel the RAM after its window that the '
                              'firmware frees at ExitBootServices, up to the panic region (or the end of guest RAM)')
@@ -252,6 +266,15 @@ def main():
     memory_limit = None
     if args.reclaim_memory:
         memory_limit = (panic_region[0] if panic_region else dram_base + args.dram_size) & ~0x1fffff
+    boot_video = None
+    if args.boot_video_mib:
+        if not args.reclaim_memory or not 2 <= args.boot_video_mib <= 64 or args.boot_video_mib % 2:
+            parser.error('--boot-video-mib requires --reclaim-memory and an even size from 2 to 64 MiB')
+        video_bytes = args.boot_video_mib << 20
+        if memory_limit - dram_base <= video_bytes + (args.owned_memory_size or 0):
+            parser.error('boot video reservation leaves no room for the DarwinBoot window')
+        memory_limit -= video_bytes
+        boot_video = (memory_limit, video_bytes)
     # The memory the kernel manages: its window, or about everything up to the limit when the window is extended.
     kernel_memory = memory_limit - dram_base if memory_limit else (args.owned_memory_size or args.dram_size)
     if panic_region and (panic_region[0] % 0x4000 or panic_region[1] % 0x4000 or not 0x4000 <= panic_region[1] < 1 << 32):
@@ -262,7 +285,8 @@ def main():
     except ValueError:
         parser.error('--input-mmio takes comma-separated addresses')
     virtio_mmio = [window for window in vm['virtio_mmio']
-                   if window[0] not in (args.data_store_mmio, args.gpu_mmio, args.net_mmio) and window[0] not in input_bases]
+                   if window[0] not in (args.data_store_mmio, args.gpu_mmio, args.net_mmio, args.virtio_gpu_mmio)
+                   and window[0] not in input_bases]
     data_store = [window for window in vm['virtio_mmio'] if window[0] == args.data_store_mmio]
     if args.data_store_mmio is not None and not data_store:
         parser.error(f'the FDT has no virtio-mmio window at {args.data_store_mmio:#x} for --data-store-mmio')
@@ -276,6 +300,10 @@ def main():
     if args.net_mmio is not None and (not net or args.net_mmio in input_bases or
                                       args.net_mmio in (args.data_store_mmio, args.gpu_mmio)):
         parser.error(f'--net-mmio {args.net_mmio:#x} must be a virtio-mmio window of the FDT of its own')
+    virtio_gpu = [window for window in vm['virtio_mmio'] if window[0] == args.virtio_gpu_mmio]
+    if args.virtio_gpu_mmio is not None and (not virtio_gpu or args.virtio_gpu_mmio in input_bases or
+                                           args.virtio_gpu_mmio in (args.data_store_mmio, args.gpu_mmio, args.net_mmio)):
+        parser.error(f'--virtio-gpu-mmio {args.virtio_gpu_mmio:#x} must be a virtio-mmio window of the FDT of its own')
 
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
                                    ('reg', struct.pack('<I', reg)),
@@ -299,6 +327,7 @@ def main():
                         *([('ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
                         *([('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))] if args.owned_memory_size else []),
                         *([('darwinboot-memory-limit', struct.pack('<Q', memory_limit))] if memory_limit else []),
+                        *([('darwinboot-video-memory', struct.pack('<QQ', *boot_video))] if boot_video else []),
                         ('dram-base', struct.pack('<Q', dram_base)),
                         ('dram-size', struct.pack('<Q', args.dram_size)),
                         ('crypto-hash-method', b'sha2-384\0'),
@@ -361,7 +390,12 @@ def main():
               *[node('net', [('compatible', b'droidvm,net\0'),
                              ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
                              ('dma-coherent', b'')])
-                for address, size in net]]),
+                for address, size in net],
+              *[node('virtio-gpu', [('compatible', b'droidvm,virtio-gpu\0'),
+                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                    ('dma-coherent', b''),
+                                    *[('drm-host-pool', struct.pack('<QQ', *pool)) for pool in vm['drm_host_pool']]])
+                for address, size in virtio_gpu]]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)

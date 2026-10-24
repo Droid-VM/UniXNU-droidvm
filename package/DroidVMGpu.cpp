@@ -73,6 +73,9 @@ struct droidvm_gpu_info droidvm_gpu_facts;
 volatile uint64_t droidvm_gpu_stats[16];
 // [0] result (1 pass, 2 fail) [1] the value read back [2] the fence [3] the step that failed [4] its status
 volatile uint32_t droidvm_gpu_selftest[5];
+volatile uint32_t droidvm_gpu_capabilities, droidvm_gpu_lost_mask;
+volatile uint32_t droidvm_gpu_generation[DROIDVM_GPU_MAX_CLIENTS];
+volatile uint32_t droidvm_gpu_lost[DROIDVM_GPU_MAX_CLIENTS];
 }
 
 namespace {
@@ -202,10 +205,13 @@ const char *attachDevice()
     return gLock ? nullptr : "no lock";
 }
 
+void noteLost(uint32_t mask);
 // One request: header + a + b in, response payload (at most `capacity` bytes) out. Returns the device's status (0 or a negative
 // host errno) or kTransportFailed, after which the device is not used again.
-int32_t call(uint32_t op, const void *a, uint32_t a_bytes, const void *b, uint32_t b_bytes, void *reply, uint32_t capacity)
+int32_t call(uint32_t op, const void *a, uint32_t a_bytes, const void *b, uint32_t b_bytes, void *reply, uint32_t capacity,
+    uint32_t *actual = nullptr)
 {
+    if (actual) *actual = 0;
     const uint32_t bytes = a_bytes + b_bytes;
     if (sizeof(droidvm_gpu_request) + bytes > kRequestBytes || sizeof(droidvm_gpu_response) + capacity > kResponseBytes)
         return int32_t(kTransportFailed);
@@ -244,7 +250,23 @@ int32_t call(uint32_t op, const void *a, uint32_t a_bytes, const void *b, uint32
     if (answered && used[1] == uint16_t(gUsedIndex + 1) && element->id == 0 && element->length >= sizeof *response &&
         response->bytes <= capacity && element->length >= sizeof *response + response->bytes) {
         status = response->status;
+        if (actual) *actual = response->bytes;
         if (!status && reply && capacity) memcpy(reply, gResponse + sizeof *response, response->bytes);
+        // Process status while still holding the transport gate. Otherwise a delayed
+        // RETIRED response could mark a slot lost after CLIENT already reset its owner.
+        if (!status && op == DROIDVM_GPU_OP_RETIRED && response->bytes == sizeof(droidvm_gpu_timestamp) &&
+            (droidvm_gpu_capabilities & DROIDVM_GPU_CAP_RETIRED_LOST_MASK)) {
+            droidvm_gpu_timestamp retired = {};
+            memcpy(&retired, gResponse + sizeof *response, sizeof retired);
+            noteLost(retired.timeout_ms);
+        }
+        if (!status && op == DROIDVM_GPU_OP_CLIENT && a_bytes == sizeof(droidvm_gpu_client_reset)) {
+            const uint32_t slot = static_cast<const droidvm_gpu_client_reset *>(a)->client;
+            if (slot < DROIDVM_GPU_MAX_CLIENTS) {
+                __atomic_fetch_and(&droidvm_gpu_lost_mask, ~(uint32_t(1) << slot), __ATOMIC_ACQ_REL);
+                __atomic_add_fetch(&droidvm_gpu_generation[slot], 1, __ATOMIC_RELEASE);
+            }
+        }
     }
     if (answered) ++gUsedIndex;
     const uint32_t interrupts = rd(0x60) & 3;
@@ -588,7 +610,17 @@ IOReturn NativeAdrenoVm::peekWords(uint64_t iova, uint32_t *out, size_t count) c
 // seqno_ is the last timestamp submitted, completed_ the last one a wait() saw retired; the fence of a submission is its timestamp.
 namespace {
 uint32_t gRetired;   // the newest retired timestamp the device reported (retirement is in order, so it is never ahead)
+uint32_t gPresentSubmitted;
 uint32_t gIbHeader;  // NativeAdrenoSubmit's CP_INDIRECT_BUFFER header
+void noteLost(uint32_t mask)
+{
+    // This mask is sticky within each connection's generation. Only a successful CLIENT
+    // reset clears its bit; a delayed poll must never clear a newer SUBMIT failure.
+    const uint32_t previous = __atomic_fetch_or(&droidvm_gpu_lost_mask, mask, __ATOMIC_ACQ_REL);
+    for (unsigned slot = 0; slot < DROIDVM_GPU_MAX_CLIENTS; ++slot)
+        if ((mask & ~previous) & (uint32_t(1) << slot))
+            __atomic_fetch_add(&droidvm_gpu_lost[slot], 1, __ATOMIC_RELAXED);
+}
 int32_t readRetired(uint32_t *value)
 {
     droidvm_gpu_timestamp reply = {};
@@ -604,13 +636,27 @@ int32_t readRetired(uint32_t *value)
 // The client slot submitting now (NativeAdrenoPublish's dispatch sets it under the board lock, build-droidvm-gpu.py), and the
 // submissions each slot had refused because its KGSL context was lost (for the host rig).
 extern "C" volatile uint32_t droidvm_gpu_client = 0;
-extern "C" volatile uint32_t droidvm_gpu_lost[DROIDVM_GPU_MAX_CLIENTS] = {};
 // A slot changed hands (NativeAdrenoPublish's mount): its next user starts with a fresh KGSL context, whatever the last one did.
-extern "C" void droidvm_gpu_client_opened(uint32_t slot)
+extern "C" IOReturn droidvm_gpu_client_opened(uint32_t slot)
 {
-    if (slot >= DROIDVM_GPU_MAX_CLIENTS || droidvm_gpu_state < 1) return;
+    if (slot >= DROIDVM_GPU_MAX_CLIENTS || droidvm_gpu_state < 1) return kIOReturnNotReady;
     const droidvm_gpu_client_reset request = {slot, 0};
-    (void)call(DROIDVM_GPU_OP_CLIENT, &request, sizeof request, nullptr, 0, nullptr, 0);
+    const int32_t status = call(DROIDVM_GPU_OP_CLIENT, &request, sizeof request, nullptr, 0, nullptr, 0);
+    if (status) return ioReturn(status);
+    return kIOReturnSuccess;
+}
+// Called under NativeAdrenoPublish's connection gate. A health read never poisons the
+// shared ring: cancelled timestamps must remain usable for other clients and BO cleanup.
+extern "C" IOReturn droidvm_gpu_client_health(uint32_t slot, bool refresh)
+{
+    if (slot >= DROIDVM_GPU_MAX_CLIENTS) return kIOReturnBadArgument;
+    if (refresh && (droidvm_gpu_capabilities & DROIDVM_GPU_CAP_RETIRED_LOST_MASK)) {
+        uint32_t ignored = 0;
+        const int32_t status = readRetired(&ignored);
+        if (status) return ioReturn(status);
+    }
+    return (__atomic_load_n(&droidvm_gpu_lost_mask, __ATOMIC_ACQUIRE) & (uint32_t(1) << slot))
+        ? kIOReturnAborted : kIOReturnSuccess;
 }
 
 IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *, const NativeAdrenoRingCache *, void *, size_t, uint64_t, void *, size_t,
@@ -656,12 +702,13 @@ IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words, size_t word_count
         return poison();
     }
     if (status == -35 /* EDEADLK */) {
-        droidvm_gpu_lost[client] = droidvm_gpu_lost[client] + 1;
+        noteLost(uint32_t(1) << client);
         return kIOReturnAborted;
     }
     if (status) return ioReturn(status);
     reset_pending_ = false;   // KGSL frames each submission for its context itself
     ++seqno_;
+    __atomic_store_n(&gPresentSubmitted, seqno_, __ATOMIC_RELEASE);
     ++submissions_;
     *fence = seqno_;
     return kIOReturnSuccess;
@@ -705,6 +752,36 @@ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence, const NativeAdrenoR
     if (observed) *observed = value;
     if (result == NativeAdrenoRingFenceComplete && value > completed_) completed_ = value;
     return result;
+}
+
+// The display is a consumer in another host GPU context. Its blit fence only proves that
+// reading finished; it does not wait for the guest renderer which writes the IOSurface.
+extern "C" uint32_t droidvm_gpu_scanout_fence(void)
+{
+    return __atomic_load_n(&gPresentSubmitted, __ATOMIC_ACQUIRE);
+}
+extern "C" IOReturn droidvm_gpu_scanout_wait(uint32_t fence, bool wait, uint32_t *observed)
+{
+    if (observed) *observed = 0;
+    if (!fence) return kIOReturnSuccess;
+    if (droidvm_gpu_state != 2) return kIOReturnNotReady;
+    droidvm_gpu_timestamp reply = {};
+    int32_t status = call(DROIDVM_GPU_OP_RETIRED, nullptr, 0, nullptr, 0, &reply, sizeof reply);
+    if (status) return ioReturn(status);
+    if (observed) *observed = reply.timestamp;
+    if (!wait || int32_t(reply.timestamp - fence) >= 0) return kIOReturnSuccess;
+    const uint64_t begin = nowUs();
+    do {
+        const droidvm_gpu_timestamp request = {fence, 10};
+        status = call(DROIDVM_GPU_OP_WAIT, &request, sizeof request, nullptr, 0, nullptr, 0);
+        if (status && status != -110) return ioReturn(status);
+        // WAIT wakes for the oldest context currently blocking the global timeline, which
+        // can be earlier than the requested fence. Verify the whole timeline after every wake.
+        status = call(DROIDVM_GPU_OP_RETIRED, nullptr, 0, nullptr, 0, &reply, sizeof reply);
+        if (status) return ioReturn(status);
+        if (int32_t(reply.timestamp - fence) >= 0) return kIOReturnSuccess;
+    } while (nowUs() - begin < 2000000);
+    return kIOReturnTimeout;
 }
 
 // ---- NativeAdrenoTimer: the host's counter --------------------------------------------------------------------------------
@@ -895,6 +972,21 @@ void gpuThread(void *, wait_result_t)
         fail("unusable device facts");
         return;
     }
+    // The probe must accept the legacy 64-byte reply; a smaller capacity would mark an
+    // older host's otherwise valid transport broken. Empty INFO remains version 3.
+    const droidvm_gpu_info_query query = {DROIDVM_GPU_INFO_MAGIC, DROIDVM_GPU_INFO_CAPABILITIES,
+                                         DROIDVM_GPU_EXTENSION_VERSION, 0};
+    alignas(8) uint8_t extension[sizeof(droidvm_gpu_info)] = {};
+    uint32_t extensionBytes = 0;
+    if (call(DROIDVM_GPU_OP_INFO, &query, sizeof query, nullptr, 0, extension, sizeof extension, &extensionBytes)) {
+        fail("INFO capability probe failed"); return;
+    }
+    struct droidvm_gpu_capabilities caps = {};
+    memcpy(&caps, extension, sizeof caps);
+    if (extensionBytes == sizeof caps && caps.magic == DROIDVM_GPU_INFO_MAGIC &&
+        caps.version == DROIDVM_GPU_EXTENSION_VERSION && caps.max_clients == DROIDVM_GPU_MAX_CLIENTS)
+        droidvm_gpu_capabilities = caps.capabilities;
+    IOLog("droidvm-gpu: loss-status capabilities %#x\n", droidvm_gpu_capabilities);
     IOLog("droidvm-gpu: KGSL chip %#x gmem %#x@%#llx hbb %u ubwc %u, VBO %#llx+%#llx\n", info.chip_id, info.gmem_bytes,
            info.gmem_base, info.highest_bank_bit, info.ubwc_mode, info.va_start, info.va_size);
     // GPU addresses below 2^input_bits; guest physical addresses (the 5 GiB VM's RAM ends below 2^33) below 2^40.

@@ -5,6 +5,9 @@
 //   lsdiag [-u UID] restrictions [BUNDLE_ID...]   LSApplicationRestrictionsManager's lists, and per-app verdicts
 //   lsdiag [-u UID] rebuild [nosystem] [internal] [nouser]   rebuild the LaunchServices database (system and user apps)
 //   lsdiag [-u UID] register APP_PATH...   re-register app bundles by URL (their plug-ins go under them)
+//   lsdiag owner-install APP_PATH...      move trusted org.droidvm apps into MCM bundle containers, keep CLI symlinks
+//   lsdiag -u 501 owner-register APP_PATH...   register those trusted apps with installation metadata
+//   lsdiag -u 501 launch BUNDLE_ID...      request a foreground launch (device must be unlocked)
 //   lsdiag [-u UID] midump [FILTER...]    the item dictionaries installd gives LaunchServices (type, plug-in owner)
 //   lsdiag [-u UID] relink [-clean] BUNDLE_ID...|all   re-register apps with their plug-ins as an install does (plug-ins get
 //                                       their app); -clean drops each plug-in's records first (unregisterPlugin:)
@@ -39,6 +42,8 @@
 #import <fcntl.h>
 #import <sys/wait.h>
 #import <unistd.h>
+#import <mach-o/loader.h>
+#import <libkern/OSByteOrder.h>
 
 static id call(id target, const char *name) {
     SEL sel = sel_registerName(name);
@@ -192,13 +197,148 @@ static void rebuild(NSArray<NSString *> *args) {
 static void registerApps(NSArray<NSString *> *paths) {
     id workspace = call(NSClassFromString(@"LSApplicationWorkspace"), "defaultWorkspace");
     SEL sel = sel_registerName("registerApplication:");
+    // The workspace wrapper reduces LSRegisterURL's OSStatus to BOOL. Preserve
+    // that status so a failed registration can be diagnosed without guessing.
+    int32_t (*registerURL)(CFURLRef, Boolean) = (int32_t (*)(CFURLRef, Boolean))dlsym(RTLD_DEFAULT, "LSRegisterURL");
     for (NSString *path in paths) {
         if (![workspace respondsToSelector:sel]) {
             line(@"register: LSApplicationWorkspace does not answer registerApplication:");
             return;
         }
-        BOOL ok = ((BOOL (*)(id, SEL, NSURL *))objc_msgSend)(workspace, sel, [NSURL fileURLWithPath:path isDirectory:YES]);
-        line(@"register %@: %@", path, ok ? @"YES" : @"NO");
+        NSURL *url = [NSURL fileURLWithPath:path isDirectory:YES];
+        if (registerURL) {
+            int32_t status = registerURL((CFURLRef)url, false);
+            line(@"register %@: %@ (OSStatus %d)", path, status == 0 ? @"YES" : @"NO", status);
+        } else {
+            BOOL ok = ((BOOL (*)(id, SEL, NSURL *))objc_msgSend)(workspace, sel, url);
+            line(@"register %@: %@ (LSRegisterURL unavailable)", path, ok ? @"YES" : @"NO");
+        }
+    }
+}
+
+// Owner-built, already trusted apps live on persistent Data outside installd's
+// bundle directory. Supply installation metadata explicitly for this narrow path.
+// registerApplicationDictionary: is also used by UIKitTools/TrollStore's uicache;
+// this does not validate or add a code signature to the kernel trust cache.
+static NSDictionary *ownerEntitlements(NSString *path) {
+    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    if (data.length < sizeof(struct mach_header_64)) return nil;
+    const uint8_t *bytes = data.bytes;
+    struct mach_header_64 header;
+    memcpy(&header, bytes, sizeof(header));
+    if (header.magic != MH_MAGIC_64 || header.sizeofcmds > data.length - sizeof(header)) return nil;
+    size_t at = sizeof(header), end = at + header.sizeofcmds;
+    for (uint32_t i = 0; i < header.ncmds; i++) {
+        if (at > end || end - at < sizeof(struct load_command)) return nil;
+        struct load_command cmd;
+        memcpy(&cmd, bytes + at, sizeof(cmd));
+        if (cmd.cmdsize < sizeof(cmd) || cmd.cmdsize > end - at) return nil;
+        if (cmd.cmd == LC_CODE_SIGNATURE && cmd.cmdsize >= sizeof(struct linkedit_data_command)) {
+            struct linkedit_data_command signature;
+            memcpy(&signature, bytes + at, sizeof(signature));
+            size_t off = signature.dataoff, len = signature.datasize;
+            if (off > data.length || len > data.length - off || len < 12) return nil;
+            const uint8_t *blob = bytes + off;
+            uint32_t magic = OSReadBigInt32(blob, 0), total = OSReadBigInt32(blob, 4), count = OSReadBigInt32(blob, 8);
+            if (magic != 0xfade0cc0 || total > len || total < 12 || count > (total - 12) / 8) return nil;
+            for (uint32_t j = 0; j < count; j++) {
+                if (OSReadBigInt32(blob, 12 + j * 8) != 5) continue;
+                uint32_t entry = OSReadBigInt32(blob, 16 + j * 8);
+                if (entry > total || total - entry < 8 || OSReadBigInt32(blob, entry) != 0xfade7171) return nil;
+                uint32_t length = OSReadBigInt32(blob, entry + 4);
+                if (length < 8 || length > total - entry) return nil;
+                NSData *xml = [NSData dataWithBytes:blob + entry + 8 length:length - 8];
+                id plist = [NSPropertyListSerialization propertyListWithData:xml options:0 format:NULL error:nil];
+                return [plist isKindOfClass:[NSDictionary class]] ? plist : nil;
+            }
+            return nil;
+        }
+        at += cmd.cmdsize;
+    }
+    return nil;
+}
+
+static NSURL *ownerContainer(NSString *className, NSString *identifier, BOOL create) {
+    dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
+    Class cls = NSClassFromString(className);
+    SEL lookup = sel_registerName("containerWithIdentifier:createIfNecessary:existed:error:");
+    if (![cls respondsToSelector:lookup]) { line(@"owner container: unavailable %@", className); return nil; }
+    NSError *error = nil;
+    BOOL existed = NO;
+    id container = ((id (*)(Class, SEL, NSString *, BOOL, BOOL *, NSError **))objc_msgSend)(cls, lookup, identifier, create, &existed, &error);
+    NSURL *url = call(container, "url");
+    if (!url) line(@"owner container %@ %@: %@", className, identifier, error);
+    return url;
+}
+
+static void installOwnerApps(NSArray<NSString *> *paths) {
+    for (NSString *input in paths) {
+        NSString *source = input.stringByResolvingSymlinksInPath.stringByStandardizingPath;
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[source stringByAppendingPathComponent:@"Info.plist"]];
+        NSString *identifier = info[@"CFBundleIdentifier"];
+        if (!([source hasPrefix:@"/private/var/ngpu/apps/"] || [source hasPrefix:@"/var/ngpu/apps/"]) ||
+            ![source.pathExtension isEqualToString:@"app"] || ![identifier isKindOfClass:[NSString class]] || ![identifier hasPrefix:@"org.droidvm."]) {
+            line(@"owner-install %@: expected an unmoved org.droidvm app in ngpu/apps", input); continue;
+        }
+        NSURL *container = ownerContainer(@"MCMAppContainer", identifier, YES);
+        NSURL *dataContainer = ownerContainer(@"MCMAppDataContainer", identifier, YES);
+        if (!container || !dataContainer) continue;
+        NSString *destination = [container.path stringByAppendingPathComponent:source.lastPathComponent];
+        struct stat src, dst, existing;
+        if (stat(source.fileSystemRepresentation, &src) || stat(container.fileSystemRepresentation, &dst) || src.st_dev != dst.st_dev) {
+            line(@"owner-install %@: source and container must exist on the same volume", input); continue;
+        }
+        if (lstat(destination.fileSystemRepresentation, &existing) == 0 || errno != ENOENT) {
+            line(@"owner-install %@: destination already exists or cannot be checked: %@", input, destination); continue;
+        }
+        if (rename(source.fileSystemRepresentation, destination.fileSystemRepresentation)) {
+            line(@"owner-install %@: rename: %s", input, strerror(errno)); continue;
+        }
+        if (symlink(destination.fileSystemRepresentation, source.fileSystemRepresentation))
+            line(@"owner-install %@: moved but CLI symlink failed: %s", input, strerror(errno));
+        line(@"owner-install %@ -> %@; data %@", identifier, destination, dataContainer.path);
+    }
+}
+
+static void registerOwnerApps(NSArray<NSString *> *paths) {
+    id workspace = call(NSClassFromString(@"LSApplicationWorkspace"), "defaultWorkspace");
+    SEL registerItems = sel_registerName("registerContainerizedApplicationWithInfoDictionaries:personaUniqueStrings:operationUUID:requestContext:saveObserver:registrationError:");
+    if (![workspace respondsToSelector:registerItems]) { line(@"owner-register: selector unavailable"); return; }
+    for (NSString *input in paths) {
+        NSString *path = input.stringByResolvingSymlinksInPath.stringByStandardizingPath;
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Info.plist"]];
+        NSString *identifier = info[@"CFBundleIdentifier"];
+        NSString *executable = info[@"CFBundleExecutable"];
+        if (!([path hasPrefix:@"/private/var/containers/Bundle/Application/"] || [path hasPrefix:@"/var/containers/Bundle/Application/"]) || ![path.pathExtension isEqualToString:@"app"] ||
+            ![identifier isKindOfClass:[NSString class]] || ![identifier hasPrefix:@"org.droidvm."] ||
+            ![executable isKindOfClass:[NSString class]] || ![executable isEqualToString:executable.lastPathComponent] ||
+            ![[NSFileManager defaultManager] isExecutableFileAtPath:[path stringByAppendingPathComponent:executable]]) {
+            line(@"owner-register %@: invalid owner app path=%@ identifier=%@ executable=%@ accessible=%d", input, path, identifier, executable,
+                 executable ? [[NSFileManager defaultManager] isExecutableFileAtPath:[path stringByAppendingPathComponent:executable]] : NO); continue;
+        }
+        NSMutableDictionary *item = [info mutableCopy];
+        NSDictionary *entitlements = ownerEntitlements([path stringByAppendingPathComponent:executable]);
+        NSURL *dataContainer = ownerContainer(@"MCMAppDataContainer", identifier, NO);
+        if (!entitlements || !dataContainer) { line(@"owner-register %@: missing signed entitlements or data container", input); continue; }
+        item[@"Entitlements"] = entitlements;
+        item[@"Container"] = dataContainer.path;
+        [item addEntriesFromDictionary:@{@"ApplicationType": @"System", @"CodeInfoIdentifier": identifier,
+            @"Path": path, @"CompatibilityState": @0, @"IsContainerized": @(![entitlements[@"com.apple.private.security.no-container"] boolValue]), @"IsDeletable": @NO,
+            @"IsAdHocSigned": @YES, @"LSInstallType": @1, @"_LSBundlePlugins": @{}}];
+        NSError *error = nil;
+        BOOL ok = ((BOOL (*)(id, SEL, NSArray *, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
+            workspace, registerItems, @[item], nil, [NSUUID UUID], nil, nil, &error);
+        line(@"owner-register %@ (%@): %@ %@", path, identifier, ok ? @"YES" : @"NO", error ?: @"");
+    }
+}
+
+static void launchApps(NSArray<NSString *> *identifiers) {
+    id workspace = call(NSClassFromString(@"LSApplicationWorkspace"), "defaultWorkspace");
+    SEL launch = sel_registerName("openApplicationWithBundleID:");
+    if (![workspace respondsToSelector:launch]) { line(@"launch: selector unavailable"); return; }
+    for (NSString *identifier in identifiers) {
+        BOOL ok = ((BOOL (*)(id, SEL, NSString *))objc_msgSend)(workspace, launch, identifier);
+        line(@"launch %@: %@", identifier, ok ? @"YES" : @"NO");
     }
 }
 
@@ -714,6 +854,12 @@ int main(int argc, char **argv) {
             rebuild(identifiers);
         } else if ([verb isEqualToString:@"register"]) {
             registerApps(identifiers);
+        } else if ([verb isEqualToString:@"owner-register"]) {
+            registerOwnerApps(identifiers);
+        } else if ([verb isEqualToString:@"owner-install"]) {
+            installOwnerApps(identifiers);
+        } else if ([verb isEqualToString:@"launch"]) {
+            launchApps(identifiers);
         } else if ([verb isEqualToString:@"midump"]) {
             midump(identifiers);
         } else if ([verb isEqualToString:@"nodes"]) {

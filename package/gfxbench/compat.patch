@@ -1,0 +1,672 @@
+diff --git a/3rdparty/libpng/pngpriv.h b/3rdparty/libpng/pngpriv.h
+index 88d08513..643df25e 100644
+--- a/3rdparty/libpng/pngpriv.h
++++ b/3rdparty/libpng/pngpriv.h
+@@ -426,7 +426,7 @@
+ #  include <float.h>
+ 
+ #  if (defined(__MWERKS__) && defined(macintosh)) || defined(applec) || \
+-    defined(THINK_C) || defined(__SC__) || defined(TARGET_OS_MAC)
++    defined(THINK_C) || defined(__SC__) || (defined(TARGET_OS_MAC) && !defined(__APPLE__))
+      /* We need to check that <math.h> hasn't already been included earlier
+       * as it seems it doesn't agree with <fp.h>, yet we should really use
+       * <fp.h> if possible.
+diff --git a/3rdparty/poco/Foundation/include/Poco/Delegate.h b/3rdparty/poco/Foundation/include/Poco/Delegate.h
+index b1745f35..ca0d732d 100644
+--- a/3rdparty/poco/Foundation/include/Poco/Delegate.h
++++ b/3rdparty/poco/Foundation/include/Poco/Delegate.h
+@@ -148,7 +148,6 @@ public:
+ 	{
+ 		if (&delegate != this)
+ 		{
+-			this->_pTarget        = delegate._pTarget;
+ 			this->_receiverObject = delegate._receiverObject;
+ 			this->_receiverMethod = delegate._receiverMethod;
+ 		}
+@@ -364,7 +363,6 @@ public:
+ 	{
+ 		if (&delegate != this)
+ 		{
+-			this->_pTarget        = delegate._pTarget;
+ 			this->_receiverObject = delegate._receiverObject;
+ 			this->_receiverMethod = delegate._receiverMethod;
+ 		}
+diff --git a/3rdparty/poco/Foundation/src/zutil.h b/3rdparty/poco/Foundation/src/zutil.h
+index 24ab06b1..925edcde 100644
+--- a/3rdparty/poco/Foundation/src/zutil.h
++++ b/3rdparty/poco/Foundation/src/zutil.h
+@@ -118,7 +118,7 @@ extern z_const char * const z_errmsg[10]; /* indexed by 2-zlib_error */
+ #  endif
+ #endif
+ 
+-#if defined(MACOS) || defined(TARGET_OS_MAC)
++#if (defined(MACOS) || defined(TARGET_OS_MAC)) && !defined(__APPLE__)
+ #  define OS_CODE  0x07
+ #  ifndef Z_SOLO
+ #    if defined(__MWERKS__) && __dest_os != __be_os && __dest_os != __win32_os
+diff --git a/3rdparty/zlib/zutil.h b/3rdparty/zlib/zutil.h
+index 76966ef2..092fac64 100644
+--- a/3rdparty/zlib/zutil.h
++++ b/3rdparty/zlib/zutil.h
+@@ -118,7 +118,7 @@ extern z_const char * const z_errmsg[10]; /* indexed by 2-zlib_error */
+ #  endif
+ #endif
+ 
+-#if defined(MACOS) || defined(TARGET_OS_MAC)
++#if (defined(MACOS) || defined(TARGET_OS_MAC)) && !defined(__APPLE__)
+ #  define OS_CODE  0x07
+ #  ifndef Z_SOLO
+ #    if defined(__MWERKS__) && __dest_os != __be_os && __dest_os != __win32_os
+diff --git a/app_ios/CMakeLists.txt b/app_ios/CMakeLists.txt
+index ab7f889d..402c36e5 100644
+--- a/app_ios/CMakeLists.txt
++++ b/app_ios/CMakeLists.txt
+@@ -102,6 +102,8 @@ list(APPEND BENCHMARK_RESOURCES "${CMAKE_BINARY_DIR}/theme")
+ if (NOT OPT_COMMUNITY_BUILD)
+     # add poco for command line options
+     find_package(Poco REQUIRED COMPONENTS Util Foundation)
++    # Later framework lookups can overwrite POCO_LIBRARIES with Foundation only.
++    set(APP_POCO_LIBRARIES ${POCO_LIBRARIES})
+     add_definitions(${POCO_DEFINITIONS})
+ 
+ endif()
+@@ -189,10 +191,12 @@ list(APPEND RESOURCE
+             ${BENCHMARK_RESOURCES}
+ 
+             # raw and config (simple folder path to create a "blue" linked folder in Xcode)
+-            data
+             image
+             compare
+         )
++if (NOT BUNDLE_DATA)
++    list(APPEND RESOURCE data)
++endif()
+ source_group("Assets" FILES ${RESOURCE} )
+ 
+ # Set include directories to allow the files to see each other
+@@ -255,7 +259,7 @@ target_link_libraries(${PROJECT_NAME}
+         ${APPLY_FIND_LIBRARIES}
+         "-framework WebKit -framework UIKit -framework QuartzCore -framework AVFoundation -framework Security -framework CoreMedia -framework CoreText -framework CoreGraphics -framework CoreImage -framework OpenGLES -framework SystemConfiguration"
+         "-weak_framework Metal"
+-        ${POCO_LIBRARIES}
++        ${APP_POCO_LIBRARIES}
+         ${epoxy_LIBRARIES}
+         tfw_deviceinfo
+         benchmarkservice
+diff --git a/frameworks/cmake-utils/cmake/toolchain/ios.cmake b/frameworks/cmake-utils/cmake/toolchain/ios.cmake
+index 61e58feb..8d3af992 100644
+--- a/frameworks/cmake-utils/cmake/toolchain/ios.cmake
++++ b/frameworks/cmake-utils/cmake/toolchain/ios.cmake
+@@ -39,7 +39,7 @@ set (IOS True)
+ # Determine the cmake host system version so we know where to find the iOS SDKs
+ find_program (CMAKE_UNAME uname /bin /usr/bin /usr/local/bin)
+ if (CMAKE_UNAME)
+-	exec_program(uname ARGS -r OUTPUT_VARIABLE CMAKE_HOST_SYSTEM_VERSION)
++	execute_process(COMMAND ${CMAKE_UNAME} -r OUTPUT_VARIABLE CMAKE_HOST_SYSTEM_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
+ 	string (REGEX REPLACE "^([0-9]+)\\.([0-9]+).*$" "\\1" DARWIN_MAJOR_VERSION "${CMAKE_HOST_SYSTEM_VERSION}")
+ endif (CMAKE_UNAME)
+ 
+@@ -226,7 +226,7 @@ macro (find_host_program)
+ 
+ 	find_program(${ARGN})
+ 
+-	set (APPLE)
++	set (APPLE 1)
+ 	set (UNIX 1)
+ 	set (IOS TRUE)
+ 	set (CMAKE_FIND_ROOT_PATH_MODE_PROGRAM ONLY)
+diff --git a/gfxbench/CMakeLists.txt b/gfxbench/CMakeLists.txt
+index 62a0b2d1..d35a3bfb 100644
+--- a/gfxbench/CMakeLists.txt
++++ b/gfxbench/CMakeLists.txt
+@@ -40,8 +40,12 @@ if(NOT DISABLE_GFX4)
+         elseif(PRODUCT_ID AND ${PRODUCT_ID} STREQUAL "gfxbench_metal")
+             build_gfx4_metal()
+         elseif(PRODUCT_ID AND ${PRODUCT_ID} STREQUAL "gfxbench" )
+-            build_gfx4_gl()
+-            if (NOT ANDROID)
++            if(APPLE)
++                build_gfx4_metal()
++            else()
++                build_gfx4_gl()
++            endif()
++            if (WIN32)
+                 build_gfx4_dx()
+             endif()
+         endif()
+diff --git a/scripts/build-3rdparty.sh b/scripts/build-3rdparty.sh
+index 26e1cce7..fb62277e 100755
+--- a/scripts/build-3rdparty.sh
++++ b/scripts/build-3rdparty.sh
+@@ -135,7 +135,10 @@ case $PLATFORM in
+ 	linux_arm|linux_arm64|linux_cross)
+ 	;;
+ 	ios|iossim|ios.libstdc++|iossim.libstdc++)
+-                COMMON_OPTS="-DCMAKE_OSX_DEPLOYMENT_TARGET=14"
++                COMMON_OPTS="-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0"
++                # The offline corporate app does not need SSL. Do not link host macOS
++                # Homebrew OpenSSL into an iOS target through CMake's package search.
++                poco_OPTS+=" -DDISABLE_OPENSSL=ON -DOPENSSL_FOUND=FALSE"
+ 	#	COMMON_OPTS="-DCMAKE_C_FLAGS=-fembed-bitcode -DCMAKE_CXX_FLAGS=-fembed-bitcode -DCOMPILE_DEFINITIONS=-Wdeprecated-declarations"
+ 	;;
+ 	v120_wp81-arm|v120_wp81-win32|v140_wp81-arm|v140_wp81-win32|v120_rt81-arm|v120_rt81-x86|v120_rt81-x64)
+diff --git a/scripts/build.sh b/scripts/build.sh
+index 8e501d7a..d82b942a 100755
+--- a/scripts/build.sh
++++ b/scripts/build.sh
+@@ -424,11 +424,15 @@ case $PLATFORM in
+             # source $WORKSPACE/app_ios/ios_setup_bundle.sh
+         fi
+ 
+-        COMMON_OPTS+=" -DRENDER_API=Metal -DCMAKE_OSX_DEPLOYMENT_TARGET=14"
++        COMMON_OPTS+=" -DRENDER_API=Metal -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0"
+         COMMON_OPTS+=" -DBENCHMARK_DIR=${BENCHMARK_DIR} -DBUILD_SHARED_LIBS=0"
+         if [ "$APPLICATION_TYPE" = "gui" ]; then
+             app_ios_OPTS=" -DOPT_COMMUNITY_BUILD=${COMMUNITY_BUILD}"
+             app_ios_TARGET="-t xcarchive"
++            if [ "${DROIDVM_UNSIGNED_APP:-false}" = "true" ]; then
++                app_ios_TARGET="-t app_ios"
++                COMMON_OPTS+=" -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO"
++            fi
+             PROJECTS+=" app_ios"
+         else
+             testfw_OPTS=""
+diff --git a/gfxbench/resources/gfxbench_metal/5.0/testlist_corporate.json b/gfxbench/resources/gfxbench_metal/5.0/testlist_corporate.json
+new file mode 100644
+index 00000000..d0d024f5
+--- /dev/null
++++ b/gfxbench/resources/gfxbench_metal/5.0/testlist_corporate.json
+@@ -0,0 +1,423 @@
++{
++    "version": 1,
++    "tests": [
++        {
++            "test_name": "metal_5_high",
++            "group_name": "group_high_level",
++            "run_order": 1,
++            "variant_postfixes": [
++                "",
++                "_4k_off",
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "Frames"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_5_normal",
++            "group_name": "group_high_level",
++            "run_order": 1,
++            "variant_postfixes": [
++                "",
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "Frames"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_4",
++            "group_name": "group_high_level",
++            "run_order": 1,
++            "variant_postfixes": [
++                "",
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "Frames"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_manhattan311_wqhd",
++            "group_name": "group_high_level",
++            "run_order": 1,
++            "variant_postfixes": [
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "Frames"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_manhattan31",
++            "group_name": "group_high_level",
++            "run_order": 1,
++            "variant_postfixes": [
++                "",
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "Frames"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_manhattan",
++            "group_name": "group_high_level",
++            "run_order": 1,
++            "variant_postfixes": [
++                "",
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "Frames"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_trex",
++            "group_name": "group_high_level",
++            "run_order": 1,
++            "variant_postfixes": [
++                "",
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "Frames"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_alu2",
++            "group_name": "group_low_level",
++            "run_order": 0,
++            "variant_postfixes": [
++                "",
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "Frames"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_driver2",
++            "group_name": "group_low_level",
++            "run_order": 0,
++            "variant_postfixes": [
++                "",
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "Frames"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_fill2",
++            "group_name": "group_low_level",
++            "run_order": 0,
++            "variant_postfixes": [
++                "",
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "",
++                    "unit": "MTexel/s"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_manhattan31_battery",
++            "group_name": "group_battery",
++            "run_order": 3,
++            "variant_postfixes": [
++                ""
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [
++                "battery",
++                "runalone"
++            ],
++            "results": [
++                {
++                    "result_postfix": "_performance",
++                    "unit": "Frame"
++                },
++                {
++                    "result_postfix": "_lifetime",
++                    "unit": "min"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_trex_battery",
++            "group_name": "group_battery",
++            "run_order": 3,
++            "variant_postfixes": [
++                ""
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [
++                "battery",
++                "runalone"
++            ],
++            "results": [
++                {
++                    "result_postfix": "_performance",
++                    "unit": "Frame"
++                },
++                {
++                    "result_postfix": "_lifetime",
++                    "unit": "min"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_4_fixed",
++            "group_name": "group_fixed",
++            "run_order": 1,
++            "variant_postfixes": [
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "_fps",
++                    "unit": "Fps"
++                },
++                {
++                    "result_postfix": "_time",
++                    "unit": "msec"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_manhattan31_fixed",
++            "group_name": "group_fixed",
++            "run_order": 1,
++            "variant_postfixes": [
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "_fps",
++                    "unit": "Fps"
++                },
++                {
++                    "result_postfix": "_time",
++                    "unit": "msec"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_manhattan311_fixed",
++            "group_name": "group_fixed",
++            "run_order": 1,
++            "variant_postfixes": [
++                "_wqhd_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "_fps",
++                    "unit": "Fps"
++                },
++                {
++                    "result_postfix": "_time",
++                    "unit": "msec"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_manhattan_fixed",
++            "group_name": "group_fixed",
++            "run_order": 1,
++            "variant_postfixes": [
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "_fps",
++                    "unit": "Fps"
++                },
++                {
++                    "result_postfix": "_time",
++                    "unit": "msec"
++                }
++            ]
++        },
++        {
++            "test_name": "metal_trex_fixed",
++            "group_name": "group_fixed",
++            "run_order": 1,
++            "variant_postfixes": [
++                "_off"
++            ],
++            "minimum_api": [
++                {
++                    "type": "METAL",
++                    "major": 1,
++                    "minor": 0
++                }
++            ],
++            "requirements": [],
++            "results": [
++                {
++                    "result_postfix": "_fps",
++                    "unit": "Fps"
++                },
++                {
++                    "result_postfix": "_time",
++                    "unit": "msec"
++                }
++            ]
++        }
++    ]
++}
+diff --git a/app_ios/src/Common/NUIAppData.h b/app_ios/src/Common/NUIAppData.h
+index 53b378ee..6d1fbc34 100644
+--- a/app_ios/src/Common/NUIAppData.h
++++ b/app_ios/src/Common/NUIAppData.h
+@@ -46,6 +46,8 @@
+ 
+ @property (strong, nonatomic, nonnull) NSMutableDictionary *uiStateCache;
+ @property (strong, nonatomic, nullable) NSString *loginName;
++// Initialization may finish before the loading controller appears.
++@property (assign, atomic) BOOL serviceReady;
+ 
+ - (void)addNewAlert:(nonnull UIAlertController *)alert;
+ - (nonnull UIAlertController *)getAlert;
+diff --git a/app_ios/src/Common/NUIAppData.mm b/app_ios/src/Common/NUIAppData.mm
+index 3bfa75b2..20e5eedf 100644
+--- a/app_ios/src/Common/NUIAppData.mm
++++ b/app_ios/src/Common/NUIAppData.mm
+@@ -424,6 +424,7 @@ namespace {
+ }
+ 
+ - (void) initFinished {
++    self.serviceReady = YES;
+ 
+     [UIApplication sharedApplication].idleTimerDisabled = NO;
+ 
+@@ -464,6 +465,7 @@ namespace {
+ 
+ - (void)Startup
+ {
++    self.serviceReady = NO;
+     dispatch_async(dispatch_get_main_queue(),
+                    ^{
+                        [UIApplication sharedApplication].idleTimerDisabled = YES;
+diff --git a/app_ios/src/Pages/NUILoadingViewController.mm b/app_ios/src/Pages/NUILoadingViewController.mm
+index 19eb7302..164ad28c 100644
+--- a/app_ios/src/Pages/NUILoadingViewController.mm
++++ b/app_ios/src/Pages/NUILoadingViewController.mm
+@@ -15,6 +15,7 @@
+ @interface NUILoadingViewController ()
+ 
+ @property (assign, nonatomic) BOOL done;
++@property (assign, nonatomic) BOOL leavingLoading;
+ @property (strong, nonatomic) NSMutableArray *alertViews;
+ 
+ @end
+@@ -83,6 +84,12 @@
+     [[NSNotificationCenter defaultCenter] removeObserver:self];
+ }
+ 
++- (void)viewDidAppear:(BOOL)animated
++{
++    [super viewDidAppear:animated];
++    if ([NUIAppData sharedNUIAppData].serviceReady) [self fadeOut];
++}
++
+ - (void)dealloc
+ {
+     [[NSNotificationCenter defaultCenter] removeObserver:self];
+@@ -153,8 +160,10 @@
+ {
+     self.done = true;
+ 
+-    if(self.presentedViewController == nil)
++    if(self.isViewLoaded && self.view.window != nil && self.presentedViewController == nil && !self.leavingLoading) {
++        self.leavingLoading = YES;
+         [self performSegueWithIdentifier:@"ShowMainViewSegue" sender:self];
++    }
+ }
+ 
+ 

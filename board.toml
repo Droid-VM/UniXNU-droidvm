@@ -109,7 +109,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "8e8dc1bee753d231c5bcc81fb46b41bcf34102a8cab2620456eda5da81698cf9",
+  "4cfe75e276af2ca169198a161f19df4f5ba022d5fb7a3773f0a5c60415a78fd0",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -131,6 +131,9 @@ kernel_args = [
   "offline-legacy-validate=1",
   "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1",
+  # NativeLegacyDisplay defaults to sheng-early-retire=0: retain each swap until display DMA completes.
+  # Omit the duplicate bootarg to keep the full boot command below DarwinBoot's 1024-byte buffer.
+
   "offline-hid-input=1",
   "offline-hid-home=1",
   "sheng-touch-hid=1",
@@ -202,7 +205,7 @@ kernel_args = [
   # The kernel's grant and the plugin take the same forms (UniXNU patch zzw, build-adreno-metal-plugin.py). Maps is not one: VectorKit
   # lost its device (DeviceLost) within seconds, and the render server's frames were wedged until a reboot; without one its map is
   # blank but the app runs
-  "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,com.apple.WebKit.*,Preferences",
+  "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,com.apple.WebKit.*,Preferences,MetalCheck,app_ios",
 ]
 
 [payload.adt]

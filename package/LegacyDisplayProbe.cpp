@@ -13,6 +13,7 @@
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
 #include <machine/machine_routines.h>
+#include "DroidVMVirtioGpu.h"
 extern "C" kmod_info_t g_kernel_kmod_info;
 extern "C" void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
 extern "C" IOService *native_legacy_display_allocate(void);
@@ -160,6 +161,7 @@ volatile uint32_t native_legacy_frame_time[NATIVE_LEGACY_FRAMES];
 volatile uint64_t native_legacy_frame_stats[NATIVE_LEGACY_FRAMES][5];
 static uint64_t frameEpoch;
 void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uint64_t miny,uint64_t maxx,uint64_t maxy) {
+    if(kind<2)droidvm_virtio_gpu_boot_dirty();
     uint32_t n=native_legacy_frame_count;
     uint64_t now,frequency;
     __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(now));__asm__ volatile("mrs %0, cntfrq_el0":"=r"(frequency));
@@ -252,6 +254,7 @@ __attribute__((noinline)) void native_legacy_transfer_observed(IOReturn status,c
     }
 }
 bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
+    if(droidvm_virtio_gpu_offer(display,memory,stride,width,height))return true;
     return gpuHandoffPresenter && native_gop_gpu_offer(gpuHandoffPresenter,display,memory,stride,width,height);
 }
 void native_legacy_gpu_fallback_observed(int status) {
@@ -484,6 +487,7 @@ extern void native_touch_probe(void);
 extern void sheng_cpufreq_probe(void);
 extern void sheng_gpu_power_probe(void);
 void native_legacy_display_late_probe(void) {
+    droidvm_virtio_gpu_display_start();
     native_keystore_probe();
     sheng_cpufreq_probe();
     sheng_gpu_power_probe();

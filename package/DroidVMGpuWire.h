@@ -32,6 +32,11 @@ enum {
     DROIDVM_GPU_OP_TICKS = 8,
     DROIDVM_GPU_OP_CLIENT = 9,            /* a client slot's next user starts with a fresh KGSL context */
     DROIDVM_GPU_MAX_CLIENTS = 32,
+    /* Optional OP_INFO query: legacy hosts return their unchanged 64-byte INFO. */
+    DROIDVM_GPU_INFO_MAGIC = 0x58504744,   /* little-endian "DGPX" */
+    DROIDVM_GPU_INFO_CAPABILITIES = 1,
+    DROIDVM_GPU_EXTENSION_VERSION = 1,
+    DROIDVM_GPU_CAP_RETIRED_LOST_MASK = 1,
 
     DROIDVM_GPU_BIND = 1,                 /* KGSL_GPUMEM_RANGE_OP_BIND */
     DROIDVM_GPU_UNBIND = 2,               /* KGSL_GPUMEM_RANGE_OP_UNBIND */
@@ -66,6 +71,12 @@ struct droidvm_gpu_range {
     uint64_t address;                     /* guest physical, 4 KiB aligned */
     uint64_t bytes;                       /* 4 KiB multiple */
 };
+struct droidvm_gpu_info_query {
+    uint32_t magic, kind, version, reserved;
+};
+struct droidvm_gpu_capabilities {
+    uint32_t magic, version, capabilities, max_clients;
+};
 struct droidvm_gpu_import {               /* OP_IMPORT request, followed by `count` ranges */
     uint32_t count;
     uint32_t flags;                       /* DROIDVM_GPU_IMPORT_* */
@@ -99,9 +110,9 @@ struct droidvm_gpu_client_reset {         /* OP_CLIENT request */
     uint32_t client;                      /* < DROIDVM_GPU_MAX_CLIENTS */
     uint32_t reserved;
 };
-struct droidvm_gpu_timestamp {            /* OP_RETIRED reply; OP_WAIT request (timeout in milliseconds) */
+struct droidvm_gpu_timestamp {            /* OP_RETIRED reply; OP_WAIT request */
     uint32_t timestamp;
-    uint32_t timeout_ms;
+    uint32_t timeout_ms;                  /* WAIT: milliseconds; RETIRED with capability: sticky lost-client mask */
 };
 struct droidvm_gpu_ticks {                /* OP_TICKS reply: the host's 19.2 MHz counter */
     uint64_t ticks;
@@ -109,6 +120,7 @@ struct droidvm_gpu_ticks {                /* OP_TICKS reply: the host's 19.2 MHz
 
 #if defined(__cplusplus)
 static_assert(sizeof(droidvm_gpu_info) == 64, "wire info");
+static_assert(sizeof(droidvm_gpu_info_query) == 16 && sizeof(droidvm_gpu_capabilities) == 16, "wire extensions");
 static_assert(sizeof(droidvm_gpu_range) == 16 && sizeof(droidvm_gpu_import) == 8, "wire import");
 static_assert(sizeof(droidvm_gpu_import_reply) == 16 && sizeof(droidvm_gpu_bind) == 32, "wire bind");
 static_assert(sizeof(droidvm_gpu_ib) == 16 && sizeof(droidvm_gpu_submit) == 8, "wire submit");

@@ -64,19 +64,51 @@ publish = publish.replace(anchor, anchor + '/* DroidVM: the clients\' windows st
                           'extern "C" uint64_t droidvm_gpu_window_base(void);\n'
                           '/* DroidVM: the host gives each slot a KGSL context of its own (DroidVMGpu.cpp). */\n'
                           'extern "C" volatile uint32_t droidvm_gpu_client;\n'
-                          'extern "C" void droidvm_gpu_client_opened(uint32_t slot);\n')
+                          'extern "C" IOReturn droidvm_gpu_client_opened(uint32_t slot);\n'
+                          'extern "C" IOReturn droidvm_gpu_client_health(uint32_t slot,bool refresh);\n')
 # Each slot has a KGSL context of its own on the host, so a client whose commands fault loses its own GPU, not the render server's
 # (Maps' VectorKit once took the whole display down): every call into a connection's core says whose it is (under g.lock, as all
 # dispatch is), and a slot's new user gets a fresh context.
 dispatch = 'connection->live_?connection->core_->dispatch('
 if publish.count(dispatch) != 2:
     sys.exit('NativeAdrenoPublish.cpp no longer dispatches to a connection\'s core in exactly two places')
-publish = publish.replace(dispatch, 'connection->live_?(droidvm_gpu_client=connection->slot_<NativeAdrenoMaxClients?connection->slot_:0u,'
-                          'connection->core_)->dispatch(')
-mounted = '            if(kernel)g.kernel_client=true;else g.slots[slot]=true;\n'
-if publish.count(mounted) != 1:
-    sys.exit('NativeAdrenoPublish.cpp no longer marks a mounted slot exactly once')
-publish = publish.replace(mounted, mounted + '            if(!kernel)droidvm_gpu_client_opened(slot);\n')
+publish = publish.replace(dispatch, 'connection->live_?connection->dispatchDroidVM(')
+# Global retirement includes cancelled jobs so releaseAll can reclaim their references.
+# Only the external connection boundary turns cancellation into device loss. In particular,
+# both WaitFence dispatch sites (including the mailbox) must check the mask AFTER the core's
+# poll, since that very poll can discover a host reset. No new GPU fence or wait is inserted.
+slot_field = '    unsigned slot_=NativeAdrenoMaxClients;\n'
+if publish.count(slot_field) != 1:
+    sys.exit('NativeAdrenoPublish.cpp slot field changed')
+publish = publish.replace(slot_field, slot_field + '''    IOReturn dispatchDroidVM(uint32_t method,const void *input,size_t input_size,
+        void *output,size_t output_size,const NativeAdrenoRingClock *clock) {
+        droidvm_gpu_client=slot_<NativeAdrenoMaxClients?slot_:0u;
+        if(!kernel_ && method==NativeAdrenoMethodGetStatus) {
+            if(input_size || !output || output_size!=sizeof(NativeAdrenoAbiStatus))return kIOReturnBadArgument;
+            const IOReturn health=droidvm_gpu_client_health(slot_,true);
+            if(health && health!=kIOReturnAborted)return health;
+            auto *reply=static_cast<NativeAdrenoAbiStatus *>(output);
+            reply->faults=health==kIOReturnAborted?1:0;reply->suspends=0;
+            return kIOReturnSuccess;
+        }
+        if(!kernel_ && (method==NativeAdrenoMethodWaitFence || method==NativeAdrenoMethodSubmit)) {
+            const IOReturn health=droidvm_gpu_client_health(slot_,false);
+            if(health)return health;
+        }
+        const IOReturn result=core_->dispatch(method,input,input_size,output,output_size,clock);
+        if(!kernel_ && method==NativeAdrenoMethodWaitFence) {
+            const IOReturn health=droidvm_gpu_client_health(slot_,false);
+            if(health)return health;
+        }
+        return result;
+    }
+''')
+scoped_line = next((line for line in publish.splitlines(keepends=True)
+                    if 'const IOReturn scoped=kernel?core->setScope(' in line), None)
+if not scoped_line or publish.count(scoped_line) != 1:
+    sys.exit('NativeAdrenoPublish.cpp scope/reset anchor changed')
+publish = publish.replace(scoped_line, scoped_line.replace('const IOReturn scoped=', 'IOReturn scoped=') +
+                          '        if(!scoped && !kernel)scoped=droidvm_gpu_client_opened(slot);\n')
 # 32 connections instead of NativeAdreno's four: the render server, the widget renderer, the app icons and Settings take four,
 # PosterBoard and each running wallpaper poster extension one each (*Poster*: the gallery runs several at once), WebKit's GPU and
 # WebContent processes (com.apple.WebKit.*) more, and an app that draws with Metal itself one each; ten were taken in normal use.

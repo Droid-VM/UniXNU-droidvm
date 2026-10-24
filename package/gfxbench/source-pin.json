@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/Kishonti-Opensource/gfxbench.git",
+  "revision": "89aa956f43836798d1eaaab8ec32d3dc8b02eead",
+  "product": "GFXBench Metal",
+  "product_id": "gfxbench_metal",
+  "version": "5.0.0",
+  "compatibility_patch": "compat.patch",
+  "compatibility_patch_sha256": "f79c92798f54212851fbcd0a88ad3e6fe7dfc964752c70991f71fad255fbb9bf"
+}

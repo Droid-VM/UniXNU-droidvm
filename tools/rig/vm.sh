@@ -102,6 +102,18 @@ ipc() {
   python3 "$IPC" "$port" "$token" "$@"
 }
 
+# A unique shim mailbox pair identifies this boot even when the console ring wraps. Never
+# accept an earlier boot's handoff while the newest firmware is still running or has refused XNU.
+handoff_ready() {
+  python3 - "$RIG_OUT/console.txt" "$1" <<'PYREADY'
+import re, sys
+text = open(sys.argv[1]).read().rsplit('SHIM: payload', 1)[-1]
+marker = re.search(r'SHIM: rm tx[^\n]+', text)
+sys.exit(0 if marker and marker[0] != sys.argv[2] and
+         'DARWINBOOT: ARM64 va=' in text and 'DARWINBOOT: video base=' in text else 1)
+PYREADY
+}
+
 start() {
   local wait=${1:-240} pid="" frames=""
   [ -z "$(crosvm_pid)" ] || { echo "a UniXNU crosvm is already running"; return 1; }
@@ -112,7 +124,7 @@ start() {
   # The console keeps earlier boots' output (the clear above does not reach it), so the hand-off below is the first one past these.
   local port token before
   port=$($A shell "su -c 'cat $RUN/droidvmd-port.txt'" | tr -dc 0-9); token=$($A shell "su -c 'cat $RUN/droidvmd-token.txt'" | tr -dc 0-9a-f)
-  before=$(python3 "$RIG/console.py" "$port" "$token" "$VM" serial1 2>/dev/null | grep -ao 'DARWINBOOT: video base' | wc -l)
+  before=$(python3 "$RIG/console.py" "$port" "$token" "$VM" serial1 2>/dev/null | grep -a 'SHIM: rm tx' | tail -1)
   for attempt in 1 2 3; do
     ipc vm_start "{\"vm_id\":\"$VM\"}" >/dev/null 2>&1
     for i in $(seq 1 10); do pid=$(crosvm_pid); [ -n "$pid" ] && break; sleep 1; done
@@ -124,12 +136,16 @@ start() {
   for i in $(seq 1 30); do
     port=$($A shell "su -c 'cat $RUN/droidvmd-port.txt'" | tr -dc 0-9); token=$($A shell "su -c 'cat $RUN/droidvmd-token.txt'" | tr -dc 0-9a-f)
     python3 "$RIG/console.py" "$port" "$token" "$VM" serial1 > "$RIG_OUT/console.txt" 2>/dev/null
-    [ "$(grep -ao 'DARWINBOOT: video base' "$RIG_OUT/console.txt" | wc -l)" -gt "$before" ] && break
+    handoff_ready "$before" && break
     sleep 2
   done
+  if ! handoff_ready "$before"; then
+    echo "no new DarwinBoot hand-off; inspect out/console.txt (kernel probes would use stale addresses)"
+    return 1
+  fi
   python3 - "$RIG_OUT/console.txt" <<'PY'
 import os, re, sys
-text = open(sys.argv[1]).read()
+text = open(sys.argv[1]).read().rsplit('SHIM: payload', 1)[-1]
 arm = re.findall(r'DARWINBOOT: ARM64 va=0x([0-9A-F]+) pa=0x([0-9A-F]+)', text)
 video = re.findall(r'DARWINBOOT: video base=0x([0-9A-F]+) display=\d+ row=(\d+) width=(\d+) height=(\d+)', text)
 if arm and video:

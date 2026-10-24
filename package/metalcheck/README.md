@@ -1,0 +1,88 @@
+# Metal Check
+
+Metal Check is a fixed, deterministic correctness probe for selected public Metal 2.3 APIs and the framebuffer rotation SPI used by the compositor. Each case checks results against CPU-computed bytes, values, or pixels. It is not a complete Metal conformance suite.
+
+## Correctness cases
+
+| # | Case |
+|---:|---|
+| 1 | shared buffer contents read/write |
+| 2 | blit fill partial range and guards |
+| 3 | shared-private-shared copy with offsets |
+| 4 | affine compute dispatchThreads |
+| 5 | affine compute dispatchThreadgroups |
+| 6 | affine compute indirect dispatch with GPU-written arguments at byte offset 16 |
+| 7 | RGBA8 replaceRegion/getBytes padded rows |
+| 8 | buffer-texture-buffer blit offsets/stride/guards |
+| 9 | texture-to-texture region copy |
+| 10 | private RGBA8 clear/readback |
+| 11 | fullscreen triangle vertex_id and fragment |
+| 12 | vertex descriptor indexed quad |
+| 13 | instanced left/right quads |
+| 14 | alpha blend red over blue |
+| 15 | scissor rectangle |
+| 16 | depth less ordering |
+| 17 | stencil replace/equal mask |
+| 18 | multiple render targets |
+| 19 | 4x MSAA resolve to mip 1, slice 1 |
+| 20 | nearest 2x2 texture sampling |
+| 21 | uniform mipmap generation |
+| 22 | texture view nonzero mip/slice |
+| 23 | compute atomic add |
+| 24 | threadgroup sum |
+| 25 | function constant scales 2 and 3 |
+| 26 | MTLFence encoder dependency |
+| 27 | MTLSharedEvent cross-queue dependency |
+| 28 | IOSurface BGRA render/readback |
+| 29 | IOSurface framebuffer rotation SPI: four rotations, non-square plane, four quadrant CPU pixel oracle |
+
+Only case 19 is optional: it may report `SKIP` when `supportsTextureSampleCount:4` is false. Every other case is required; an unexpected `SKIP`, missing resource or pipeline, command error, or oracle mismatch is a `FAIL`.
+
+## Build and run
+
+From this device repository, set `TREE_ROOT` to the build tree. The script builds the iOS UI app and macOS CLI, plus their offline Metal libraries:
+
+```sh
+TREE_ROOT=/path/to/tree
+python3 scripts/build-droidvm-metalcheck.py "$TREE_ROOT"
+```
+
+Run the host CLI and save a correctness-plus-performance report:
+
+```sh
+"$TREE_ROOT/build/metalcheck/host/metalcheck" --cli \
+  --library "$TREE_ROOT/build/metalcheck/host/default.metallib" \
+  --output "$TREE_ROOT/out/metalcheck/host-baseline.json" \
+  --benchmark
+```
+
+The iOS UI build output is `$TREE_ROOT/build/metalcheck/MetalCheck.app`. Its source defines **Correctness**, **Correctness + Performance**, and a five-minute **GPU Stress** action with 0/128/256 MiB memory choices and a stop-after-current-round control. The guest UI has been launched and its Correctness + Performance action passes all 28 cases and three workloads (`out/metalcheck/ui-performance.json` in the active rig). With the current no-container signing, it saves `/private/var/mobile/Documents/MetalCheck/latest.json`.
+
+The enhanced guest run at `../../../droidvm/out/metalcheck-guest-enhanced/report.json` has 28 `PASS`, 0 `FAIL`, and 0 `SKIP`; its render, compute, and blit benchmark workloads pass, and the rig observed no guest GPU loss. The enhanced Mac M4 host correctness-and-benchmark baseline and the 15-second, 128-MiB host stress run also pass (`../../../droidvm/out/metalcheck/host-enhanced-baseline.json` and `../../../droidvm/out/metalcheck/host-stress.json`). The first five-minute guest run passed nine rounds in 303.98 seconds with 128 MiB extra resident buffers (`../../../droidvm/out/metalcheck-guest-stress-300s/report.json`), with no new GPU loss or display error/timeout. It included UI activity and an explicit SpringBoard restart while diagnosing app installation, so it is not an isolated performance baseline. After caching buffer length outside the byte-check loop, the deployed version passed 20 API/validation rounds in 301.76 seconds. However, that run retained stale Metal Check screen content during Home/GFXBench transitions and showed text corruption despite zero GPU-loss counters. Its reviewed overall result is FAIL (`out/metalcheck-guest-stress-final/report.json`); the original API/counter result is retained as `report-automated.json`. These probes do not validate the compositor or final displayed pixels. The UI Stop button was also verified: three completed rounds followed by CANCELLED, not PASS (`out/metalcheck/ui-stress-stop.json`).
+
+The rotation fix has since passed all **29 correctness cases and all three workloads on both Mac and guest** (`out/rotation-fix/host-rotation.json` and `out/rotation-fix/after/report.json` in the active rig). The old guest plugin failed case 29 with an IOSurface bounds error; the new plugin passes its four-rotation pixel oracle. This confirms the bridge fix, while post-fix compositor and stress visual acceptance remain pending.
+
+## Benchmark scope
+
+The three fixed workloads submit for two seconds each: 512×512 render, 1M-float compute, and 16 MiB blit. Each uses at most three in-flight command buffers with a separate slot per output. Warmup and pipeline setup are outside the timed window; every queue is drained, then each slot's output is validated before the workload receives a score. A failed command buffer or output check yields `FAIL` with no valid score.
+
+## Stress mode
+
+The CLI accepts `--stress-seconds 1..86400` and `--memory-mib 0..512` (default `128`). Stress first runs all required correctness cases; if any fail, stress is not run. Each stress round runs render, compute, and blit workloads, with a two-second timed window for each and at most three in-flight command buffers. Setup and output verification are outside the timed windows. The run validates workload outputs and every byte in its extra resident buffers, and records process memory for each round. Stress scores are per-round rates under load, not an isolated performance baseline.
+
+The suite does not cover argument buffers, indirect command buffers (ICB), sparse textures, ray tracing, mesh shaders, tessellation, function pointers and dynamic linking, heaps and aliasing, or counter sampling and performance counters. Passing these probes does not establish complete Metal conformance.
+
+## Install on the current guest
+
+After signing, adding the new CDHash to the owner trust bundle, and booting that trust bundle, stage the app under `/private/var/ngpu/apps/MetalCheck.app`, then use the trusted owner helper:
+
+```sh
+lsdiag -c owner-install /private/var/ngpu/apps/MetalCheck.app
+lsdiag -c -u 501 owner-register /private/var/ngpu/apps/MetalCheck.app
+lsdiag -c -u 501 app org.droidvm.metalcheck
+lsdiag -c -u 501 launch org.droidvm.metalcheck
+```
+
+Unlock the guest before `launch`. `owner-install` moves the app into a real MCM bundle container and leaves the original path as a CLI symlink. It creates the data container without changing the signed no-container entitlement. It refuses an existing destination and does not modify MCM's container-root metadata. For a later update, stop the app, preserve a backup, and use the entitled `lsdiag copy` helper to replace its files in the existing bundle container, then register the updated path. Ordinary root toybox writes are still blocked by the bundle data vault. The installation helper does not add code to the kernel trust cache.
+
+Running directly from `ngpu/apps` works for the owner CLI but the system blocks UI execution and icon reads at that location. A successful LaunchServices record alone does not prove an app can launch.
