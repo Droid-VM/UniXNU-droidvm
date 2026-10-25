@@ -273,6 +273,9 @@ IOReturn getParam(const droidvm_virtgpu_getparam &in, droidvm_virtgpu_getparam_r
     case DROIDVM_VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS: queryCapsets(); out.value = gCapsetMask; break;
     case DROIDVM_VIRTGPU_PARAM_CREATE_GUEST_HANDLE: out.value = (features() & (1u << 6)) != 0; break;
     case DROIDVM_VIRTGPU_PARAM_ABI_VERSION: out.value = DROIDVM_VIRTGPU_ABI_VERSION; break;
+    case DROIDVM_VIRTGPU_PARAM_DEFAULT_3D: {
+        unsigned on = 0; PE_parse_boot_argn("vgpu-3d", &on, sizeof on); out.value = on != 0; break;
+    }
     default: return kIOReturnUnsupported;
     }
     return kIOReturnSuccess;
@@ -330,6 +333,21 @@ IOMemoryDescriptor *guestPages(uint64_t bytes) {
     IODelete(chunks, IOMemoryDescriptor *, most);
     return pages;
 }
+// A client's own pages for CREATE_BLOB_USER, wired, as NativeAdreno imports them (NativeAdrenoMemory.cpp importRange): through a
+// memory entry of their own (kIOMemoryPersistent), so the owner may unmap its range while the GPU still uses it, and read-only where
+// the owner's mapping cannot be written (a mapped file, constant data; Metal only reads no-copy buffers over such memory).
+IOMemoryDescriptor *userPages(task_t task, uint64_t address, uint64_t bytes) {
+    const IODirection directions[] = {kIODirectionInOut, kIODirectionOut};
+    for (IODirection direction : directions) {
+        const IOOptionBits options = IOOptionBits(direction) | IOOptionBits(kIOMemoryMapperNone);
+        IOMemoryDescriptor *pages = IOMemoryDescriptor::withAddressRange(address, bytes, options | kIOMemoryPersistent, task);
+        if (!pages) pages = IOMemoryDescriptor::withAddressRange(address, bytes, options, task);
+        if (!pages) continue;
+        if (pages->prepare() == kIOReturnSuccess) return pages;
+        pages->release();
+    }
+    return nullptr;
+}
 // The size of the last guest blob whose pages or entries ran out, for peek.py.
 volatile uint64_t droidvm_virtgpu_last_blob_refused;
 // A blob: the host's (HOST3D), guest memory the kernel allocates (HOST3D_GUEST), or with `user` the caller's own pages at that
@@ -357,9 +375,8 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
         const uint64_t bytes = (in.size + 4095) & ~uint64_t(4095);
         if (user) {
             if ((user & 4095) || bytes != in.size) return kIOReturnBadArgument;
-            r.pages = IOMemoryDescriptor::withAddressRange(user, bytes, kIODirectionInOut, task);
-            if (!r.pages) return kIOReturnNoMemory;
-            if (r.pages->prepare() != kIOReturnSuccess) { r.pages->release(); return kIOReturnVMError; }
+            r.pages = userPages(task, user, bytes);
+            if (!r.pages) return kIOReturnVMError;
             r.wired = true;
         } else {
             r.pages = guestPages(bytes);

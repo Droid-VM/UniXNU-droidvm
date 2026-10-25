@@ -111,7 +111,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "3d6c47ee6a99f1a52aacf06ad60e90a7a7f3687f4382d77a35ab0b0cf14847d6",
+  "c702fe11395fdde59b7abf83834446247569480925b693bbb8a98d3390ca51e8",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -191,7 +191,9 @@ kernel_args = [
   # the host phone's GPU through crosvm --droidvm-gpu (kits/droidvm/DroidVMGpu.cpp): NativeAdreno's service over KGSL
   # (droidvm-gpu-selftest=1 first runs one CP_MEM_WRITE through it; left out, the command line is at its 1000-byte limit)
   "droidvm-gpu=1",
-  "vgpu-selftest=1",
+  # Metal's 3D through the virtio GPU's DRM context (drm2kgsl) by default, droidvm-gpu still there: turnip asks the kernel
+  # (package/DroidVMVirtioGpu3D.cpp, DROIDVM_VIRTGPU_PARAM_DEFAULT_3D); TU_DARWIN_VIRTGPU=0 or 1 in a process overrides it
+  "vgpu-3d=1",
   # the AGXAccelerator for the original Metal discovery, and the plugin bundle (staged in the Data seed by add-gpu-plugin-data.py)
   # mounted over /System/Library/Extensions
   "droidvm-gpu-metal=1",
