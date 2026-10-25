@@ -8,7 +8,7 @@ adb -s "$PHONE" push phone-hostmem.sh /data/local/tmp/hostmem.sh >/dev/null || e
 for t in "$@"; do
   ./gfx-suite.sh "$t" 2>&1 | grep -v 'Bad substitution'
   sleep 5
-  h=$(timeout 60 adb -s "$PHONE" shell su -c 'sh /data/local/tmp/hostmem.sh' 2>/dev/null | grep -E 'dmabuf fds|kgsl mapped|MemAvailable' | tr -s ' ' | tr '\n' ' ')
+  h=$(timeout 60 adb -s "$PHONE" shell su -c 'sh /data/local/tmp/hostmem.sh' 2>/dev/null | grep -E 'dmabuf fds|kgsl mapped|MemAvailable|cpufreq policy7' | tr -s ' ' | tr '\n' ' ')
   g=$(timeout 60 python3 -c "
 import sys, struct; sys.path.insert(0, '.'); import rigenv, peek
 pa, d = peek.read('droidvm_virtgpu_closes', 32); print('closes', struct.unpack('<4Q', d))" 2>&1 | tail -1)

@@ -111,7 +111,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "0fea0af0563391c8c2c2b3c39b4f6c26eef433f6b391e325a22a1ecfaf0c89d8",
+  "32c09a830b96e68a2f289cac10504598163f3ae83c02878fd0a2b78c54a69674",
 ]
 kernel_args = [
   "debug=0x14e",

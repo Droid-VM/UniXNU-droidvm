@@ -17,3 +17,6 @@ cat /sys/class/kgsl/kgsl/mapped 2>/dev/null | sed 's/^/kgsl mapped /'
 cat /sys/class/kgsl/kgsl/secure 2>/dev/null | sed 's/^/kgsl secure /'
 for z in /sys/class/thermal/thermal_zone*; do t=$(cat $z/type); case $t in gpuss-0|cpu-0-0-0|skin-msm-therm) echo "$t $(cat $z/temp)";; esac; done
 cat /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null
+# The CPU limits the vendor's power daemons set (scaling_max_freq, kHz) against the hardware's: OPLUS capped the big cores at
+# 1.7 of 3.3 GHz with the screen on, which halves a CPU-bound guest benchmark.
+for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "cpufreq ${p##*/} max $(cat $p/scaling_max_freq) of $(cat $p/cpuinfo_max_freq)"; done
