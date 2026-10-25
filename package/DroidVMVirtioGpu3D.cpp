@@ -147,6 +147,7 @@ void selftest3D() {
 // A client's lock serializes its methods (a Metal device's threads share one connection); a fence wait sleeps without it.
 #include "DroidVMVirtgpuABI.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOMultiMemoryDescriptor.h>
 extern "C" void proc_selfname(char *, int);
 extern "C" {
 // clients now, contexts made, blobs made, maps made, submissions, fenced submissions, fence waits that timed out, refusals
@@ -162,7 +163,7 @@ struct Resource {
     uint32_t handle, id;
     uint64_t size;
     bool hostVisible;
-    IOBufferMemoryDescriptor *pages;   // a guest blob's own pages
+    IOMemoryDescriptor *pages;         // a guest blob's own pages
     IOMemoryDescriptor *window;        // a host blob's range of the pool, once mapped
     IOMemoryMap *map;                  // in the client's task
 };
@@ -298,6 +299,33 @@ IOReturn contextInit(Client *c, const droidvm_virtgpu_context_init &in, droidvm_
     c->context = context; c->rings = in.num_rings; out.context_id = context; count(1);
     return kIOReturnSuccess;
 }
+// A guest blob's pages: wired and zeroed, physically contiguous in chunks of at most ContiguousLimit (halved down to 64 KiB
+// while an allocation fails), so a blob of any size the host is told about in few entries (one per page refused blobs above
+// 16 MiB). Several chunks become one IOMultiMemoryDescriptor.
+IOMemoryDescriptor *guestPages(uint64_t bytes) {
+    const uint32_t most = uint32_t((bytes + 0xffff) >> 16);
+    IOMemoryDescriptor **chunks = IONew(IOMemoryDescriptor *, most);
+    if (!chunks) return nullptr;
+    uint32_t count = 0; uint64_t chunk = ContiguousLimit, offset = 0;
+    while (offset < bytes) {
+        const uint64_t length = bytes - offset < chunk ? bytes - offset : chunk;
+        IOBufferMemoryDescriptor *piece = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+            IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), length, ~uint64_t(4095));
+        if (!piece && chunk > 0x10000) { chunk >>= 1; continue; }
+        if (!piece || count == most) { if (piece) piece->release(); break; }
+        bzero(piece->getBytesNoCopy(), length);
+        chunks[count++] = piece; offset += length;
+    }
+    IOMemoryDescriptor *pages = nullptr;
+    if (offset == bytes)
+        pages = count == 1 ? chunks[0] : IOMultiMemoryDescriptor::withDescriptors(chunks, count, kIODirectionInOut, false);
+    if (count == 1 && pages == chunks[0]) chunks[0] = nullptr;
+    for (uint32_t i = 0; i < count; ++i) if (chunks[i]) chunks[i]->release();
+    IODelete(chunks, IOMemoryDescriptor *, most);
+    return pages;
+}
+// The size of the last guest blob whose pages or entries ran out, for peek.py.
+volatile uint64_t droidvm_virtgpu_last_blob_refused;
 IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint8_t *ccmd, droidvm_virtgpu_create_blob_reply &out) {
     if (!c->context) return kIOReturnNotReady;
     const bool guest = in.blob_mem == DROIDVM_VIRTGPU_BLOB_MEM_HOST3D_GUEST;
@@ -316,14 +344,10 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
     Resource r = {}; r.handle = c->nextHandle++; r.id = resourceId(); r.size = in.size; r.hostVisible = !guest;
     Entry *entries = nullptr; uint32_t entryCount = 0;
     if (guest) {
-        // Guest memory the host imports (a pseudo-unprotected VM shares all of its RAM): wired pages, contiguous when small.
+        // Guest memory the host imports (a pseudo-unprotected VM shares all of its RAM).
         const uint64_t bytes = (in.size + 4095) & ~uint64_t(4095);
-        if (bytes <= ContiguousLimit)
-            r.pages = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous),
-                                                                      bytes, ~uint64_t(4095));
-        if (!r.pages) r.pages = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, bytes, 4096);
-        if (!r.pages) return kIOReturnNoMemory;
-        bzero(r.pages->getBytesNoCopy(), bytes);
+        r.pages = guestPages(bytes);
+        if (!r.pages) { droidvm_virtgpu_last_blob_refused = bytes; return kIOReturnNoMemory; }
         entries = IONewData(Entry, MaxBlobEntries);
         if (!entries) { r.pages->release(); return kIOReturnNoMemory; }
         for (uint64_t offset = 0; offset < bytes;) {
@@ -333,7 +357,7 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
             if (length > bytes - offset) length = bytes - offset;
             if (entryCount && entries[entryCount - 1].address + entries[entryCount - 1].length == physical &&
                 entries[entryCount - 1].length + length <= 0x80000000u) entries[entryCount - 1].length += uint32_t(length);
-            else if (entryCount == MaxBlobEntries) { status = kIOReturnNoResources; break; }
+            else if (entryCount == MaxBlobEntries) { status = kIOReturnNoResources; droidvm_virtgpu_last_blob_refused = bytes; break; }
             else entries[entryCount++] = {physical, uint32_t(length), 0};
             offset += length;
         }
