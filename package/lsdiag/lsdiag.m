@@ -325,7 +325,10 @@ static void registerOwnerApps(NSArray<NSString *> *paths) {
         if (!entitlements || !dataContainer) { line(@"owner-register %@: missing signed entitlements or data container", input); continue; }
         item[@"Entitlements"] = entitlements;
         item[@"Container"] = dataContainer.path;
-        [item addEntriesFromDictionary:@{@"ApplicationType": @"System", @"CodeInfoIdentifier": identifier,
+        // User, as an app in an MCM bundle container is: SpringBoard tags a System app hidden unless its bundle identifier is in
+        // the default icon state (-[SBApplicationInfo _configureTags:hasVisibilityOverride:]), so a System registration put no
+        // icon on the home screen or in the App Library.
+        [item addEntriesFromDictionary:@{@"ApplicationType": @"User", @"CodeInfoIdentifier": identifier,
             @"Path": path, @"CompatibilityState": @0, @"IsContainerized": @(![entitlements[@"com.apple.private.security.no-container"] boolValue]), @"IsDeletable": @NO,
             @"IsAdHocSigned": @YES, @"LSInstallType": @1, @"_LSBundlePlugins": @{}}];
         NSError *error = nil;

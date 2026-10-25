@@ -25,6 +25,11 @@
 //                                       each, the rows that differ and a few pixels; DIR gets each render as raw RGBA (ci-N-metal.rgba,
 //                                       ci-N-software.rgba). CI_ENABLE_FUNCTION_STITCHING=0 takes Core Image's other kernel path
 //
+//   gfxprobe orient N                   tell backboardd the device is held at UIDeviceOrientation N (1 portrait, 2 upside down,
+//                                       3 landscape left, 4 landscape right), as XCTest rotates a device. Tried 2026-10-25 with
+//                                       com.apple.backboard.client: backboardd did not act on it. What keeps the home screen
+//                                       landscape after an app that turns the interface (GFXBench) is iPadOS's rotation lock
+//
 //   gfxprobe virtgpu                    one DRM context through the accelerator's virtgpu methods (DroidVMVirtgpuABI.h), as mesa's
 //                                       vdrm drives them: capset, context, the msm shmem, GET_PARAM ccmds, a guest-alloc BO (GEM_NEW
 //                                       and a HOST3D_GUEST blob) written through its mapping, a fenced NOP waited for, then closed
@@ -319,6 +324,20 @@ static int ciProbe(unsigned size, const char *dir) {
     return worst > 3;
 }
 
+static int setOrientation(long orientation) {
+    void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
+    void (*set)(long) = bbs ? (void (*)(long))dlsym(bbs, "BKSHIDServicesSetDeviceOrientationForAutomation") : NULL;
+    if (!set) {
+        fprintf(stderr, "no BKSHIDServicesSetDeviceOrientationForAutomation\n");
+        return 1;
+    }
+    set(orientation);
+    printf("device orientation %ld sent\n", orientation);
+    // backboardd reads the caller's entitlements after the message arrives: a process gone by then is refused.
+    sleep(2);
+    return 0;
+}
+
 static int compileMetal(const char *sourcePath, const char *outPath, const char *options) {
     void *library = dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_NOW);
     void *(*create)(const char *) = library ? dlsym(library, "MTLCodeGenServiceCreate") : NULL;
@@ -442,6 +461,8 @@ int main(int argc, char **argv) {
             sync();
             return failed;
         }
+        if (argc >= 3 && !strcmp(argv[1], "orient"))
+            return setOrientation(strtol(argv[2], NULL, 0));
         if (argc >= 2 && !strcmp(argv[1], "ci"))
             return ciProbe(argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 64, argc >= 4 ? argv[3] : NULL);
         if (argc >= 2 && !strcmp(argv[1], "virtgpu"))

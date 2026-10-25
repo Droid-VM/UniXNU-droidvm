@@ -30,7 +30,9 @@ subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot',
                 '-I', FORK / 'drivers/NativeAdreno', SOURCE, '-o', binary], check=True)
 entitlements = OUT / 'entitlements.plist'
 # The platform sandbox refuses IOServiceOpen of a user-client class a process is not granted: the surface and GPU clients it opens.
+# com.apple.backboard.client: backboardd takes `gfxprobe orient`'s device orientation only from its clients.
 entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True,
+                                         'com.apple.backboard.client': True,
                                          'com.apple.security.iokit-user-client-class': ['IOSurfaceRootUserClient',
                                                                                         'AGXDeviceUserClient']}))
 subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'org.droidvm.gfxprobe',
