@@ -120,8 +120,11 @@ start() {
   ensure_pool || return 1
   echo "start $(date +%s)" > "$RIG_OUT/vm-request"
   "$RIG/daemon-recover.sh" >/dev/null || { echo "the DroidVM daemon did not come back"; return 1; }
-  ipc vm_console_clear "{\"vm_id\":\"$VM\"}" >/dev/null 2>&1
-  # The console keeps earlier boots' output (the clear above does not reach it), so the hand-off below is the first one past these.
+  # Each stream by name (the daemon refuses a clear without one, and keeps at most ~1 MiB of a stream, then drops what comes after:
+  # crosvm's stderr filled up with earlier boots and lost this boot's GPU errors).
+  local stream
+  for stream in stderr stdio serial1; do ipc vm_console_clear "{\"vm_id\":\"$VM\",\"stream\":\"$stream\"}" >/dev/null 2>&1; done
+  # The console may still hold earlier boots' output, so the hand-off below is the first one past these.
   local port token before
   port=$($A shell "su -c 'cat $RUN/droidvmd-port.txt'" | tr -dc 0-9); token=$($A shell "su -c 'cat $RUN/droidvmd-token.txt'" | tr -dc 0-9a-f)
   before=$(python3 "$RIG/console.py" "$port" "$token" "$VM" serial1 2>/dev/null | grep -a 'SHIM: rm tx' | tail -1)

@@ -4,6 +4,7 @@
 # into the guest's Data (flushed with gfxprobe sync before anything stops the VM: a stop right after a put truncated the binary),
 # then payload-redeploy.sh (new trust, reboot) and check the plugin survived the reboot.
 #   plugin-redeploy.sh        FORK: the local UniXNU fork checkout whose scripts/ and patches/metal2vulkan/ are built
+#   PAYLOAD_TOOLS="gfxprobe lsdiag" plugin-redeploy.sh    also stage those owner tools (rebuilt on the Mac) with the new trust
 # Those are copied to the Mac; anything else the plugin is built from (the NativeMetal submodule above all) must already be there:
 # mac-sync-check.sh refuses the build otherwise.
 set -u
@@ -50,6 +51,7 @@ WANT=$(md5sum out/plugin/NativeAdrenoMetal.bundle/NativeAdrenoMetal | cut -c1-32
 GSSH_TIMEOUT=200 ./guest-ssh.sh "cd $B && for f in $FILES; do /private/var/ngpu/bin/toybox mv -f \$f.new \$f || exit 1; done &&
   /private/var/ngpu/bin/gfxprobe sync $B/NativeAdrenoMetal $B/libvulkan_freedreno.dylib $B/_CodeSignature/CodeResources $B/Info.plist"
 python3 -c "import time; time.sleep(20)"
-./payload-redeploy.sh 2>&1 | tail -4
+# PAYLOAD_TOOLS names owner tools rebuilt with the plugin (payload-redeploy.sh TOOL...): the new trust drops their old CDHashes.
+./payload-redeploy.sh ${PAYLOAD_TOOLS:-} 2>&1 | tail -6
 GOT=$(GSSH_TIMEOUT=100 ./guest-ssh.sh "/private/var/ngpu/bin/toybox md5sum $B/NativeAdrenoMetal" 2>&1 | cut -c1-32)
 [ "$WANT" = "$GOT" ] && echo "plugin persisted $GOT" || echo "PLUGIN MISMATCH: want $WANT got $GOT"
