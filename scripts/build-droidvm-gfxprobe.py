@@ -25,7 +25,7 @@ sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'],
 binary = OUT / 'gfxprobe'
 subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk, '-O2', '-Wall', '-Wextra', '-Werror',
                 '-fno-objc-arc', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface',
-                '-framework', 'QuartzCore', '-framework', 'IOKit', '-framework', 'CoreGraphics',
+                '-framework', 'QuartzCore', '-framework', 'IOKit', '-framework', 'CoreGraphics', '-framework', 'CoreImage',
                 # `gfxprobe virtgpu`: NativeAdreno's virtio-gpu 3D methods (DroidVMVirtgpuABI.h)
                 '-I', FORK / 'drivers/NativeAdreno', SOURCE, '-o', binary], check=True)
 entitlements = OUT / 'entitlements.plist'

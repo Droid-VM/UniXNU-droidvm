@@ -18,6 +18,13 @@
 //   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
 //                                       newLibraryWithSource: does through MTLCompilerService) and write the metallib it returns
 //
+//   gfxprobe ci [SIZE [DIR]]            Core Image on the Metal device against its software renderer: blue over red through a
+//                                       horizontal gradient mask (CIBlendWithAlphaMask, how IconServices lays a graphic icon's glyph
+//                                       over its fill), a Gaussian blur of that, and an icon-like image (rounded rectangle, a glyph)
+//                                       drawn at SIZE and scaled from twice SIZE (Lanczos, affine); the largest channel difference of
+//                                       each, the rows that differ and a few pixels; DIR gets each render as raw RGBA (ci-N-metal.rgba,
+//                                       ci-N-software.rgba). CI_ENABLE_FUNCTION_STITCHING=0 takes Core Image's other kernel path
+//
 //   gfxprobe virtgpu                    one DRM context through the accelerator's virtgpu methods (DroidVMVirtgpuABI.h), as mesa's
 //                                       vdrm drives them: capset, context, the msm shmem, GET_PARAM ccmds, a guest-alloc BO (GEM_NEW
 //                                       and a HOST3D_GUEST blob) written through its mapping, a fenced NOP waited for, then closed
@@ -27,6 +34,7 @@
 // count, bytes per row, allocation and base address, and whether the device made a texture. RB::create_iosurface is not
 // exported: its address is RenderBox's slide (from -[RBDrawable size]) plus its address in the iPadOS 17.7.11 (21H461) cache.
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreImage/CoreImage.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
@@ -213,6 +221,104 @@ static int virtgpuProbe(void) {
 // (NUL-terminated). The reply, to a block called before the request returns, is a header whose u32s at 8 and 12 are its own size and
 // that of the warnings after it, then the metallib (as tinygrad's ops_metal.py drives it on macOS).
 typedef void (^CodeGenReply)(int32_t status, const void *reply, size_t length, const char *message);
+// The largest channel difference of two RGBA8 renders, the rows where they differ (by more than 8), and the pixels at the left,
+// middle and right of the middle row of each.
+static unsigned compareRenders(const char *what, const uint8_t *gpu, const uint8_t *cpu, unsigned size) {
+    unsigned worst = 0, lit = 0, rows = 0, first = size, last = 0;
+    for (unsigned y = 0; y < size; y++) {
+        unsigned row = 0;
+        for (size_t i = (size_t)y * size * 4; i < (size_t)(y + 1) * size * 4; i++) {
+            unsigned d = gpu[i] > cpu[i] ? gpu[i] - cpu[i] : cpu[i] - gpu[i];
+            if (d > row) row = d;
+            lit |= gpu[i];
+        }
+        if (row > worst) worst = row;
+        if (row > 8) {
+            rows++;
+            if (y < first) first = y;
+            last = y;
+        }
+    }
+    printf("%s: largest difference %u%s", what, worst, lit ? "" : " (the Metal render is all zero)");
+    if (rows) printf("; %u rows differ, %u to %u (row 0 is the bottom)", rows, first, last);
+    printf("\n");
+    for (unsigned x = 0; x < size; x += size / 2 ? size / 2 - 1 : 1) {
+        const uint8_t *g = gpu + ((size_t)(size / 2) * size + x) * 4, *c = cpu + ((size_t)(size / 2) * size + x) * 4;
+        printf("  x=%-3u metal %3u %3u %3u %3u   software %3u %3u %3u %3u\n", x, g[0], g[1], g[2], g[3], c[0], c[1], c[2], c[3]);
+    }
+    return worst;
+}
+
+static void writeRender(const char *dir, int index, const char *which, const uint8_t *pixels, unsigned size) {
+    if (!dir) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/ci-%d-%s.rgba", dir, index, which);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(pixels, 4, (size_t)size * size, f);
+    fclose(f);
+}
+
+// An icon-like image of side s: an orange rounded rectangle over white, a white checkerboard "glyph" over that.
+static CIImage *iconImage(CGFloat s) {
+    CGRect r = CGRectMake(0, 0, s, s);
+    CIImage *white = [[CIImage imageWithColor:[CIColor colorWithRed:1 green:1 blue:1]] imageByCroppingToRect:r];
+    CIImage *rounded = [CIFilter filterWithName:@"CIRoundedRectangleGenerator" withInputParameters:@{
+        @"inputExtent": [CIVector vectorWithCGRect:CGRectInset(r, s / 8, s / 8)], @"inputRadius": @(s / 5),
+        @"inputColor": [CIColor colorWithRed:1 green:0.5 blue:0]}].outputImage;
+    CIImage *checker = [[CIFilter filterWithName:@"CICheckerboardGenerator" withInputParameters:@{
+        @"inputCenter": [CIVector vectorWithX:0 Y:0], @"inputColor0": [CIColor colorWithRed:1 green:1 blue:1],
+        @"inputColor1": [CIColor colorWithRed:0 green:0 blue:0 alpha:0], @"inputWidth": @(s / 8), @"inputSharpness": @1}].outputImage
+        imageByCroppingToRect:CGRectInset(r, s / 4, s / 4)];
+    return [checker imageByCompositingOverImage:[rounded imageByCompositingOverImage:white]];
+}
+
+static int ciProbe(unsigned size, const char *dir) {
+    const char *stitching = getenv("CI_ENABLE_FUNCTION_STITCHING");
+    printf("CI_ENABLE_FUNCTION_STITCHING %s\n", stitching ? stitching : "(unset: on)");
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    printf("device %s\n", device ? device.name.UTF8String : "(none)");
+    if (!device) return 1;
+    NSDictionary *plain = @{kCIContextWorkingColorSpace: [NSNull null], kCIContextOutputColorSpace: [NSNull null]};
+    CIContext *gpu = [CIContext contextWithMTLDevice:device options:plain];
+    NSMutableDictionary *software = [[plain mutableCopy] autorelease];
+    software[kCIContextUseSoftwareRenderer] = @YES;
+    CIContext *cpu = [CIContext contextWithOptions:software];
+    CGRect r = CGRectMake(0, 0, size, size);
+    CIImage *red = [[CIImage imageWithColor:[CIColor colorWithRed:1 green:0 blue:0]] imageByCroppingToRect:r];
+    CIImage *blue = [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:1]] imageByCroppingToRect:r];
+    CIImage *mask = [[CIFilter filterWithName:@"CILinearGradient" withInputParameters:@{
+        @"inputPoint0": [CIVector vectorWithX:0 Y:0], @"inputPoint1": [CIVector vectorWithX:size Y:0],
+        @"inputColor0": [CIColor colorWithRed:0 green:0 blue:0 alpha:0], @"inputColor1": [CIColor colorWithRed:1 green:1 blue:1 alpha:1]}]
+        .outputImage imageByCroppingToRect:r];
+    CIImage *blend = [CIFilter filterWithName:@"CIBlendWithAlphaMask" withInputParameters:@{
+        kCIInputImageKey: blue, kCIInputBackgroundImageKey: red, kCIInputMaskImageKey: mask}].outputImage;
+    CIImage *blur = [[CIFilter filterWithName:@"CIGaussianBlur" withInputParameters:@{kCIInputImageKey: blend, kCIInputRadiusKey: @4}]
+        .outputImage imageByCroppingToRect:r];
+    CIImage *icon = iconImage(size), *icon2x = iconImage(size * 2);
+    CIImage *lanczos = [[CIFilter filterWithName:@"CILanczosScaleTransform" withInputParameters:@{
+        kCIInputImageKey: icon2x, kCIInputScaleKey: @0.5, kCIInputAspectRatioKey: @1}].outputImage imageByCroppingToRect:r];
+    CIImage *affine = [[icon2x imageByApplyingTransform:CGAffineTransformMakeScale(0.5, 0.5)] imageByCroppingToRect:r];
+    CIImage *images[] = {blend, blur, icon, lanczos, affine};
+    const char *names[] = {"blend with alpha mask", "gaussian blur", "icon (rounded rectangle, glyph)", "icon 2x, lanczos to 1x",
+                           "icon 2x, affine to 1x"};
+    uint8_t *g = calloc((size_t)size * size, 4), *c = calloc((size_t)size * size, 4);
+    unsigned worst = 0;
+    for (int i = 0; i < (int)(sizeof images / sizeof images[0]); i++) {
+        memset(g, 0, (size_t)size * size * 4);
+        memset(c, 0, (size_t)size * size * 4);
+        [gpu render:images[i] toBitmap:g rowBytes:size * 4 bounds:r format:kCIFormatRGBA8 colorSpace:nil];
+        [cpu render:images[i] toBitmap:c rowBytes:size * 4 bounds:r format:kCIFormatRGBA8 colorSpace:nil];
+        writeRender(dir, i, "metal", g, size);
+        writeRender(dir, i, "software", c, size);
+        unsigned d = compareRenders(names[i], g, c, size);
+        if (d > worst) worst = d;
+    }
+    free(g);
+    free(c);
+    return worst > 3;
+}
+
 static int compileMetal(const char *sourcePath, const char *outPath, const char *options) {
     void *library = dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_NOW);
     void *(*create)(const char *) = library ? dlsym(library, "MTLCodeGenServiceCreate") : NULL;
@@ -336,6 +442,8 @@ int main(int argc, char **argv) {
             sync();
             return failed;
         }
+        if (argc >= 2 && !strcmp(argv[1], "ci"))
+            return ciProbe(argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 64, argc >= 4 ? argv[3] : NULL);
         if (argc >= 2 && !strcmp(argv[1], "virtgpu"))
             return virtgpuProbe();
         if (argc >= 4 && !strcmp(argv[1], "msl"))
