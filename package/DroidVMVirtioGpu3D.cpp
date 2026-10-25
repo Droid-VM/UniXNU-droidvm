@@ -152,6 +152,9 @@ extern "C" void proc_selfname(char *, int);
 extern "C" {
 // clients now, contexts made, blobs made, maps made, submissions, fenced submissions, fence waits that timed out, refusals
 volatile uint64_t droidvm_virtgpu_stats[8];
+// resources closed, of them released later (their client's submissions were in flight), resources waiting so now, and the
+// connections whose submissions were still in flight after the 5 s a closing connection waits
+volatile uint64_t droidvm_virtgpu_closes[4];
 // the last refusal: op, status, input and output size; and refusals by op
 volatile uint64_t droidvm_virtgpu_last_refusal[4], droidvm_virtgpu_refusals_by_op[16];
 }
@@ -168,12 +171,17 @@ struct Resource {
     IOMemoryDescriptor *window;        // a host blob's range of the pool, once mapped
     IOMemoryMap *map;                  // in the client's task
 };
-struct Pending { uint32_t ticket, ring; uint64_t fence; };
+// A fenced submission in flight; `sequence` numbers the client's fenced submissions in the order they were made.
+struct Pending { uint32_t ticket, ring; uint64_t fence, sequence; };
+// A closed resource the GPU may still use: released once every submission made before it was closed has finished.
+struct Closed { Resource resource; uint64_t sequence; };
 struct Client {
     void *connection;
     IOLock *lock;
-    uint32_t context, rings, nextHandle, resourceCount, resourceCapacity, pendingCount;
+    uint32_t context, rings, nextHandle, resourceCount, resourceCapacity, pendingCount, closedCount, closedCapacity;
     Resource *resources;
+    Closed *closed;
+    uint64_t sequence;                 // fenced submissions made
     Pending pending[MaxPending];
     uint64_t nextFence[MaxRings], completed[MaxRings];
 };
@@ -208,11 +216,13 @@ Client *client(void *connection, bool create) {
     IOLockUnlock(gClientsLock);
     return found;
 }
+void releaseResource(Client *c, Resource &r);
 Resource *resource(Client *c, uint32_t handle) {
     for (uint32_t i = 0; i < c->resourceCount; ++i) if (c->resources[i].handle == handle) return &c->resources[i];
     return nullptr;
 }
-// Takes every finished fenced submission off the client's list; with `fence` set, whether that fence on `ring` has signalled.
+// Takes every finished fenced submission off the client's list, then releases the closed resources no submission in flight
+// was made before.
 void reapPending(Client *c) {
     for (uint32_t i = 0; i < c->pendingCount;) {
         IOReturn result;
@@ -220,6 +230,15 @@ void reapPending(Client *c) {
         const Pending done = c->pending[i];
         if (done.fence > c->completed[done.ring]) c->completed[done.ring] = done.fence;
         c->pending[i] = c->pending[--c->pendingCount];
+    }
+    if (!c->closedCount) return;
+    uint64_t oldest = ~uint64_t(0);
+    for (uint32_t i = 0; i < c->pendingCount; ++i) if (c->pending[i].sequence < oldest) oldest = c->pending[i].sequence;
+    for (uint32_t i = 0; i < c->closedCount;) {
+        if (c->closed[i].sequence >= oldest) { ++i; continue; }
+        releaseResource(c, c->closed[i].resource);
+        c->closed[i] = c->closed[--c->closedCount];
+        droidvm_virtgpu_closes[2] = droidvm_virtgpu_closes[2] - 1;
     }
 }
 // Waits for every submission of the client in flight (before its resources' pages go back), at most `timeoutUs`.
@@ -299,8 +318,10 @@ IOReturn contextInit(Client *c, const droidvm_virtgpu_context_init &in, droidvm_
     if (c->context) return kIOReturnExclusiveAccess;
     if (!in.num_rings || in.num_rings > MaxRings) return kIOReturnBadArgument;
     IOLockLock(gClientsLock); const uint32_t context = gNextContext++; IOLockUnlock(gClientsLock);
-    CtxCreate create = {{CmdCtxCreate, 0, 0, context, 0, {}}, 0, in.capset_id, {}};
-    proc_selfname(create.name, sizeof create.name);
+    // "xnu:" and the process: the host's drm2kgsl unbinds a freed guest BO's GPU ranges for such a context (this guest hands
+    // a blob's pages back to its allocator once the resource goes), and its log names the process.
+    CtxCreate create = {{CmdCtxCreate, 0, 0, context, 0, {}}, 0, in.capset_id, {'x', 'n', 'u', ':'}};
+    proc_selfname(create.name + 4, sizeof create.name - 4);
     create.nameLength = uint32_t(strnlen(create.name, sizeof create.name));
     Header reply = {};
     IOReturn status = command(&create, sizeof create, nullptr, 0, &reply, sizeof reply);
@@ -447,7 +468,7 @@ IOReturn execbuffer(Client *c, const droidvm_virtgpu_execbuffer &in, const uint8
     IOReturn status = post(&submit, sizeof submit, commands, in.size, sizeof(Header), false, &ticket);
     if (status) return status;
     c->nextFence[in.ring_idx] = fence;
-    c->pending[c->pendingCount++] = {ticket, in.ring_idx, fence};
+    c->pending[c->pendingCount++] = {ticket, in.ring_idx, fence, ++c->sequence};
     out.fence = fence; count(5);
     return kIOReturnSuccess;
 }
@@ -464,11 +485,28 @@ IOReturn waitFence(Client *c, const droidvm_virtgpu_wait_fence &in) {
         IOSleep(1);   // a fence is a GPU job: sleep, so the vCPU goes idle (see pause() in DroidVMVirtioGpu.cpp)
     }
 }
+// The handle goes now; the pages go once the GPU cannot be using them. A submission does not name the resources it uses, so
+// every one of the client's submissions in flight counts: with none, the resource is released at once, otherwise it waits
+// (Closed) for the submissions made so far, and reapPending releases it. Waiting here for the GPU instead stalled every close.
 IOReturn closeResource(Client *c, uint32_t handle) {
     Resource *r = resource(c, handle);
     if (!r) return kIOReturnBadArgument;
-    drain(c, 5000000);   // the GPU may still use it: the context's submissions in flight finish first
-    releaseResource(c, *r);
+    droidvm_virtgpu_closes[0] = droidvm_virtgpu_closes[0] + 1;
+    reapPending(c);
+    if (c->pendingCount) {
+        if (c->closedCount == c->closedCapacity) {
+            const uint32_t capacity = c->closedCapacity ? c->closedCapacity * 2 : 64;
+            Closed *grown = IONew(Closed, capacity);
+            if (!grown) { drain(c, 5000000); releaseResource(c, *r); *r = c->resources[--c->resourceCount]; return kIOReturnSuccess; }
+            if (c->closed) { memcpy(grown, c->closed, sizeof(Closed) * c->closedCount); IODelete(c->closed, Closed, c->closedCapacity); }
+            c->closed = grown; c->closedCapacity = capacity;
+        }
+        c->closed[c->closedCount++] = {*r, c->sequence};
+        droidvm_virtgpu_closes[1] = droidvm_virtgpu_closes[1] + 1;
+        droidvm_virtgpu_closes[2] = droidvm_virtgpu_closes[2] + 1;
+    } else {
+        releaseResource(c, *r);
+    }
     *r = c->resources[--c->resourceCount];
     return kIOReturnSuccess;
 }
@@ -560,8 +598,12 @@ extern "C" void droidvm_virtgpu_close(void *connection) {
     IOLockUnlock(gClientsLock);
     IOLockLock(c->lock);
     drain(c, 5000000);
+    if (c->pendingCount) droidvm_virtgpu_closes[3] = droidvm_virtgpu_closes[3] + 1;
     for (uint32_t i = 0; i < c->resourceCount; ++i) releaseResource(c, c->resources[i]);
     if (c->resources) IODelete(c->resources, Resource, c->resourceCapacity);
+    for (uint32_t i = 0; i < c->closedCount; ++i) releaseResource(c, c->closed[i].resource);
+    droidvm_virtgpu_closes[2] = droidvm_virtgpu_closes[2] - c->closedCount;
+    if (c->closed) IODelete(c->closed, Closed, c->closedCapacity);
     if (c->context) {
         Header destroy = {CmdCtxDestroy, 0, 0, c->context, 0, {}}, reply = {};
         (void)command(&destroy, sizeof destroy, nullptr, 0, &reply, sizeof reply);
