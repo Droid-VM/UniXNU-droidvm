@@ -12,7 +12,8 @@
 //   lsdiag -u 501 launch BUNDLE_ID...      request a foreground launch (device must be unlocked)
 //   lsdiag -u 501 launch-args OUT BUNDLE_ID [ARG...]   launch an app as a debugger does (FrontBoard's open-application service
 //                                       with debug options): ARGs on its command line, any running instance ended first, its
-//                                       standard output and error in OUT.out and OUT.err, and NSLog copied to them
+//                                       standard output and error in OUT.out and OUT.err, and NSLog copied to them; LSDIAG_LAUNCH_ENV="NAME=VALUE;..."
+//                                       adds to its environment
 //   lsdiag [-u UID] midump [FILTER...]    the item dictionaries installd gives LaunchServices (type, plug-in owner)
 //   lsdiag [-u UID] relink [-clean] BUNDLE_ID...|all   re-register apps with their plug-ins as an install does (plug-ins get
 //                                       their app); -clean drops each plug-in's records first (unregisterPlugin:)
@@ -406,7 +407,14 @@ static void launchWithArguments(NSArray<NSString *> *words) {
         if (k) into[k] = value;
     };
     put(debug, "FBSDebugOptionKeyArguments", arguments);
-    put(debug, "FBSDebugOptionKeyEnvironment", @{@"OS_ACTIVITY_DT_MODE": @"YES"});
+    // LSDIAG_LAUNCH_ENV="NAME=VALUE;NAME=VALUE" adds to the app's environment (MallocScribble=1, TU_DARWIN_VIRTGPU=0, ...).
+    NSMutableDictionary *environment = [NSMutableDictionary dictionaryWithObject:@"YES" forKey:@"OS_ACTIVITY_DT_MODE"];
+    const char *extra = getenv("LSDIAG_LAUNCH_ENV");
+    if (extra) for (NSString *pair in [@(extra) componentsSeparatedByString:@";"]) {
+        const NSRange equals = [pair rangeOfString:@"="];
+        if (equals.location != NSNotFound && equals.location) environment[[pair substringToIndex:equals.location]] = [pair substringFromIndex:equals.location + 1];
+    }
+    put(debug, "FBSDebugOptionKeyEnvironment", environment);
     put(debug, "FBSDebugOptionKeyStandardOutPath", [out stringByAppendingString:@".out"]);
     put(debug, "FBSDebugOptionKeyStandardErrorPath", [out stringByAppendingString:@".err"]);
     put(dictionary, "FBSOpenApplicationOptionKeyDebuggingOptions", debug);

@@ -30,6 +30,31 @@
 //                                       with com.apple.backboardd.setDeviceOrientation. The guest's panel is landscape-native, so
 //                                       iPadOS's portrait (1) is its wide, upright screen and 3 and 4 turn everything sideways
 //
+//   gfxprobe memcheck MIB SECONDS       a process that never touches the GPU keeps MIB of anonymous memory, each word holding its
+//                                       own address mixed with its chunk's salt, and checks all of it again and again for SECONDS;
+//                                       every round a sixteenth of the chunks goes back to the kernel and comes anew, so the process
+//                                       keeps taking pages others gave back. A changed word is a write from outside the process (a
+//                                       GPU or the host writing pages the guest handed to someone else, a kernel bug): each is
+//                                       printed with what it held, what it should hold and, decoded, the address its value names
+//
+//   gfxprobe memidle MIB SECONDS PERIOD the other half: MIB of compressible content (mostly zeros and repeated small values, as a
+//                                       heap holds) left alone, checked every PERIOD seconds for SECONDS. Pages nobody touches are
+//                                       what the pageout daemon compresses or frees under memory pressure, so a page that comes back
+//                                       different points at the compressor or at a mapping the pageout path tore down; each bad page
+//                                       is printed with how many of its words differ and the first of them
+//
+//   gfxprobe regcheck THREADS SECONDS   a thread's own state across preemption: THREADS threads (more than the CPUs, so they are
+//                                       preempted) each load a pattern of their own into v0-v31, spin, and read the registers
+//                                       back, and check that TPIDRRO_EL0 (the TSD base) and pthread_self() stay theirs and that
+//                                       TPIDR_EL0's CPU number is one the system has; each mismatch is printed. A kernel that
+//                                       restores another thread's SIMD registers or TSD base corrupts any process's memory at
+//                                       random (memcpy, malloc and locks run on them)
+//
+//   gfxprobe atomcheck THREADS SECONDS  atomics between CPUs: THREADS threads add to the same counters on a fresh page each round
+//                                       (an atomic add, a compare-and-swap loop, and a plain add under an os_unfair_lock), then
+//                                       the totals are compared with what was added; each short total is printed with the page's
+//                                       physical-looking address. A round sleeps a little, so the vCPUs idle (vmguard)
+//
 //   gfxprobe virtgpu                    one DRM context through the accelerator's virtgpu methods (DroidVMVirtgpuABI.h), as mesa's
 //                                       vdrm drives them: capset, context, the msm shmem, GET_PARAM ccmds, a guest-alloc BO (GEM_NEW
 //                                       and a HOST3D_GUEST blob) written through its mapping, a fenced NOP waited for, then closed
@@ -46,6 +71,10 @@
 #import <dlfcn.h>
 #import <fcntl.h>
 #import <objc/runtime.h>
+#import <pthread.h>
+#import <stdatomic.h>
+#import <os/lock.h>
+#import <sys/mman.h>
 #import <sys/stat.h>
 #import <unistd.h>
 
@@ -150,6 +179,239 @@ static uint64_t vgGetParam(volatile uint8_t *shmem, uint32_t *seqno, uint32_t pa
     if (!*kr && ret) *kr = (kern_return_t)ret;
     return value;
 }
+// memcheck: 1 MiB chunks of anonymous memory, word w of chunk i holding (its address) ^ salt[i]; a new salt each time a chunk
+// is taken anew, so a word that holds another chunk's or an older generation's value decodes to an address of its own.
+static int memoryCheck(unsigned long mib, unsigned long seconds) {
+    enum { Chunk = 1u << 20, Words = Chunk / 8 };
+    if (!mib) mib = 256;
+    uint64_t **chunk = calloc(mib, sizeof *chunk), *salt = calloc(mib, sizeof *salt), bad = 0, rounds = 0;
+    __block uint64_t generation = 0;
+    if (!chunk || !salt) return 1;
+    void (^take)(unsigned long) = ^(unsigned long i) {
+        uint64_t *words = mmap(NULL, Chunk, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (words == MAP_FAILED) { chunk[i] = NULL; return; }
+        const uint64_t mix = 0x9e3779b97f4a7c15ull * (++generation) | 1;
+        for (unsigned long w = 0; w < Words; ++w) words[w] = (uint64_t)(uintptr_t)&words[w] ^ mix;
+        chunk[i] = words; salt[i] = mix;
+    };
+    for (unsigned long i = 0; i < mib; ++i) take(i);
+    const time_t begin = time(NULL);
+    time_t reported = begin;
+    unsigned long next = 0;
+    printf("memcheck: %lu MiB in 1 MiB chunks for %lu s\n", mib, seconds);
+    fflush(stdout);
+    while ((unsigned long)(time(NULL) - begin) < seconds) {
+        for (unsigned long i = 0; i < mib; ++i) {
+            uint64_t *words = chunk[i];
+            if (!words) continue;
+            for (unsigned long w = 0; w < Words; ++w) {
+                const uint64_t expected = (uint64_t)(uintptr_t)&words[w] ^ salt[i], got = words[w];
+                if (got == expected) continue;
+                if (++bad <= 256) {
+                    // The value decoded with this chunk's salt: an address names the word whose value it is (a misplaced page).
+                    printf("BAD round %llu chunk %lu word %#lx (page offset %#lx) at %p: got %#018llx want %#018llx diff %#018llx decoded %#llx\n",
+                           rounds, i, w, (w * 8) & 4095, (void *)&words[w], got, expected, got ^ expected, got ^ salt[i]);
+                }
+                words[w] = expected;
+            }
+        }
+        ++rounds;
+        // A sixteenth of the chunks back to the kernel and taken anew, round-robin.
+        for (unsigned long k = 0; k < (mib + 15) / 16; ++k, next = (next + 1) % mib) {
+            if (chunk[next]) munmap(chunk[next], Chunk);
+            take(next);
+        }
+        if (time(NULL) - reported >= 30) {
+            reported = time(NULL);
+            printf("memcheck: %llu rounds, %llu bad words, %llu chunks taken\n", rounds, bad, generation);
+            fflush(stdout);
+        }
+        usleep(200000);
+    }
+    printf("memcheck: done, %llu rounds, %llu bad words\n", rounds, bad);
+    return bad ? 2 : 0;
+}
+
+// memidle: word w of page p is compressible and still names its page: most words 0, every 8th a small value, every 64th the
+// page number with the word index.
+static uint64_t idleWord(uint64_t page, uint64_t w) {
+    if (w % 64 == 0) return page << 16 | w;
+    if (w % 8 == 0) return 0x1234 + (w & 0x38);
+    return 0;
+}
+static int memoryIdle(unsigned long mib, unsigned long seconds, unsigned long period) {
+    const uint64_t bytes = (uint64_t)(mib ? mib : 512) << 20, words = bytes / 8, pages = bytes / 4096;
+    uint64_t *memory = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (memory == MAP_FAILED) { printf("memidle: no memory\n"); return 1; }
+    for (uint64_t w = 0; w < words; ++w) memory[w] = idleWord(w / 512, w % 512);
+    printf("memidle: %llu MiB (%llu pages) filled; checked every %lu s for %lu s\n", bytes >> 20, pages, period, seconds);
+    fflush(stdout);
+    const time_t begin = time(NULL);
+    uint64_t checks = 0, badPages = 0;
+    while ((unsigned long)(time(NULL) - begin) < seconds) {
+        sleep((unsigned)(period ? period : 60));
+        ++checks;
+        uint64_t badNow = 0;
+        for (uint64_t p = 0; p < pages; ++p) {
+            uint64_t *page = memory + p * 512, differ = 0, first = 0;
+            for (uint64_t w = 0; w < 512; ++w) if (page[w] != idleWord(p, w)) { if (!differ++) first = w; }
+            if (!differ) continue;
+            ++badNow;
+            if (++badPages <= 200)
+                printf("BAD check %llu page %llu at %p: %llu words differ, first word %llu got %#018llx want %#018llx (word 0 holds %#llx)\n",
+                       checks, p, (void *)page, differ, first, page[first], idleWord(p, first), page[0]);
+            for (uint64_t w = 0; w < 512; ++w) page[w] = idleWord(p, w);
+        }
+        printf("memidle: check %llu after %ld s, %llu bad pages now, %llu in all\n", checks, (long)(time(NULL) - begin), badNow, badPages);
+        fflush(stdout);
+    }
+    return badPages ? 2 : 0;
+}
+
+// regcheck: one thread's round, in assembly so that nothing but the kernel touches v0-v31 between the load and the store.
+static void vectorRound(const uint8_t *in, uint8_t *out, uint64_t spins) {
+    __asm__ volatile(
+        "ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [%[in]], #64\n"
+        "ld1 {v4.16b, v5.16b, v6.16b, v7.16b}, [%[in]], #64\n"
+        "ld1 {v8.16b, v9.16b, v10.16b, v11.16b}, [%[in]], #64\n"
+        "ld1 {v12.16b, v13.16b, v14.16b, v15.16b}, [%[in]], #64\n"
+        "ld1 {v16.16b, v17.16b, v18.16b, v19.16b}, [%[in]], #64\n"
+        "ld1 {v20.16b, v21.16b, v22.16b, v23.16b}, [%[in]], #64\n"
+        "ld1 {v24.16b, v25.16b, v26.16b, v27.16b}, [%[in]], #64\n"
+        "ld1 {v28.16b, v29.16b, v30.16b, v31.16b}, [%[in]], #64\n"
+        "1: subs %[spins], %[spins], #1\n"
+        "b.ne 1b\n"
+        "st1 {v0.16b, v1.16b, v2.16b, v3.16b}, [%[out]], #64\n"
+        "st1 {v4.16b, v5.16b, v6.16b, v7.16b}, [%[out]], #64\n"
+        "st1 {v8.16b, v9.16b, v10.16b, v11.16b}, [%[out]], #64\n"
+        "st1 {v12.16b, v13.16b, v14.16b, v15.16b}, [%[out]], #64\n"
+        "st1 {v16.16b, v17.16b, v18.16b, v19.16b}, [%[out]], #64\n"
+        "st1 {v20.16b, v21.16b, v22.16b, v23.16b}, [%[out]], #64\n"
+        "st1 {v24.16b, v25.16b, v26.16b, v27.16b}, [%[out]], #64\n"
+        "st1 {v28.16b, v29.16b, v30.16b, v31.16b}, [%[out]], #64\n"
+        : [in] "+r"(in), [out] "+r"(out), [spins] "+r"(spins)
+        :
+        : "memory", "cc", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+          "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+}
+static volatile int regStop;
+static volatile uint64_t regRounds, regBad, regCpuMax;
+static void *registerWorker(void *argument) {
+    const uint64_t id = (uint64_t)(uintptr_t)argument;
+    const pthread_t self = pthread_self();
+    uint64_t tsd, generation = 0;
+    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd));
+    uint8_t in[512] __attribute__((aligned(16))), out[512] __attribute__((aligned(16)));
+    while (!regStop) {
+        ++generation;
+        for (unsigned i = 0; i < 64; ++i) ((uint64_t *)in)[i] = (id << 56) ^ (generation << 16) ^ (i * 0x0101010101010101ull) ^ 0xa5;
+        vectorRound(in, out, 200000);
+        for (unsigned r = 0; r < 32; ++r) {
+            if (!memcmp(in + r * 16, out + r * 16, 16)) continue;
+            if (__atomic_add_fetch(&regBad, 1, __ATOMIC_RELAXED) <= 100)
+                printf("BAD thread %llu round %llu v%u: got %016llx%016llx want %016llx%016llx\n", id, generation, r,
+                       ((uint64_t *)out)[r * 2 + 1], ((uint64_t *)out)[r * 2], ((uint64_t *)in)[r * 2 + 1], ((uint64_t *)in)[r * 2]);
+        }
+        uint64_t nowTsd, cpu;
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(nowTsd));
+        __asm__ volatile("mrs %0, TPIDR_EL0" : "=r"(cpu));
+        if (nowTsd != tsd || pthread_self() != self) {
+            if (__atomic_add_fetch(&regBad, 1, __ATOMIC_RELAXED) <= 100)
+                printf("BAD thread %llu round %llu: TSD base %#llx (was %#llx), pthread_self %p (was %p)\n", id, generation, nowTsd, tsd,
+                       (void *)pthread_self(), (void *)self);
+        }
+        uint64_t number = cpu & 0xff, seen = regCpuMax;
+        while (number > seen && !__atomic_compare_exchange_n(&regCpuMax, &seen, number, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        __atomic_add_fetch(&regRounds, 1, __ATOMIC_RELAXED);
+        usleep(1000);   // the vCPUs idle now and then: vmguard stops crosvm when every secondary spins for a minute
+    }
+    return NULL;
+}
+static int registerCheck(unsigned threads, unsigned long seconds) {
+    if (!threads) threads = 12;
+    pthread_t workers[64];
+    if (threads > 64) threads = 64;
+    for (unsigned i = 0; i < threads; ++i) pthread_create(&workers[i], NULL, registerWorker, (void *)(uintptr_t)(i + 1));
+    printf("regcheck: %u threads for %lu s\n", threads, seconds);
+    fflush(stdout);
+    for (unsigned long t = 0; t < seconds; t += 30) {
+        sleep(seconds - t < 30 ? (unsigned)(seconds - t) : 30);
+        printf("regcheck: %llu rounds, %llu bad, largest CPU number in TPIDR_EL0 %llu\n", regRounds, regBad, regCpuMax);
+        fflush(stdout);
+    }
+    regStop = 1;
+    for (unsigned i = 0; i < threads; ++i) pthread_join(workers[i], NULL);
+    return regBad ? 2 : 0;
+}
+
+// atomcheck: one round's shared counters, on a page of their own.
+struct AtomPage { _Atomic uint64_t added, swapped; uint64_t locked; os_unfair_lock lock; };
+static struct AtomPage *volatile atomPage;
+static volatile int atomStop;
+static volatile uint64_t atomGeneration, atomDone;
+enum { AtomAdds = 20000 };
+static void *atomWorker(void *argument) {
+    (void)argument;
+    uint64_t seen = 0;
+    while (!atomStop) {
+        const uint64_t generation = atomGeneration;
+        if (generation == seen) { usleep(200); continue; }
+        seen = generation;
+        struct AtomPage *page = atomPage;
+        for (unsigned i = 0; i < AtomAdds; ++i) {
+            atomic_fetch_add_explicit(&page->added, 1, memory_order_relaxed);
+            uint64_t old = atomic_load_explicit(&page->swapped, memory_order_relaxed);
+            while (!atomic_compare_exchange_weak_explicit(&page->swapped, &old, old + 1, memory_order_acq_rel, memory_order_relaxed)) {}
+            os_unfair_lock_lock(&page->lock);
+            page->locked = page->locked + 1;
+            os_unfair_lock_unlock(&page->lock);
+        }
+        __atomic_add_fetch(&atomDone, 1, __ATOMIC_ACQ_REL);
+    }
+    return NULL;
+}
+static int atomicCheck(unsigned threads, unsigned long seconds) {
+    if (!threads) threads = 8;
+    if (threads > 64) threads = 64;
+    pthread_t workers[64];
+    for (unsigned i = 0; i < threads; ++i) pthread_create(&workers[i], NULL, atomWorker, NULL);
+    const time_t begin = time(NULL);
+    time_t reported = begin;
+    uint64_t rounds = 0, bad = 0;
+    printf("atomcheck: %u threads for %lu s\n", threads, seconds);
+    fflush(stdout);
+    while ((unsigned long)(time(NULL) - begin) < seconds) {
+        // A fresh page each round (mapped anew: its physical page changes), the counters at a varying offset in it.
+        uint8_t *memory = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (memory == MAP_FAILED) break;
+        struct AtomPage *page = (struct AtomPage *)(memory + (rounds % 64) * 64);
+        *page = (struct AtomPage){0, 0, 0, OS_UNFAIR_LOCK_INIT};
+        atomDone = 0;
+        atomPage = page;
+        __atomic_add_fetch(&atomGeneration, 1, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&atomDone, __ATOMIC_ACQUIRE) < threads) usleep(500);
+        const uint64_t want = (uint64_t)threads * AtomAdds;
+        const uint64_t added = atomic_load(&page->added), swapped = atomic_load(&page->swapped), locked = page->locked;
+        if (added != want || swapped != want || locked != want) {
+            if (++bad <= 100)
+                printf("BAD round %llu page %p: atomic add %llu, compare-and-swap %llu, locked add %llu, want %llu\n",
+                       rounds, (void *)page, added, swapped, locked, want);
+        }
+        munmap(memory, 16384);
+        ++rounds;
+        usleep(2000);
+        if (time(NULL) - reported >= 30) {
+            reported = time(NULL);
+            printf("atomcheck: %llu rounds, %llu bad\n", rounds, bad);
+            fflush(stdout);
+        }
+    }
+    atomStop = 1;
+    for (unsigned i = 0; i < threads; ++i) pthread_join(workers[i], NULL);
+    printf("atomcheck: done, %llu rounds, %llu bad\n", rounds, bad);
+    return bad ? 2 : 0;
+}
+
 static int virtgpuProbe(void) {
     io_object_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOAcceleratorES"));
     kern_return_t kr = service ? IOServiceOpen(service, mach_task_self(), DROIDVM_VIRTGPU_OPEN_TYPE, &vgConnection) : KERN_FAILURE;
@@ -467,6 +729,14 @@ int main(int argc, char **argv) {
             return ciProbe(argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 64, argc >= 4 ? argv[3] : NULL);
         if (argc >= 2 && !strcmp(argv[1], "virtgpu"))
             return virtgpuProbe();
+        if (argc >= 4 && !strcmp(argv[1], "atomcheck"))
+            return atomicCheck((unsigned)strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+        if (argc >= 4 && !strcmp(argv[1], "regcheck"))
+            return registerCheck((unsigned)strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+        if (argc >= 5 && !strcmp(argv[1], "memidle"))
+            return memoryIdle(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0));
+        if (argc >= 4 && !strcmp(argv[1], "memcheck"))
+            return memoryCheck(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
         if (argc >= 4 && !strcmp(argv[1], "msl"))
             return compileMetal(argv[2], argv[3], argc >= 5 ? argv[4] : "-std=metal3.1 --driver-mode=metal -x metal");
         if (argc < 5) {
