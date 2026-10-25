@@ -121,7 +121,7 @@ static bool store_request(uint32_t type, uint64_t sector, uint32_t bytes) {
     store_write32(0x50, 0);
     volatile uint16_t *used = (volatile uint16_t *)(droidvm_store_queue + 256);
     uint64_t start = mach_absolute_time(), spin, limit;
-    nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &spin);
+    nanoseconds_to_absolutetime(200 * NSEC_PER_USEC, &spin);   // then sleep, so the vCPU goes idle (DroidVMVirtioGpu.cpp pause())
     nanoseconds_to_absolutetime((uint64_t)DROIDVM_STORE_TIMEOUT_MS * NSEC_PER_MSEC, &limit);
     while (used[1] == droidvm_store_used_index) {
         uint64_t waited = mach_absolute_time() - start;

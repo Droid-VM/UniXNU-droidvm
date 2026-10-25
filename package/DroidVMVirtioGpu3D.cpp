@@ -396,7 +396,7 @@ IOReturn waitFence(Client *c, const droidvm_virtgpu_wait_fence &in) {
         IOLockUnlock(c->lock);
         if (done) return kIOReturnSuccess;
         if (nowUsLocal() - begin >= timeoutUs) { if (timeoutUs) count(6); return kIOReturnTimeout; }
-        if (nowUsLocal() - begin < 2000) IODelay(20); else IOSleep(1);
+        IOSleep(1);   // a fence is a GPU job: sleep, so the vCPU goes idle (see pause() in DroidVMVirtioGpu.cpp)
     }
 }
 IOReturn closeResource(Client *c, uint32_t handle) {

@@ -240,7 +240,7 @@ int32_t call(uint32_t op, const void *a, uint32_t a_bytes, const void *b, uint32
     while (used[1] == gUsedIndex) {
         const uint64_t waited = nowUs() - start;
         if (waited >= uint64_t(kTimeoutMs) * 1000) {answered = false; break;}
-        if (waited < 3000) IODelay(5);
+        if (waited < 200) IODelay(5);   // then sleep, so the vCPU goes idle (see pause() in DroidVMVirtioGpu.cpp)
         else IOSleep(1);
         barrier();
     }
