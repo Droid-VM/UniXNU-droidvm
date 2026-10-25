@@ -100,7 +100,7 @@ static void describe(NSString *what, IOSurfaceRef surface, id<MTLDevice> device,
 // libsystem_sandbox: enter a sandbox profile by name (SANDBOX_NAMED), as a process launchd starts with one does.
 extern int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
 
-#include "../DroidVMVirtgpuABI.h"
+#include "DroidVMVirtgpuABI.h"   // NativeAdreno's
 extern kern_return_t IOConnectCallStructMethod(mach_port_t, uint32_t, const void *, size_t, void *, size_t *);
 static mach_port_t vgConnection;
 static uint32_t vgSelector;

@@ -230,7 +230,9 @@ virtio_gpu_sources=[ROOT/'kits/droidvm'/name for name in ('DroidVMVirtioGpu.cpp'
 virtio_gpu_objects=[]
 for gpu_source in virtio_gpu_sources:
     gpu_obj=OUT/(gpu_source.stem+'.o')
-    run([str(gpu_source) if arg==str(source) else str(gpu_obj) if arg==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd],cwd=r['directory'])
+    # The virtio-gpu 3D methods' ABI (DroidVMVirtgpuABI.h) is NativeAdreno's, whose user client carries them.
+    run([str(gpu_source) if arg==str(source) else str(gpu_obj) if arg==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+
+        ['-I',str(ROOT/'drivers/NativeAdreno')],cwd=r['directory'])
     virtio_gpu_objects.append(gpu_obj)
 hid_source=ROOT/'kits/droidvm/HidInputProbe.cpp'
 hid_obj=OUT/'HidInputProbe.o'

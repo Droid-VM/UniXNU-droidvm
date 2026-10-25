@@ -151,6 +151,8 @@ extern "C" void proc_selfname(char *, int);
 extern "C" {
 // clients now, contexts made, blobs made, maps made, submissions, fenced submissions, fence waits that timed out, refusals
 volatile uint64_t droidvm_virtgpu_stats[8];
+// the last refusal: op, status, input and output size; and refusals by op
+volatile uint64_t droidvm_virtgpu_last_refusal[4], droidvm_virtgpu_refusals_by_op[16];
 }
 namespace DroidVMVirtioGpu {
 namespace {
@@ -177,6 +179,7 @@ Client *gClients[MaxClients];
 IOLock *gClientsLock;
 uint32_t gNextContext = FirstContext;
 uint64_t gCapsetMask;
+uint32_t gCapsetBytes[64];   // each capset's size (GET_CAPSET_INFO)
 bool gCapsetsQueried;
 void count(unsigned index) { droidvm_virtgpu_stats[index] = droidvm_virtgpu_stats[index] + 1; }
 uint64_t nowUsLocal() { uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000; }
@@ -247,7 +250,7 @@ void queryCapsets() {
         struct { Header h; uint32_t index, padding; } ask = {{CmdGetCapsetInfo, 0, 0, 0, 0, {}}, index, 0};
         CapsetInfo info = {};
         if (command(&ask, sizeof ask, nullptr, 0, &info, sizeof info) || info.h.type != RespCapsetInfo) break;
-        if (info.id < 64) gCapsetMask |= uint64_t(1) << info.id;
+        if (info.id < 64) { gCapsetMask |= uint64_t(1) << info.id; gCapsetBytes[info.id] = info.maxSize; }
     }
     gCapsetsQueried = true;
 }
@@ -269,10 +272,14 @@ IOReturn getParam(const droidvm_virtgpu_getparam &in, droidvm_virtgpu_getparam_r
 }
 IOReturn getCaps(const droidvm_virtgpu_get_caps &in, void *out, size_t outSize) {
     static uint8_t answer[4096];   // under the client's lock; one capset at a time across clients is enough
-    if (!outSize || outSize > sizeof answer - sizeof(Header)) return kIOReturnBadArgument;
+    if (!outSize || outSize > sizeof answer - sizeof(Header) || in.capset_id >= 64) return kIOReturnBadArgument;
     struct { Header h; uint32_t id, version; } ask = {{CmdGetCapset, 0, 0, 0, 0, {}}, in.capset_id, in.version};
     IOLockLock(gClientsLock);
-    IOReturn status = command(&ask, sizeof ask, nullptr, 0, answer, uint32_t(sizeof(Header) + outSize));
+    queryCapsets();
+    // The device answers with the whole capset, so it gets room for that; the caller gets the part it asked for, zero-padded.
+    const uint32_t bytes = gCapsetBytes[in.capset_id];
+    IOReturn status = bytes && bytes <= sizeof answer - sizeof(Header) ? kIOReturnSuccess : kIOReturnUnsupported;
+    if (!status) { memset(answer, 0, sizeof answer); status = command(&ask, sizeof ask, nullptr, 0, answer, uint32_t(sizeof(Header) + bytes)); }
     if (!status && reinterpret_cast<Header *>(answer)->type != RespCapset) status = kIOReturnIOError;
     if (!status) memcpy(out, answer + sizeof(Header), outSize);
     IOLockUnlock(gClientsLock);
@@ -467,7 +474,12 @@ extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t t
         break;
     }
     IOLockUnlock(c->lock);
-    if (status) count(7);
+    if (status) {
+        count(7);
+        droidvm_virtgpu_last_refusal[0] = op; droidvm_virtgpu_last_refusal[1] = uint32_t(status);
+        droidvm_virtgpu_last_refusal[2] = inSize; droidvm_virtgpu_last_refusal[3] = outSize;
+        droidvm_virtgpu_refusals_by_op[op] = droidvm_virtgpu_refusals_by_op[op] + 1;
+    }
     return status;
 }
 // The connection closed (or its process ended): its submissions finish, its resources go, its context is destroyed.
