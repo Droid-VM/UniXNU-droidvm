@@ -163,7 +163,8 @@ struct Resource {
     uint32_t handle, id;
     uint64_t size;
     bool hostVisible;
-    IOMemoryDescriptor *pages;         // a guest blob's own pages
+    IOMemoryDescriptor *pages;         // a guest blob's own pages, or the caller's (CREATE_BLOB_USER)
+    bool wired;                        // pages is the caller's memory, prepared (wired) until the blob goes
     IOMemoryDescriptor *window;        // a host blob's range of the pool, once mapped
     IOMemoryMap *map;                  // in the client's task
 };
@@ -233,6 +234,11 @@ IOReturn submitCommand(Client *c, const void *command, uint32_t size) {
     IOReturn status = post(&submit, sizeof submit, command, size, sizeof reply, false, &ticket);
     return status ? status : wait(ticket, 5000000, &reply, sizeof reply);
 }
+void dropPages(Resource &r) {
+    if (r.pages && r.wired) r.pages->complete();
+    if (r.pages) r.pages->release();
+    r.pages = nullptr; r.wired = false;
+}
 void releaseResource(Client *c, Resource &r) {
     Header reply = {};
     if (r.map) { r.map->release(); r.map = nullptr; }
@@ -243,7 +249,7 @@ void releaseResource(Client *c, Resource &r) {
     }
     (void)unref(r.id);
     // The host has dropped its import of the pages with the resource; only then do they go back.
-    if (r.pages) { r.pages->release(); r.pages = nullptr; }
+    dropPages(r);
 }
 void queryCapsets() {
     if (gCapsetsQueried) return;
@@ -326,7 +332,10 @@ IOMemoryDescriptor *guestPages(uint64_t bytes) {
 }
 // The size of the last guest blob whose pages or entries ran out, for peek.py.
 volatile uint64_t droidvm_virtgpu_last_blob_refused;
-IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint8_t *ccmd, droidvm_virtgpu_create_blob_reply &out) {
+// A blob: the host's (HOST3D), guest memory the kernel allocates (HOST3D_GUEST), or with `user` the caller's own pages at that
+// address in `task` (CREATE_BLOB_USER), wired while the blob lives.
+IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint8_t *ccmd, droidvm_virtgpu_create_blob_reply &out,
+                    task_t task = nullptr, uint64_t user = 0) {
     if (!c->context) return kIOReturnNotReady;
     const bool guest = in.blob_mem == DROIDVM_VIRTGPU_BLOB_MEM_HOST3D_GUEST;
     if ((!guest && in.blob_mem != DROIDVM_VIRTGPU_BLOB_MEM_HOST3D) || !in.size || in.size > (uint64_t(1) << 32) || (in.cmd_size & 3))
@@ -346,10 +355,18 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
     if (guest) {
         // Guest memory the host imports (a pseudo-unprotected VM shares all of its RAM).
         const uint64_t bytes = (in.size + 4095) & ~uint64_t(4095);
-        r.pages = guestPages(bytes);
-        if (!r.pages) { droidvm_virtgpu_last_blob_refused = bytes; return kIOReturnNoMemory; }
+        if (user) {
+            if ((user & 4095) || bytes != in.size) return kIOReturnBadArgument;
+            r.pages = IOMemoryDescriptor::withAddressRange(user, bytes, kIODirectionInOut, task);
+            if (!r.pages) return kIOReturnNoMemory;
+            if (r.pages->prepare() != kIOReturnSuccess) { r.pages->release(); return kIOReturnVMError; }
+            r.wired = true;
+        } else {
+            r.pages = guestPages(bytes);
+            if (!r.pages) { droidvm_virtgpu_last_blob_refused = bytes; return kIOReturnNoMemory; }
+        }
         entries = IONewData(Entry, MaxBlobEntries);
-        if (!entries) { r.pages->release(); return kIOReturnNoMemory; }
+        if (!entries) { dropPages(r); return kIOReturnNoMemory; }
         for (uint64_t offset = 0; offset < bytes;) {
             IOByteCount length = 0;
             const addr64_t physical = r.pages->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
@@ -368,7 +385,7 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
         status = command(&blob, sizeof blob, entries, entryCount * uint32_t(sizeof(Entry)), &reply, sizeof reply);
     }
     if (entries) IODeleteData(entries, Entry, MaxBlobEntries);
-    if (status) { if (r.pages) r.pages->release(); return status; }
+    if (status) { dropPages(r); return status; }
     c->resources[c->resourceCount++] = r;
     out.handle = r.handle; out.resource_id = r.id; count(2);
     return kIOReturnSuccess;
@@ -473,6 +490,16 @@ extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t t
             auto blob = static_cast<const droidvm_virtgpu_create_blob *>(in);
             if (blob->cmd_size <= DROIDVM_VIRTGPU_MAX_COMMAND && inSize == sizeof *blob + blob->cmd_size)
                 status = createBlob(c, *blob, static_cast<const uint8_t *>(in) + sizeof *blob, *static_cast<droidvm_virtgpu_create_blob_reply *>(out));
+        }
+        break;
+    case DROIDVM_VIRTGPU_CREATE_BLOB_USER:
+        if (fixed(sizeof(droidvm_virtgpu_create_blob_user), sizeof(droidvm_virtgpu_create_blob_reply), true)) {
+            auto user = static_cast<const droidvm_virtgpu_create_blob_user *>(in);
+            const droidvm_virtgpu_create_blob blob = {DROIDVM_VIRTGPU_BLOB_MEM_HOST3D_GUEST, user->blob_flags, user->size, user->blob_id,
+                                                      user->cmd_size, 0};
+            if (user->cmd_size <= DROIDVM_VIRTGPU_MAX_COMMAND && inSize == sizeof *user + user->cmd_size && user->address)
+                status = createBlob(c, blob, static_cast<const uint8_t *>(in) + sizeof *user,
+                                    *static_cast<droidvm_virtgpu_create_blob_reply *>(out), task, user->address);
         }
         break;
     case DROIDVM_VIRTGPU_MAP:
