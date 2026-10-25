@@ -2666,6 +2666,70 @@ static NSDictionary *MCRunBenchmarks(MCContext *context) {
     return result;
 }
 
+// A texture large enough to be tiled, written by one side and read by the other: a GPU blit from a buffer read back with
+// getBytes, and replaceRegion read back with a GPU blit to a buffer. A CPU-side copy (a host image copy) tiles and detiles in
+// software with the driver's idea of the bank swizzle, the GPU with the hardware's; where they differ, blocks of texels trade
+// places (Turnip on virtio-gpu had UBWC swizzle levels 0 and four-channel macrotiles: 16-texel blocks swapped in every other
+// 16-row band). Cases 07 and 08 copy both ways on one side and cannot see it.
+static void MCTest42(MCContext *context) {
+    const NSUInteger width = 96, height = 80, rowBytes = width * 4;
+    id<MTLTexture> texture = MCTexture(context, MTLPixelFormatRGBA8Unorm, width, height,
+                                       MTLStorageModeShared, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, NO);
+    id<MTLBuffer> buffer = MCBuffer(context, rowBytes * height, MTLResourceStorageModeShared);
+    for (int pass = 0; pass < 2; pass++) {
+        // Each texel names its own position (x, y), and the pass.
+        NSMutableData *pattern = [NSMutableData dataWithLength:rowBytes * height];
+        uint8_t *expected = static_cast<uint8_t *>(pattern.mutableBytes);
+        for (NSUInteger y = 0; y < height; y++) {
+            for (NSUInteger x = 0; x < width; x++) {
+                uint8_t *pixel = expected + y * rowBytes + x * 4;
+                pixel[0] = (uint8_t)x;
+                pixel[1] = (uint8_t)y;
+                pixel[2] = (uint8_t)(pass ? 0xa5 : 0x5a);
+                pixel[3] = 255;
+            }
+        }
+        std::memset(buffer.contents, 0, buffer.length);
+        id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+        MCRequire(commandBuffer != nil, @"commandBuffer returned nil");
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        MCRequire(blit != nil, @"blitCommandEncoder returned nil");
+        const MTLSize size = MTLSizeMake(width, height, 1);
+        NSData *found;
+        if (pass == 0) {
+            std::memcpy(buffer.contents, expected, rowBytes * height);
+            [blit copyFromBuffer:buffer sourceOffset:0 sourceBytesPerRow:rowBytes sourceBytesPerImage:rowBytes * height
+                      sourceSize:size toTexture:texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+            MCWaitForCommandBuffer(commandBuffer);
+            found = MCReadSharedTexture(texture, 0, 0, rowBytes);
+        } else {
+            [texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:expected bytesPerRow:rowBytes];
+            [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size
+                         toBuffer:buffer destinationOffset:0 destinationBytesPerRow:rowBytes destinationBytesPerImage:rowBytes * height];
+            [blit endEncoding];
+            MCWaitForCommandBuffer(commandBuffer);
+            found = [NSData dataWithBytes:buffer.contents length:rowBytes * height];
+        }
+        const uint8_t *got = static_cast<const uint8_t *>(found.bytes);
+        NSUInteger wrong = 0, firstX = 0, firstY = 0;
+        for (NSUInteger y = 0; y < height; y++) {
+            for (NSUInteger x = 0; x < width; x++) {
+                if (std::memcmp(got + y * rowBytes + x * 4, expected + y * rowBytes + x * 4, 4) == 0) continue;
+                if (!wrong++) {
+                    firstX = x;
+                    firstY = y;
+                }
+            }
+        }
+        const uint8_t *first = got + firstY * rowBytes + firstX * 4;
+        MCRequire(wrong == 0, [NSString stringWithFormat:@"%@: %lu of %lu texels misplaced; the first at (%lu, %lu) holds (%u, %u)",
+                               pass ? @"replaceRegion, GPU blit to a buffer" : @"GPU blit from a buffer, getBytes",
+                               (unsigned long)wrong, (unsigned long)(width * height), (unsigned long)firstX,
+                               (unsigned long)firstY, first[0], first[1]]);
+    }
+}
+
 static NSArray<NSString *> *MCCaseNames(void) {
     return @[
         @"01 shared buffer contents read/write",
@@ -2709,6 +2773,7 @@ static NSArray<NSString *> *MCCaseNames(void) {
         @"39 A8 text masks in whole-page shared memory at offset 64, redrawn in place",
         @"40 new pages at an address an earlier no-copy buffer still covers",
         @"41 Metal source compiled at run time, synchronously and through the completion handler",
+        @"42 a tiled texture written by the GPU and read by the CPU, and the other way",
     ];
 }
 
@@ -2770,6 +2835,9 @@ static NSArray<NSArray<NSString *> *> *MCCaseSelectors(void) {
           @"MTLPixelFormatA8Unorm"],
         @[@"newLibraryWithSource:options:error:", @"newLibraryWithSource:options:completionHandler:", @"MTLCompileOptions.preprocessorMacros",
           @"MTLLibraryErrorCompileFailure"],
+        @[@"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+          @"getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:", @"replaceRegion:mipmapLevel:withBytes:bytesPerRow:",
+          @"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:"],
     ];
 }
 
@@ -2816,6 +2884,7 @@ static void MCRunCaseBody(MCContext *context, NSUInteger index) {
         case 38: MCTest39(context); break;
         case 39: MCTest40(context); break;
         case 40: MCTest41(context); break;
+        case 41: MCTest42(context); break;
         default: MCRequire(NO, @"invalid fixed test index");
     }
 }
