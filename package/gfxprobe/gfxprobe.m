@@ -26,9 +26,9 @@
 //                                       ci-N-software.rgba). CI_ENABLE_FUNCTION_STITCHING=0 takes Core Image's other kernel path
 //
 //   gfxprobe orient N                   tell backboardd the device is held at UIDeviceOrientation N (1 portrait, 2 upside down,
-//                                       3 landscape left, 4 landscape right), as XCTest rotates a device. Tried 2026-10-25 with
-//                                       com.apple.backboard.client: backboardd did not act on it. What keeps the home screen
-//                                       landscape after an app that turns the interface (GFXBench) is iPadOS's rotation lock
+//                                       3 landscape left, 4 landscape right), as XCTest rotates a device; backboardd takes it only
+//                                       with com.apple.backboardd.setDeviceOrientation. The guest's panel is landscape-native, so
+//                                       iPadOS's portrait (1) is its wide, upright screen and 3 and 4 turn everything sideways
 //
 //   gfxprobe virtgpu                    one DRM context through the accelerator's virtgpu methods (DroidVMVirtgpuABI.h), as mesa's
 //                                       vdrm drives them: capset, context, the msm shmem, GET_PARAM ccmds, a guest-alloc BO (GEM_NEW

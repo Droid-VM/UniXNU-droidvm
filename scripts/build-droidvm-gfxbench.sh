@@ -156,6 +156,10 @@ info.update({
     'CFBundleShortVersionString': '5.0.0',
     'CFBundleVersion': '5.0.0',
     'MinimumOSVersion': '17.0',
+    # The guest's panel is landscape-native (1366x1024): iPadOS's portrait is its wide, upright screen and its landscape is
+    # sideways, so an app that allows only landscape on iPad (GFXBench's own list) is drawn turned 90 degrees.
+    'UISupportedInterfaceOrientations~ipad': ['UIInterfaceOrientationPortrait', 'UIInterfaceOrientationPortraitUpsideDown',
+                                              'UIInterfaceOrientationLandscapeLeft', 'UIInterfaceOrientationLandscapeRight'],
 })
 plist_path.write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_XML, sort_keys=True))
 provenance = {

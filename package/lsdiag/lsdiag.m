@@ -7,6 +7,8 @@
 //   lsdiag [-u UID] register APP_PATH...   re-register app bundles by URL (their plug-ins go under them)
 //   lsdiag owner-install APP_PATH...      move trusted org.droidvm apps into MCM bundle containers, keep CLI symlinks
 //   lsdiag -u 501 owner-register APP_PATH...   register those trusted apps with installation metadata
+//   lsdiag owner-update APP_PATH FROM_DIR   replace files of an installed org.droidvm app with FROM_DIR's (same relative paths):
+//                                         a re-signed Info.plist, executable and CodeResources, without moving the whole bundle again
 //   lsdiag -u 501 launch BUNDLE_ID...      request a foreground launch (device must be unlocked)
 //   lsdiag -u 501 launch-args OUT BUNDLE_ID [ARG...]   launch an app as a debugger does (FrontBoard's open-application service
 //                                       with debug options): ARGs on its command line, any running instance ended first, its
@@ -300,6 +302,40 @@ static void installOwnerApps(NSArray<NSString *> *paths) {
         if (symlink(destination.fileSystemRepresentation, source.fileSystemRepresentation))
             line(@"owner-install %@: moved but CLI symlink failed: %s", input, strerror(errno));
         line(@"owner-install %@ -> %@; data %@", identifier, destination, dataContainer.path);
+    }
+}
+
+// Root cannot write an MCM bundle container; this process's AppBundles storage entitlement can. Each file is written beside its
+// target and renamed over it, keeping the source's mode. FROM_DIR must be under /private/var/ngpu (where export.py puts files).
+static void updateOwnerApp(NSArray<NSString *> *words) {
+    if (words.count != 2) { line(@"owner-update: APP_PATH FROM_DIR"); return; }
+    NSString *app = words[0].stringByResolvingSymlinksInPath.stringByStandardizingPath;
+    NSString *from = words[1].stringByResolvingSymlinksInPath.stringByStandardizingPath;
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
+    NSString *identifier = info[@"CFBundleIdentifier"];
+    if (!([app hasPrefix:@"/private/var/containers/Bundle/Application/"] || [app hasPrefix:@"/var/containers/Bundle/Application/"]) ||
+        ![app.pathExtension isEqualToString:@"app"] || ![identifier isKindOfClass:[NSString class]] || ![identifier hasPrefix:@"org.droidvm."] ||
+        !([from hasPrefix:@"/private/var/ngpu/"] || [from hasPrefix:@"/var/ngpu/"])) {
+        line(@"owner-update: expected an installed org.droidvm app and a directory under ngpu (app=%@ identifier=%@ from=%@)", app, identifier, from);
+        return;
+    }
+    NSFileManager *files = [NSFileManager defaultManager];
+    for (NSString *relative in [files enumeratorAtPath:from]) {
+        NSString *source = [from stringByAppendingPathComponent:relative];
+        BOOL directory = NO;
+        if (![files fileExistsAtPath:source isDirectory:&directory] || directory) continue;
+        if ([relative.pathComponents containsObject:@".."]) { line(@"owner-update %@: refused", relative); continue; }
+        NSString *target = [app stringByAppendingPathComponent:relative], *staged = [target stringByAppendingString:@".owner-update"];
+        NSData *data = [NSData dataWithContentsOfFile:source];
+        struct stat st;
+        if (!data || stat(source.fileSystemRepresentation, &st)) { line(@"owner-update %@: cannot read the source", relative); continue; }
+        unlink(staged.fileSystemRepresentation);
+        if (![data writeToFile:staged atomically:NO]) { line(@"owner-update %@: cannot write %@: %s", relative, staged, strerror(errno)); continue; }
+        chmod(staged.fileSystemRepresentation, st.st_mode & 07777);
+        if (rename(staged.fileSystemRepresentation, target.fileSystemRepresentation)) {
+            line(@"owner-update %@: rename: %s", relative, strerror(errno)); unlink(staged.fileSystemRepresentation); continue;
+        }
+        line(@"owner-update %@: %@ (%lu bytes, mode %o)", identifier, relative, (unsigned long)data.length, st.st_mode & 07777);
     }
 }
 
@@ -907,6 +943,8 @@ int main(int argc, char **argv) {
             registerOwnerApps(identifiers);
         } else if ([verb isEqualToString:@"owner-install"]) {
             installOwnerApps(identifiers);
+        } else if ([verb isEqualToString:@"owner-update"]) {
+            updateOwnerApp(identifiers);
         } else if ([verb isEqualToString:@"launch"]) {
             launchApps(identifiers);
         } else if ([verb isEqualToString:@"launch-args"]) {
