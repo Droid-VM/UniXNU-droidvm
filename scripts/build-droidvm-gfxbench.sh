@@ -188,6 +188,10 @@ Path(sys.argv[1]).write_bytes(plistlib.dumps({
         'IOSurfaceRootUserClient',
         'AGXDeviceUserClient',
     ],
+    # SpringBoard runs an app in classic mode (a 768x1024 canvas, pillarboxed) when the screen type matches none it was built
+    # for, which the guest's wide 1366x1024 portrait never does; an app with this entitlement bypasses classic mode
+    # (-[SBApplication _bypassesClassicMode]) and gets the whole screen.
+    'com.apple.UIKit.vends-view-services': True,
 }))
 PY
 codesign --force --sign - --pagesize 4096 --identifier org.droidvm.gfxbench \
