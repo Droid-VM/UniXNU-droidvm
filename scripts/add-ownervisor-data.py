@@ -12,6 +12,7 @@ Baked under /private/var/ngpu (the writable Data volume):
   bin/ownervisor bin/ownerctl bin/ownertest     the trusted binaries (build/droidvm-ownervisor, build-droidvm-ownervisor.py)
   ownervisor/services.d/adrenoprobe.json         exec adrenoprobed once (GPU probe), enabled
   ownervisor/services.d/selftest.json            exec ownertest (proves owner->owner spawn under AMFI), enabled
+  ownervisor/services.d/orientd.json             exec gfxprobe orient-follow (motion sensors -> device orientation), enabled
 BASE is not modified and the volume UUID is unchanged."""
 import json
 import os
@@ -84,6 +85,12 @@ def main():
                 ssh_dir = mount / 'ngpu/ssh'
                 ssh_dir.mkdir(parents=True, exist_ok=True)
                 os.chmod(ssh_dir, 0o700)
+            # gfxprobe: the GPU and display probes (scripts/build-droidvm-gfxprobe.py), whose orient-follow keeps backboardd's
+            # device orientation where the guest's motion sensors say (the orientd service below). Optional.
+            gfxprobe = ROOT / 'build/gfxprobe/gfxprobe'
+            if gfxprobe.is_file():
+                shutil.copyfile(gfxprobe, bin_dir / 'gfxprobe')
+                os.chmod(bin_dir / 'gfxprobe', 0o755)
             # The managed services. ownervisor creates run/log/state/control at startup; the seed carries the
             # definitions and the enable markers so they autostart from the first boot.
             # 'autostart' (a staging flag, stripped from the json) decides whether an enable marker is written. adrenoprobe is
@@ -100,6 +107,10 @@ def main():
                 # address on 2222; the login shell is zsh. Needs the rig's key at /private/var/ngpu/ssh/authorized_keys.
                 services['dropbear'] = {'exec': [
                     '/private/var/ngpu/bin/dropbear', '-F', '-E', '-R', '-p', '2222'], 'keepalive': True, 'throttle': 5}
+            if gfxprobe.is_file():
+                # A VM without motion sensors has no kern.droidvm_motion; orient-follow then waits for it quietly.
+                services['orientd'] = {'exec': ['/private/var/ngpu/bin/gfxprobe', 'orient-follow'], 'keepalive': True,
+                                       'throttle': 5}
             svc_dir, en_dir = mount / 'ngpu/ownervisor/services.d', mount / 'ngpu/ownervisor/enabled'
             for d in (mount / 'ngpu/ownervisor', svc_dir, en_dir):
                 d.mkdir(parents=True, exist_ok=True)

@@ -8,6 +8,10 @@
 // publishes the finger set where NativeHidInput's digitizer reads it every 8 ms (native_touch_*, a seqlock: odd
 // while written; DroidVMStubs.c), on the 30480 x 20320 axes it expects. The other input devices stay unconfigured.
 //
+// Motion sensors (crosvm --input motion, or any evdev accelerometer: INPUT_PROP_ACCELEROMETER with ABS_X/Y/Z, the gravity vector
+// in the panel's frame, Y up the panel) are read too. Their latest values, and the device orientation they say, are published in
+// droidvm_motion for DroidVMMotion.c's sysctl, where the owner tool that tells backboardd the device orientation reads them.
+//
 // NativeHidInput tells a lifted finger by the list getting shorter: whatever was published past the new count is
 // reported up. A finger that lifts while one published after it stays down is therefore first moved to the end of
 // the list (still down, where it was) and the list is shortened only once the digitizer has reported that order.
@@ -34,14 +38,21 @@ extern void IOSleep(unsigned milliseconds);
 #define DROIDVM_TOUCH_AXIS_Y 20320
 // A finger that comes down within this share (percent) of the screen's bottom starts at the bottom edge. iPadOS takes a swipe
 // as the Home gesture only from the edge band (NativeHidInput: 48 of 2032 rows, ~19 px of 800), and on the phone that band
-// lies in Android's own navigation gesture area, which keeps those touches for itself.
+// lies in Android's own navigation gesture area, which keeps those touches for itself. "Bottom" is the panel edge gravity
+// points at when motion sensors say which (the device held sideways puts the Home gesture on a side of the panel), and the
+// panel's own bottom when they do not.
 #define DROIDVM_TOUCH_BOTTOM_SNAP 4
 
 enum { EV_SYN = 0, EV_KEY = 1, EV_ABS = 3 };
-enum { SYN_REPORT = 0, ABS_X = 0, ABS_Y = 1, ABS_MT_SLOT = 0x2f, ABS_MT_POSITION_X = 0x35, ABS_MT_POSITION_Y = 0x36,
-       ABS_MT_TRACKING_ID = 0x39, BTN_LEFT = 0x110, BTN_TOUCH = 0x14a, INPUT_PROP_DIRECT = 1, KEY_ENTER = 28, KEY_A = 30 };
+enum { SYN_REPORT = 0, ABS_X = 0, ABS_Y = 1, ABS_Z = 2, ABS_RZ = 5, ABS_MT_SLOT = 0x2f, ABS_MT_POSITION_X = 0x35,
+       ABS_MT_POSITION_Y = 0x36, ABS_MT_TRACKING_ID = 0x39, BTN_LEFT = 0x110, BTN_TOUCH = 0x14a, INPUT_PROP_DIRECT = 1,
+       INPUT_PROP_ACCELEROMETER = 6, KEY_ENTER = 28, KEY_A = 30 };
 enum { CFG_ID_NAME = 1, CFG_PROP_BITS = 0x10, CFG_EV_BITS = 0x11, CFG_ABS_INFO = 0x12 };
-enum { KIND_NONE, KIND_TOUCH, KIND_POINTER, KIND_KEYBOARD };
+enum { KIND_NONE, KIND_TOUCH, KIND_POINTER, KIND_KEYBOARD, KIND_MOTION };
+// UIDeviceOrientation, as backboardd takes it: 0 not known (lying flat, or between two), 1 portrait, 2 upside down, 3 landscape
+// left (the Home side on the right: the panel's left edge down), 4 landscape right (its right edge down).
+enum { ORIENTATION_UNKNOWN, ORIENTATION_PORTRAIT, ORIENTATION_UPSIDE_DOWN, ORIENTATION_LANDSCAPE_LEFT,
+       ORIENTATION_LANDSCAPE_RIGHT };
 
 struct droidvm_input_desc { uint64_t address; uint32_t length; uint16_t flags, next; };
 struct droidvm_input_event { uint16_t type, code; int32_t value; };
@@ -62,15 +73,22 @@ struct droidvm_input {
     bool pointer_down;
     uint8_t key_modifiers, keys[6];   // a keyboard's boot report state: modifier bits and up to six usages held
     bool keys_changed;
+    int32_t motion[6];                 // motion sensors: ABS_X..ABS_RZ as last reported
 };
 static struct droidvm_input droidvm_inputs[DROIDVM_INPUT_DEVICES];
 static unsigned droidvm_input_count;
 
-// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 0 left alone), events and frames
+// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 4 motion, 0 left alone), events and frames
 // seen, keyboard reports sent.
 volatile uint32_t droidvm_input_found, droidvm_input_started, droidvm_input_kinds[DROIDVM_INPUT_DEVICES];
 volatile uint64_t droidvm_input_events, droidvm_input_frames, droidvm_input_published, droidvm_input_key_reports;
 char droidvm_input_names[DROIDVM_INPUT_DEVICES][48];
+
+// The motion sensors' latest frame and the orientation it says (DroidVMMotion.c publishes it as kern.droidvm_motion). seq is
+// odd while a frame is written, so a reader that sees the same even seq before and after its copy has a whole one.
+struct droidvm_motion { volatile uint32_t seq; int32_t orientation, accel[3], gyro[3]; };
+struct droidvm_motion droidvm_motion;
+extern void droidvm_motion_register(void);
 
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
 extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
@@ -200,7 +218,33 @@ static unsigned input_identify(struct droidvm_input *d) {
         input_axis(d, ABS_X, &d->min_x, &d->span_x) && input_axis(d, ABS_Y, &d->min_y, &d->span_y))
         return KIND_POINTER;
     if (input_bit(keys, nkeys, KEY_A) && input_bit(keys, nkeys, KEY_ENTER)) return KIND_KEYBOARD;
+    if (input_bit(props, nprops, INPUT_PROP_ACCELEROMETER) && input_bit(abs, nabs, ABS_X) && input_bit(abs, nabs, ABS_Y) &&
+        input_bit(abs, nabs, ABS_Z))
+        return KIND_MOTION;
     return KIND_NONE;
+}
+
+// The device orientation gravity says, as iio-sensor-proxy decides it: an axis wins when gravity leans more than 35 degrees
+// along it out of the plane of the other two (tan^2 35 = 0.49, in integers: no floating point in the kernel), and nothing
+// changes while both lean that far, or neither does (flat on a table). Only directions matter, so the device's units do not.
+static int32_t motion_orientation(int32_t previous, const int32_t accel[3]) {
+    int64_t x = accel[0], y = accel[1], z = accel[2];
+    bool along_x = 100 * x * x > 49 * (y * y + z * z), along_y = 100 * y * y > 49 * (x * x + z * z);
+    if (along_x == along_y) return previous;
+    if (along_x) return x > 0 ? ORIENTATION_LANDSCAPE_RIGHT : ORIENTATION_LANDSCAPE_LEFT;
+    return y > 0 ? ORIENTATION_UPSIDE_DOWN : ORIENTATION_PORTRAIT;
+}
+
+static void motion_publish(const struct droidvm_input *d) {
+    droidvm_motion.seq = droidvm_motion.seq + 1;
+    input_barrier();
+    for (unsigned i = 0; i < 3; ++i) {
+        droidvm_motion.accel[i] = d->motion[i];
+        droidvm_motion.gyro[i] = d->motion[3 + i];
+    }
+    droidvm_motion.orientation = motion_orientation(droidvm_motion.orientation, d->motion);
+    input_barrier();
+    droidvm_motion.seq = droidvm_motion.seq + 1;
 }
 
 // The fingers in the order they were published: device, slot (DROIDVM_INPUT_SLOTS for a pointer) and HID identifier.
@@ -254,6 +298,26 @@ static bool finger_down(const struct droidvm_finger *f) {
 }
 
 // After a frame: drop the lifted fingers (each moved to the end first), update the others, append the new ones.
+// A finger coming down near the bottom edge -- the one gravity points at -- starts on it (DROIDVM_TOUCH_BOTTOM_SNAP).
+static void touch_snap(struct droidvm_finger *f) {
+    const int32_t snap_x = DROIDVM_TOUCH_AXIS_X * DROIDVM_TOUCH_BOTTOM_SNAP / 100;
+    const int32_t snap_y = DROIDVM_TOUCH_AXIS_Y * DROIDVM_TOUCH_BOTTOM_SNAP / 100;
+    switch (droidvm_motion.orientation) {
+    case ORIENTATION_UPSIDE_DOWN:
+        if (f->y < snap_y) f->y = 0;
+        break;
+    case ORIENTATION_LANDSCAPE_LEFT:
+        if (f->x < snap_x) f->x = 0;
+        break;
+    case ORIENTATION_LANDSCAPE_RIGHT:
+        if (f->x >= DROIDVM_TOUCH_AXIS_X - snap_x) f->x = DROIDVM_TOUCH_AXIS_X - 1;
+        break;
+    default:
+        if (f->y >= DROIDVM_TOUCH_AXIS_Y - snap_y) f->y = DROIDVM_TOUCH_AXIS_Y - 1;
+        break;
+    }
+}
+
 static void touch_frame(void) {
     struct droidvm_finger next[DROIDVM_TOUCH_FINGERS];
     unsigned n = 0;
@@ -300,8 +364,7 @@ static void touch_frame(void) {
         int32_t y = next[i].slot < DROIDVM_INPUT_SLOTS ? d->slots[next[i].slot].y : d->pointer_y;
         next[i].x = input_scale(x, d->min_x, d->span_x, DROIDVM_TOUCH_AXIS_X);
         next[i].y = input_scale(y, d->min_y, d->span_y, DROIDVM_TOUCH_AXIS_Y);
-        if (next[i].fresh && next[i].y >= DROIDVM_TOUCH_AXIS_Y * (100 - DROIDVM_TOUCH_BOTTOM_SNAP) / 100)
-            next[i].y = DROIDVM_TOUCH_AXIS_Y - 1;
+        if (next[i].fresh) touch_snap(&next[i]);
         next[i].fresh = false;
     }
     memcpy(droidvm_order, next, n * sizeof(next[0]));
@@ -388,6 +451,8 @@ static bool input_event(struct droidvm_input *d, const struct droidvm_input_even
         else if (e->type == EV_KEY && (e->code == BTN_LEFT || e->code == BTN_TOUCH)) d->pointer_down = e->value != 0;
     } else if (d->kind == KIND_KEYBOARD && e->type == EV_KEY && e->value != 2) {
         keyboard_key(d, e->code, e->value != 0);
+    } else if (d->kind == KIND_MOTION && e->type == EV_ABS && e->code <= ABS_RZ) {
+        d->motion[e->code] = e->value;
     }
     return false;
 }
@@ -407,6 +472,7 @@ static void input_poll(struct droidvm_input *d) {
             if (input_event(d, &droidvm_input_buffers[d->index][id])) {
                 droidvm_input_frames = droidvm_input_frames + 1;
                 if (d->kind == KIND_KEYBOARD) keyboard_publish(d);
+                else if (d->kind == KIND_MOTION) motion_publish(d);
                 else touch_frame();
             }
             available[2 + (head + returned) % d->size] = (uint16_t)id;
@@ -476,7 +542,9 @@ void droidvm_input_start(void) {
             droidvm_input_kinds[droidvm_input_count] = KIND_NONE;
             continue;
         }
-        printf("droidvm input %s: %s, %s\n", path, droidvm_input_names[d->index], d->kind == KIND_TOUCH ? "touch" : d->kind == KIND_POINTER ? "pointer" : "keyboard");
+        printf("droidvm input %s: %s, %s\n", path, droidvm_input_names[d->index], d->kind == KIND_TOUCH ? "touch" :
+               d->kind == KIND_POINTER ? "pointer" : d->kind == KIND_MOTION ? "motion sensors" : "keyboard");
+        if (d->kind == KIND_MOTION) droidvm_motion_register();
         droidvm_input_count++;
     }
     droidvm_input_started = droidvm_input_count;

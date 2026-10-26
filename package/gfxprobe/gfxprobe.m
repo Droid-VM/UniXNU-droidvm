@@ -30,6 +30,10 @@
 //                                       with com.apple.backboardd.setDeviceOrientation. The guest's panel is landscape-native, so
 //                                       iPadOS's portrait (1) is its wide, upright screen and 3 and 4 turn everything sideways
 //
+//   gfxprobe orient-follow              stay running and keep backboardd's device orientation where the guest's motion sensors say
+//                                       the device is held (kern.droidvm_motion, DroidVMMotion.c): an owner service, started at
+//                                       boot by ownervisor. Lying flat, or between two orientations, changes nothing
+//
 //   gfxprobe memcheck MIB SECONDS       a process that never touches the GPU keeps MIB of anonymous memory, each word holding its
 //                                       own address mixed with its chunk's salt, and checks all of it again and again for SECONDS;
 //                                       every round a sixteenth of the chunks goes back to the kernel and comes anew, so the process
@@ -167,6 +171,7 @@
 #import <os/lock.h>
 #import <sys/mman.h>
 #import <sys/stat.h>
+#import <sys/sysctl.h>
 #import <unistd.h>
 
 static const uintptr_t kRBDrawableSize = 0x1e2687330;      // -[RBDrawable size], unslid
@@ -1711,6 +1716,41 @@ static int setOrientation(long orientation) {
     return 0;
 }
 
+// kern.droidvm_motion (DroidVMMotion.c): the motion sensors' latest frame and the UIDeviceOrientation it says, 0 for none yet.
+struct DroidVMMotionSample { uint32_t seq; int32_t orientation, accel[3], gyro[3]; };
+
+static int followOrientation(void) {
+    void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
+    void (*set)(long) = bbs ? (void (*)(long))dlsym(bbs, "BKSHIDServicesSetDeviceOrientationForAutomation") : NULL;
+    if (!set) {
+        fprintf(stderr, "no BKSHIDServicesSetDeviceOrientationForAutomation\n");
+        return 1;
+    }
+    int32_t sent = 0;
+    bool missing = false;
+    for (;;) {
+        struct DroidVMMotionSample sample;
+        size_t size = sizeof(sample);
+        if (sysctlbyname("kern.droidvm_motion", &sample, &size, NULL, 0) != 0 || size != sizeof(sample)) {
+            // No motion-sensor device (yet): the VM has none, or the driver has not found it. Keep looking, quietly.
+            if (!missing) fprintf(stderr, "kern.droidvm_motion: %s; waiting\n", strerror(errno));
+            missing = true;
+            sleep(5);
+            continue;
+        }
+        missing = false;
+        // backboardd follows; it would also take the same value again, but there is no reason to send it.
+        if (sample.orientation >= 1 && sample.orientation <= 4 && sample.orientation != sent) {
+            set(sample.orientation);
+            printf("device orientation %d (gravity %d %d %d)\n", sample.orientation, sample.accel[0], sample.accel[1],
+                   sample.accel[2]);
+            fflush(stdout);
+            sent = sample.orientation;
+        }
+        usleep(100000);
+    }
+}
+
 static int compileMetal(const char *sourcePath, const char *outPath, const char *options) {
     void *library = dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_NOW);
     void *(*create)(const char *) = library ? dlsym(library, "MTLCodeGenServiceCreate") : NULL;
@@ -1846,6 +1886,8 @@ int main(int argc, char **argv) {
         }
         if (argc >= 3 && !strcmp(argv[1], "orient"))
             return setOrientation(strtol(argv[2], NULL, 0));
+        if (argc >= 2 && !strcmp(argv[1], "orient-follow"))
+            return followOrientation();
         if (argc >= 2 && !strcmp(argv[1], "tess"))
             return tessCheck();
         if (argc >= 2 && !strcmp(argv[1], "ci"))
