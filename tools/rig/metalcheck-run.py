@@ -19,16 +19,14 @@ import peek
 
 RIG = Path(__file__).resolve().parent
 FIELDS = {
-    'kernel_debugger_entry_count': 'I', 'droidvm_gpu_capabilities': 'I',
-    'droidvm_gpu_lost_mask': 'I', 'droidvm_gpu_lost': '32I',
-    'droidvm_gpu_generation': '32I', 'droidvm_virtio_display_frames': 'Q',
+    'kernel_debugger_entry_count': 'I', 'droidvm_virtio_display_frames': 'Q',
     'droidvm_virtio_gpu_errors': 'Q', 'droidvm_virtio_gpu_timeouts': 'Q',
-    'native_legacy_early_retires': 'Q', 'droidvm_virtio_present_wait': 'I',
+    'native_legacy_early_failures': 'Q', 'droidvm_virtio_present_wait': 'I',
     'native_adreno_pool_stats': '8I', 'native_adreno_kept': '6Q',
     'vm_page_free_count': 'I', 'vm_page_active_count': 'I',
     'vm_page_inactive_count': 'I', 'vm_page_wire_count': 'I',
     'vm_page_purgeable_count': 'I', 'memorystatus_level': 'I',
-    '__ZN12_GLOBAL__N_117gPresentSubmittedE': 'I',
+    'droidvm_virtgpu_stats': '8Q',
 }
 
 
@@ -68,13 +66,10 @@ def main():
         return row
 
     baseline = snapshot()
-    # Per-client loss reporting is droidvm-gpu's; a VM without that device (Metal on the virtio GPU only) has none to check.
-    if baseline['kernel_debugger_entry_count'] or baseline['droidvm_gpu_lost_mask']:
+    if baseline['kernel_debugger_entry_count']:
         raise SystemExit('guest must be healthy')
-    if not baseline['droidvm_gpu_capabilities'] & 1:
-        print('no droidvm-gpu per-client loss reporting (virtio GPU only)', flush=True)
-    if baseline['native_legacy_early_retires'] or baseline['droidvm_virtio_present_wait'] != 1:
-        raise SystemExit('guest must retain surfaces and wait for GPU producers')
+    if baseline['native_legacy_early_failures'] or baseline['droidvm_virtio_present_wait'] != 1:
+        raise SystemExit('guest must wait for GPU producers, with no failed display copy')
     guest_report = '/private/var/ngpu/metalcheck-' + str(time.time_ns()) + '.json'
     command = ['/private/var/ngpu/apps/MetalCheck.app/MetalCheck', '--cli', '--output', guest_report]
     if args.benchmark:
@@ -93,11 +88,7 @@ def main():
                     rows.append(row)
                     samples.write(json.dumps(row) + '\n')
                     samples.flush()
-                    if row['droidvm_gpu_lost_mask'] or row['droidvm_gpu_lost'] != baseline['droidvm_gpu_lost']:
-                        if 'GPU context loss' not in failures:
-                            failures.append('GPU context loss')
-                            print('GPU context loss detected', flush=True)
-                    for name in ('kernel_debugger_entry_count', 'droidvm_virtio_gpu_errors', 'droidvm_virtio_gpu_timeouts', 'native_legacy_early_retires'):
+                    for name in ('kernel_debugger_entry_count', 'droidvm_virtio_gpu_errors', 'droidvm_virtio_gpu_timeouts', 'native_legacy_early_failures'):
                         if row[name] != baseline[name] and name not in failures:
                             failures.append(name)
                 except Exception as error:

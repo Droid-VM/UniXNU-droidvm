@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Replace the DroidVM app's crosvm with a local build (CROSVM_BIN, e.g. the meta repo's crosvm_out/crosvm after
 # 2_build_crosvm.sh). The VM must be stopped first (vm.sh stop). Keeps the current binary as crosvm.bak-<md5 prefix>, gives the
-# new one the old one's owner, mode and SELinux label, and checks the copy. The guest kernel and crosvm must agree on the
-# droidvm-gpu wire version (DroidVMGpuWire.h vs devices/src/virtio/droidvm_gpu.rs).
+# new one the old one's owner, mode and SELinux label, and checks the copy.
 set -eu
 RIG=$(cd "$(dirname "$0")" && pwd)
 . "$RIG/rigenv.sh"

@@ -361,7 +361,7 @@ ethernet_late=stage_late(ethernet_obj,'DroidVMVirtioEthernet')
 netif_source=ROOT/'kits/droidvm/DroidVMVirtioNetIf.cpp'
 netif_obj=OUT/'DroidVMVirtioNetIf.o'
 run(iokit_command(netif_source,netif_obj)+strict,cwd=iokit_record['directory'])
-# The paravirtual Adreno over the host's KGSL (scripts/build-droidvm-gpu.py, an earlier archive step), with the NativeAdreno parts it keeps.
+# NativeAdreno's face for Metal over the virtio GPU (scripts/build-droidvm-gpu.py, an earlier archive step), with the NativeAdreno parts it keeps.
 gpu_objects=[ROOT/p for p in json.loads((ROOT/'build/droidvm-gpu/objects.json').read_text())]
 gpu_sources=[ROOT/p for p in json.loads((ROOT/'build/droidvm-gpu/sources.json').read_text())]
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)

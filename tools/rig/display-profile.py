@@ -62,7 +62,7 @@ def run(reader, mode, cycles):
     soak.require_consumer()
     start_swap = struct.unpack('<I', reader.read('__ZL14swapEventCount', 4))[0]
     start_present = struct.unpack('<Q', reader.read('droidvm_virtio_present_probes', 8))[0]
-    start_gpu = struct.unpack('<I', reader.read('__ZN12_GLOBAL__N_117gPresentSubmittedE', 4))[0]
+    start_gpu = struct.unpack('<8Q', reader.read('droidvm_virtgpu_stats', 64))[5]   # fenced 3D submissions
     swaps, presents, failures = {}, {}, []
     stop = threading.Event()
 
@@ -104,7 +104,7 @@ def run(reader, mode, cycles):
         raise RuntimeError(f'timing sampler failed: {failures}')
     if not swaps or not presents:
         raise RuntimeError('no completed swaps sampled')
-    end_gpu = struct.unpack('<I', reader.read('__ZN12_GLOBAL__N_117gPresentSubmittedE', 4))[0]
+    end_gpu = struct.unpack('<8Q', reader.read('droidvm_virtgpu_stats', 64))[5]
     if end_gpu == start_gpu:
         raise RuntimeError('3D submissions did not advance; refusing stale-surface performance results')
     if any(row[3] != mode or row[4] for row in presents.values()):

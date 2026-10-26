@@ -9,14 +9,12 @@
 #include <pexpert/pexpert.h>
 extern "C" void native_legacy_gpu_complete(void *, int);
 extern "C" void native_legacy_frame_observed(unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-extern "C" uint32_t droidvm_gpu_scanout_fence(void);
-extern "C" IOReturn droidvm_gpu_scanout_wait(uint32_t, bool, uint32_t *);
 extern "C" uint64_t droidvm_virtgpu_submitted(void);
 extern "C" bool droidvm_virtgpu_finished(uint64_t);
 extern "C" {
 volatile uint32_t droidvm_virtio_display_state, droidvm_virtio_display_blob, droidvm_virtio_display_last_status;
 volatile uint64_t droidvm_virtio_display_frames, droidvm_virtio_display_boot_frames, droidvm_virtio_display_resources;
-// Every swap waits for its captured producer fence, including the first swap after reboot.
+// Every swap waits for the GPU work submitted before it, including the first swap after reboot.
 // Setting this to 0 is an unsafe diagnostic A/B override, never the normal display path.
 volatile uint32_t droidvm_virtio_present_wait = 1;
 volatile uint64_t droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us;
@@ -34,9 +32,9 @@ struct Resource {
     uint32_t width, height, id;
     bool prepared, usable;
 };
-// producer: the droidvm-gpu device's timeline at the swap; work: the virtio GPU's fenced submissions made before it
-// (droidvm_virtgpu_submitted). The frame is drawn once both have finished.
-struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height, producer; uint64_t work; };
+// work: the virtio GPU's fenced submissions made before the swap (droidvm_virtgpu_submitted). The frame is drawn once they have
+// finished.
+struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height; uint64_t work; };
 Resource resources[8], boot;
 Entry entries[MaxEntries]; // worker-owned scratch, never shared with another producer
 IOLock *frameLock;
@@ -152,11 +150,9 @@ void worker(void *, wait_result_t) {
         IOLockUnlock(frameLock);
         if (frame.memory) {
             const uint32_t mode = droidvm_virtio_present_wait;
-            uint32_t retired = 0;
             const uint64_t begin = nowUs();
-            IOReturn producerStatus = droidvm_gpu_scanout_wait(frame.producer, mode != 0, &retired);
             bool drawn = droidvm_virtgpu_finished(frame.work);
-            const bool busy = int32_t(frame.producer - retired) > 0 || !drawn;
+            const bool busy = !drawn;
             while (mode && !drawn && nowUs() - begin < 2000000) {
                 IOSleep(1);   // GPU work: sleep, so the vCPU goes idle
                 drawn = droidvm_virtgpu_finished(frame.work);
@@ -169,15 +165,15 @@ void worker(void *, wait_result_t) {
             droidvm_virtio_present_wait_us = droidvm_virtio_present_wait_us + waited;
             Resource *r = surface(frame);
             const uint64_t flushBegin = nowUs();
-            status = producerStatus ? producerStatus : r ? present(*r) : kIOReturnIOError;
-            // Without the droidvm-gpu device the sample's fence is the virtio GPU's work number, and retired says it was drawn.
-            droidvm_virtio_present_samples[sample % 64] = {sample + 1, frame.producer ? frame.producer : uint32_t(frame.work),
-                frame.producer ? retired : uint32_t(drawn ? frame.work : 0), mode, uint32_t(status), waited, nowUs() - flushBegin};
+            status = r ? present(*r) : kIOReturnIOError;
+            // The sample's fence is the swap's work number, and retired the same once that work was drawn.
+            droidvm_virtio_present_samples[sample % 64] = {sample + 1, uint32_t(frame.work), uint32_t(drawn ? frame.work : 0), mode,
+                uint32_t(status), waited, nowUs() - flushBegin};
             droidvm_virtio_display_last_status = status;
-            if (producerStatus || !ready()) {
-                // Neither an unfinished producer nor an unacknowledged display DMA is a
-                // completed frame. Keep this swap and its references; recovery must quiesce
-                // the GPU before it can retire them. CPU fallback would also race the writer.
+            if (!ready()) {
+                // An unacknowledged display DMA is not a completed frame. Keep this swap and its
+                // references; recovery must quiesce the GPU before it can retire them. CPU
+                // fallback would also race the writer.
                 droidvm_virtio_display_state = 3;
                 IOLog("virtio-gpu: scanout stopped with outstanding DMA, status %x\n", status);
                 return;
@@ -217,7 +213,7 @@ extern "C" bool droidvm_virtio_gpu_offer(void *display, IOMemoryDescriptor *memo
     bool accepted = !pending.memory;
     if (accepted) {
         auto service = static_cast<IOService *>(display);
-        memory->retain(); service->retain(); pending = {service, memory, stride, width, height, droidvm_gpu_scanout_fence(), droidvm_virtgpu_submitted()};
+        memory->retain(); service->retain(); pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted()};
         compositor = true;
     }
     IOLockUnlock(frameLock); return accepted;

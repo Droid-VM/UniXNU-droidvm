@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Build the DroidVM guest's paravirtual Adreno (kits/droidvm/DroidVMGpu.cpp) with the parts of NativeAdreno it keeps.
+"""Build the DroidVM guest's NativeAdreno face for Metal over the virtio GPU (kits/droidvm/DroidVMGpu.cpp) with the parts of
+NativeAdreno it keeps.
 
 NativeAdreno's user client, IOKit surface, execbuf and memory (NativeAdrenoUserClient, NativeAdrenoPublish, NativeAdrenoSubmit,
 NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled unchanged, except for a few lines of
-NativeAdrenoPublish.cpp, compiled from a staged copy: its client windows are absolute addresses of sheng's GPU address space
-(0x20000000..), and here the space is the KGSL VBO the host reserved, so they are offset from droidvm_gpu_window_base() (the VBO's
-start), and there are ten of them instead of four (below). The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer)
-come from DroidVMGpu.cpp instead of their own sources. The staged AGXAccelerator (build-native-adreno-accelerator.py) rides
-along for droidvm-gpu-metal=1.
+NativeAdrenoPublish.cpp, compiled from a staged copy (its client windows, 32 slots and the per-slot hooks below, made for the
+KGSL proxy crosvm's droidvm-gpu device used to be; with that device gone the hooks refuse NativeAdreno's own KGSL-style opens).
+The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer) come from DroidVMGpu.cpp, never attached, instead of
+their own sources. The staged AGXAccelerator (build-native-adreno-accelerator.py) rides along for droidvm-gpu-metal=1: Metal's
+user client is the accelerator's, which DroidVMVirtioGpu3D.cpp serves.
 
 The objects land in build/droidvm-gpu; build-native-legacy-display.py archives them into the late display archive, which the
 kernel force-loads (this board does not select CONFIG_XNU_NATIVE_ADRENO, the sheng GPU)."""
@@ -295,7 +296,6 @@ if missing:
 (OUT / 'sources.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in
                                               sources[:-3] + [ADRENO / 'NativeAdrenoUserClient.cpp',
                                                               ADRENO / 'NativeAdrenoPublish.cpp', sources[-1],
-                                                              ROOT / 'kits/droidvm/DroidVMGpuWire.h',
                                                               ROOT / 'kits/AdrenoPM4/AdrenoPM4.c',
                                                               ADRENO / 'NativeAdrenoAccelerator.cpp']], indent=2) + '\n')
-print(f'droidvm-gpu: {len(objects)} objects (NativeAdreno user client, IOKit surface, execbuf and memory over the KGSL proxy)')
+print(f'droidvm-gpu: {len(objects)} objects (NativeAdreno user client, IOKit surface, execbuf and memory; Metal over the virtio GPU)')

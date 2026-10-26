@@ -34,9 +34,7 @@ COUNTERS = {
     'native_legacy_copy_n': 8,
     'native_legacy_gpu_fallbacks': 4,
     'native_legacy_early_retires': 8,
-    '__ZN12_GLOBAL__N_117gPresentSubmittedE': 4,
-    'droidvm_gpu_capabilities': 4,
-    'droidvm_gpu_lost_mask': 4,
+    'native_legacy_early_failures': 8,
 }
 
 
@@ -47,10 +45,10 @@ def snapshot():
         if len(raw) != size:
             raise RuntimeError(f'short read of {name}: {len(raw)}/{size} bytes')
         values[name] = int.from_bytes(raw, 'little')
-    raw = peek.read('droidvm_gpu_lost', 32 * 4)[1]
-    if len(raw) != 32 * 4:
-        raise RuntimeError('short read of 3D GPU context loss counters')
-    values['gpu_context_losses'] = list(struct.unpack('<32I', raw))
+    raw = peek.read('droidvm_virtgpu_stats', 64)[1]
+    if len(raw) != 64:
+        raise RuntimeError('short read of the virtio GPU 3D counters')
+    values['virtgpu_fenced_submissions'] = struct.unpack('<8Q', raw)[5]
     body, _ = export.request(2, '')
     procs = [line.split(None, 2) for line in body.decode(errors='replace').splitlines()]
     values['backboardd_pid'] = next((int(p[0]) for p in procs if len(p) == 3 and p[2] == 'backboardd'), None)
@@ -62,15 +60,11 @@ def validate(values, baseline=None):
         raise RuntimeError('kernel debugger entered or virtio display stopped')
     if values['droidvm_virtio_present_wait'] != 1:
         raise RuntimeError('producer fence waiting is not enabled')
-    if values['native_legacy_early_retires']:
-        raise RuntimeError('source surfaces have been retired before display completion')
+    if values['native_legacy_early_failures']:
+        raise RuntimeError('a frame retired on offer failed its display copy')
     if not values['backboardd_pid']:
         raise RuntimeError('backboardd is absent')
-    if values['droidvm_gpu_lost_mask']:
-        raise RuntimeError('a current GPU connection has lost its context')
     if baseline:
-        if values['gpu_context_losses'] != baseline['gpu_context_losses']:
-            raise RuntimeError('a 3D GPU context was lost during the run')
         if values['backboardd_pid'] != baseline['backboardd_pid']:
             raise RuntimeError('backboardd restarted during the run')
         for name in ('droidvm_virtio_gpu_errors', 'droidvm_virtio_gpu_timeouts',
@@ -128,7 +122,7 @@ def main():
         shot(out / 'start.png')
         width, height = rig_input.GUEST_WIDTH, rig_input.GUEST_HEIGHT
         previous_frames = before['droidvm_virtio_display_frames']
-        previous_submit = before['__ZN12_GLOBAL__N_117gPresentSubmittedE']
+        previous_submit = before['virtgpu_fenced_submissions']
         for cycle in range(1, args.cycles + 1):
             rig_input.MAPPING = None
             swipe(width * .22, height * .51, width * .88, height * .51, 700)
@@ -145,9 +139,9 @@ def main():
             if values['droidvm_virtio_display_frames'] <= previous_frames:
                 raise RuntimeError('display did not advance during the gesture cycle')
             previous_frames = values['droidvm_virtio_display_frames']
-            if values['__ZN12_GLOBAL__N_117gPresentSubmittedE'] == previous_submit:
+            if values['virtgpu_fenced_submissions'] == previous_submit:
                 raise RuntimeError('3D GPU submissions did not advance; displayed swaps may be stale surfaces')
-            previous_submit = values['__ZN12_GLOBAL__N_117gPresentSubmittedE']
+            previous_submit = values['virtgpu_fenced_submissions']
             report['completed_cycles'] = cycle
             if cycle % 5 == 0 or cycle == args.cycles:
                 require_consumer()

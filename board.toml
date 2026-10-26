@@ -44,7 +44,7 @@ archives = [
   "build-arm-driver.py NativeRamBlock",
   "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
   "build-libpthread-kernel.py",
-  # The paravirtual Adreno over crosvm's droidvm-gpu device (the host's KGSL); its objects ride in the display archive below.
+  # NativeAdreno's face for Metal over the virtio GPU (DroidVMGpu.cpp); its objects ride in the display archive below.
   "build-droidvm-gpu.py",
   "build-native-legacy-display.py",
 ]
@@ -189,9 +189,8 @@ kernel_args = [
   # retried com.apple.BTAudioHALPlugin.xpc about 110 times a second (95% of the unified log), and it needs only the keychain.
   "droidvm-disable-jobs=watchdogd,identityservicesd,locationd,CommCenter,fairplayd.A2",
   # Metal's 3D through the virtio GPU's DRM context (drm2kgsl on the host): turnip asks the kernel (package/DroidVMVirtioGpu3D.cpp,
-  # DROIDVM_VIRTGPU_PARAM_DEFAULT_3D). The VM has no droidvm-gpu device any more (crosvm's --droidvm-gpu KGSL proxy); without
-  # droidvm-gpu=1, DroidVMGpu.cpp only publishes NativeAdreno's user client, which serves the virtio GPU's opens, and the accelerator.
-  # A VM that still has the device can take droidvm-gpu=1 back (TU_DARWIN_VIRTGPU=0 in a process then picks it).
+  # DROIDVM_VIRTGPU_PARAM_DEFAULT_3D). DroidVMGpu.cpp publishes NativeAdreno, whose accelerator's user client serves the virtio
+  # GPU's opens, and the accelerator (crosvm's --droidvm-gpu KGSL proxy and the guest's driver for it are gone).
   "vgpu-3d=1",
   # the AGXAccelerator for the original Metal discovery, and the plugin bundle (staged in the Data seed by add-gpu-plugin-data.py)
   # mounted over /System/Library/Extensions

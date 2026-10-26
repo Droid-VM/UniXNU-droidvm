@@ -16,9 +16,7 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
     which serves only verified read-only images, does not bind it
   - /arm-io/input-N: the "virtio,mmio" nodes at --input-mmio instead, the input devices of crosvm
     --virtio-mmio-input (package/DroidVMVirtioInput.c), compatible "droidvm,virtio-input"
-  - /arm-io/gpu: the "virtio,mmio" node at --gpu-mmio instead, crosvm's --droidvm-gpu device
-    (package/DroidVMGpu.cpp, the host's KGSL), compatible "droidvm,gpu"
-  - /arm-io/virtio-gpu: --virtio-gpu-mmio, distinct from the legacy KGSL proxy. Its drm-host-pool
+  - /arm-io/virtio-gpu: --virtio-gpu-mmio, the virtio GPU (package/DroidVMVirtioGpu*.cpp). Its drm-host-pool
     property carries the absolute GPA and size of the FDT's pre-shared drm2kgsl_host pool.
   - /chosen/darwinboot-video-memory: --boot-video-mib reserves ordinary RAM below the panic
     region for a BLT-only GOP handoff. It needs no crosvm simplefb device or framebuffer MMIO.
@@ -214,8 +212,6 @@ def main():
                         help='/product artwork-display-gamut: P3 is the iPad7,1 panel; sRGB keeps UIKit on 8-bit sRGB surfaces')
     parser.add_argument('--input-mmio', default='',
                         help='Bases of the FDT virtio-mmio windows of the input devices, comma-separated (/arm-io/input-N)')
-    parser.add_argument('--gpu-mmio', type=lambda value: int(value, 0), default=None,
-                        help='Base of the FDT virtio-mmio window of the droidvm-gpu device (/arm-io/gpu)')
     parser.add_argument('--net-mmio', type=lambda value: int(value, 0), default=None,
                         help='Base of the FDT virtio-mmio window of the virtio-net device (/arm-io/net)')
     parser.add_argument('--virtio-gpu-mmio', type=lambda value: int(value, 0), default=None,
@@ -285,7 +281,7 @@ def main():
     except ValueError:
         parser.error('--input-mmio takes comma-separated addresses')
     virtio_mmio = [window for window in vm['virtio_mmio']
-                   if window[0] not in (args.data_store_mmio, args.gpu_mmio, args.net_mmio, args.virtio_gpu_mmio)
+                   if window[0] not in (args.data_store_mmio, args.net_mmio, args.virtio_gpu_mmio)
                    and window[0] not in input_bases]
     data_store = [window for window in vm['virtio_mmio'] if window[0] == args.data_store_mmio]
     if args.data_store_mmio is not None and not data_store:
@@ -293,16 +289,13 @@ def main():
     inputs = [window for base in input_bases for window in vm['virtio_mmio'] if window[0] == base]
     if len(inputs) != len(input_bases) or args.data_store_mmio in input_bases:
         parser.error('every --input-mmio base must be a virtio-mmio window of the FDT, other than the data store')
-    gpu = [window for window in vm['virtio_mmio'] if window[0] == args.gpu_mmio]
-    if args.gpu_mmio is not None and (not gpu or args.gpu_mmio in input_bases or args.gpu_mmio == args.data_store_mmio):
-        parser.error(f'--gpu-mmio {args.gpu_mmio:#x} must be a virtio-mmio window of the FDT of its own')
     net = [window for window in vm['virtio_mmio'] if window[0] == args.net_mmio]
     if args.net_mmio is not None and (not net or args.net_mmio in input_bases or
-                                      args.net_mmio in (args.data_store_mmio, args.gpu_mmio)):
+                                      args.net_mmio == args.data_store_mmio):
         parser.error(f'--net-mmio {args.net_mmio:#x} must be a virtio-mmio window of the FDT of its own')
     virtio_gpu = [window for window in vm['virtio_mmio'] if window[0] == args.virtio_gpu_mmio]
     if args.virtio_gpu_mmio is not None and (not virtio_gpu or args.virtio_gpu_mmio in input_bases or
-                                           args.virtio_gpu_mmio in (args.data_store_mmio, args.gpu_mmio, args.net_mmio)):
+                                           args.virtio_gpu_mmio in (args.data_store_mmio, args.net_mmio)):
         parser.error(f'--virtio-gpu-mmio {args.virtio_gpu_mmio:#x} must be a virtio-mmio window of the FDT of its own')
 
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
@@ -383,10 +376,6 @@ def main():
                                            ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
                                            ('dma-coherent', b'')])
                 for index, (address, size) in enumerate(inputs)],
-              *[node('gpu', [('compatible', b'droidvm,gpu\0'),
-                             ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
-                             ('dma-coherent', b'')])
-                for address, size in gpu],
               *[node('net', [('compatible', b'droidvm,net\0'),
                              ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
                              ('dma-coherent', b'')])
@@ -403,7 +392,7 @@ def main():
           f'psci {psci_method}, dram {dram_base:#x}+{args.dram_size:#x}, timebase {args.timebase}, '
           f'panic {"none" if not panic_region else f"{panic_region[0]:#x}+{panic_region[1]:#x}"}, '
           f'virtio-mmio {[hex(a) for a, _ in virtio_mmio]}, data store {hex(data_store[0][0]) if data_store else "none"}, '
-          f'input {[hex(a) for a, _ in inputs]}, gpu {hex(gpu[0][0]) if gpu else "none"}, net {hex(net[0][0]) if net else "none"}')
+          f'input {[hex(a) for a, _ in inputs]}, net {hex(net[0][0]) if net else "none"}')
 
 
 if __name__ == '__main__':

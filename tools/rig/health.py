@@ -65,21 +65,17 @@ def main():
         early_retires = value('native_legacy_early_retires', 8)
         print(f'present   producer wait {wait_enabled}, busy {value("droidvm_virtio_present_busy", 8)}/'
               f'{value("droidvm_virtio_present_probes", 8)}, status {value("droidvm_virtio_display_last_status")}, '
-              f'early retires {early_retires}, swaps given up after 5 s {value("native_legacy_swap_timeouts", 8)}')
-        healthy &= virtio_state == 2 and wait_enabled == 1 and early_retires == 0
+              f'early retires {early_retires}, swaps given up after 5 s {value("native_legacy_swap_timeouts", 8)}, '
+              f'shown before their GPU work finished {value("droidvm_virtio_present_late", 8)}')
+        # The virtio display retires each swap when it takes the frame (native_legacy_gpu_retires_on_offer), so early retires count
+        # every frame; a copy that failed after one is what matters.
+        healthy &= virtio_state == 2 and wait_enabled == 1 and not value('native_legacy_early_failures', 8)
     try:
-        losses = struct.unpack('<32I', peek.read('droidvm_gpu_lost', 32 * 4)[1])
-        affected = ', '.join(f'{index}:{count}' for index, count in enumerate(losses) if count) or 'none'
-        caps = value('droidvm_gpu_capabilities') or 0
-        mask = value('droidvm_gpu_lost_mask')
-        if caps & 1 and mask is not None:
-            print(f'gpu-3d    active lost mask {mask:#010x}; context losses since boot {affected}')
-            healthy &= mask == 0
-        else:
-            print(f'gpu-3d    context losses since boot {affected}; negotiated per-client loss status unavailable')
-            healthy &= not any(losses)
+        # clients, contexts, blobs, maps, submissions, fenced submissions, fence waits that timed out, refusals (DroidVMVirtioGpu3D.cpp)
+        stats = struct.unpack('<8Q', peek.read('droidvm_virtgpu_stats', 64)[1])
+        print(f'gpu-3d    {stats[0]} clients, {stats[5]} fenced submissions, {stats[6]} fence waits timed out, {stats[7]} refusals')
     except (Exception, SystemExit):
-        print('gpu-3d    context loss counters unavailable')
+        print('gpu-3d    virtio GPU 3D counters unavailable')
     unit, flags = value('droidvm_ethernet_unit'), value('droidvm_ethernet_ifflags') or 0
     if unit:
         state = ', '.join(s for bit, s in ((IFF_UP, 'up'), (IFF_RUNNING, 'running')) if flags & bit) or 'down'

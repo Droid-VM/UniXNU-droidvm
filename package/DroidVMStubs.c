@@ -2,7 +2,7 @@
 //
 // Definitions the shared display/HID/key-store probes expect from sheng's board objects, which a DroidVM
 // guest does not link: there is no SPI touch panel, cpufreq or Adreno power domain to probe (the GPU hook,
-// sheng_gpu_power_probe, is DroidVMGpu.cpp's: the host's GPU through crosvm's droidvm-gpu device).
+// sheng_gpu_power_probe, is DroidVMGpu.cpp's: NativeAdreno and the Metal accelerator published for the virtio GPU).
 //
 // The touch digitizer of NativeHidInput (sheng-touch-hid=1) reads its finger set from these globals with a
 // seqlock (odd while being written). On sheng the touch probe fills them; in a DroidVM guest the app's touch
