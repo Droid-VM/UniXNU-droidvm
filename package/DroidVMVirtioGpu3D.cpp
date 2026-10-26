@@ -171,8 +171,9 @@ struct Resource {
     IOMemoryDescriptor *window;        // a host blob's range of the pool, once mapped
     IOMemoryMap *map;                  // in the client's task
 };
-// A fenced submission in flight; `sequence` numbers the client's fenced submissions in the order they were made.
-struct Pending { uint32_t ticket, ring; uint64_t fence, sequence; };
+// A fenced submission in flight; `sequence` numbers the client's fenced submissions in the order they were made, `order`
+// every client's (the display waits by it: droidvm_virtgpu_finished).
+struct Pending { uint32_t ticket, ring; uint64_t fence, sequence, order; };
 // A closed resource the GPU may still use: released once every submission made before it was closed has finished.
 struct Closed { Resource resource; uint64_t sequence; };
 struct Client {
@@ -187,6 +188,7 @@ struct Client {
 };
 Client *gClients[MaxClients];
 IOLock *gClientsLock;
+uint64_t gSubmittedOrder;              // every client's fenced submissions made: the latest Pending::order
 uint32_t gNextContext = FirstContext;
 uint64_t gCapsetMask;
 uint32_t gCapsetBytes[64];   // each capset's size (GET_CAPSET_INFO)
@@ -468,7 +470,8 @@ IOReturn execbuffer(Client *c, const droidvm_virtgpu_execbuffer &in, const uint8
     IOReturn status = post(&submit, sizeof submit, commands, in.size, sizeof(Header), false, &ticket);
     if (status) return status;
     c->nextFence[in.ring_idx] = fence;
-    c->pending[c->pendingCount++] = {ticket, in.ring_idx, fence, ++c->sequence};
+    c->pending[c->pendingCount++] = {ticket, in.ring_idx, fence, ++c->sequence,
+                                     __atomic_add_fetch(&gSubmittedOrder, 1, __ATOMIC_ACQ_REL)};
     out.fence = fence; count(5);
     return kIOReturnSuccess;
 }
@@ -587,6 +590,31 @@ extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t t
         droidvm_virtgpu_refusals_by_op[op] = droidvm_virtgpu_refusals_by_op[op] + 1;
     }
     return status;
+}
+// For the display (DroidVMVirtioGpuDisplay.cpp). A swap shows an IOSurface the GPU draws, and the host reads it for the screen
+// in another context, which does not wait for the guest's renderers: shown at once, a frame whose GPU work was still running
+// came out half drawn (the Today view's blurred backdrop as the plain wallpaper, the home screen without its icons). So a
+// swap takes the number of the latest fenced submission of every client and is shown once all of them up to it have finished.
+extern "C" uint64_t droidvm_virtgpu_submitted(void) {
+    return __atomic_load_n(&DroidVMVirtioGpu::gSubmittedOrder, __ATOMIC_ACQUIRE);
+}
+// A client in one of its methods holds its lock, perhaps while it waits for the device: it is looked at again later rather
+// than waited for, so the clients' list is never held across a wait.
+extern "C" bool droidvm_virtgpu_finished(uint64_t order) {
+    using namespace DroidVMVirtioGpu;
+    if (!order || !gClientsLock) return true;
+    bool finished = true;
+    IOLockLock(gClientsLock);
+    for (uint32_t i = 0; i < MaxClients && finished; ++i) {
+        Client *c = gClients[i];
+        if (!c) continue;
+        if (!IOLockTryLock(c->lock)) { finished = false; break; }
+        reapPending(c);
+        for (uint32_t j = 0; j < c->pendingCount && finished; ++j) if (c->pending[j].order <= order) finished = false;
+        IOLockUnlock(c->lock);
+    }
+    IOLockUnlock(gClientsLock);
+    return finished;
 }
 // The connection closed (or its process ended): its submissions finish, its resources go, its context is destroyed.
 extern "C" void droidvm_virtgpu_close(void *connection) {

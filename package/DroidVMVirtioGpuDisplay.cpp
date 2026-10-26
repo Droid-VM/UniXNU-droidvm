@@ -11,6 +11,8 @@ extern "C" void native_legacy_gpu_complete(void *, int);
 extern "C" void native_legacy_frame_observed(unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" uint32_t droidvm_gpu_scanout_fence(void);
 extern "C" IOReturn droidvm_gpu_scanout_wait(uint32_t, bool, uint32_t *);
+extern "C" uint64_t droidvm_virtgpu_submitted(void);
+extern "C" bool droidvm_virtgpu_finished(uint64_t);
 extern "C" {
 volatile uint32_t droidvm_virtio_display_state, droidvm_virtio_display_blob, droidvm_virtio_display_last_status;
 volatile uint64_t droidvm_virtio_display_frames, droidvm_virtio_display_boot_frames, droidvm_virtio_display_resources;
@@ -18,6 +20,8 @@ volatile uint64_t droidvm_virtio_display_frames, droidvm_virtio_display_boot_fra
 // Setting this to 0 is an unsafe diagnostic A/B override, never the normal display path.
 volatile uint32_t droidvm_virtio_present_wait = 1;
 volatile uint64_t droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us;
+// Swaps shown although the GPU work before them had not finished in 2 s (a torn frame rather than a stopped display).
+volatile uint64_t droidvm_virtio_present_late;
 struct DroidVMPresentSample { uint64_t number; uint32_t fence, retired, mode, status; uint64_t wait_us, flush_us; };
 DroidVMPresentSample droidvm_virtio_present_samples[64];
 }
@@ -30,7 +34,9 @@ struct Resource {
     uint32_t width, height, id;
     bool prepared, usable;
 };
-struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height, producer; };
+// producer: the droidvm-gpu device's timeline at the swap; work: the virtio GPU's fenced submissions made before it
+// (droidvm_virtgpu_submitted). The frame is drawn once both have finished.
+struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height, producer; uint64_t work; };
 Resource resources[8], boot;
 Entry entries[MaxEntries]; // worker-owned scratch, never shared with another producer
 IOLock *frameLock;
@@ -149,15 +155,24 @@ void worker(void *, wait_result_t) {
             uint32_t retired = 0;
             const uint64_t begin = nowUs();
             IOReturn producerStatus = droidvm_gpu_scanout_wait(frame.producer, mode != 0, &retired);
+            bool drawn = droidvm_virtgpu_finished(frame.work);
+            const bool busy = int32_t(frame.producer - retired) > 0 || !drawn;
+            while (mode && !drawn && nowUs() - begin < 2000000) {
+                IOSleep(1);   // GPU work: sleep, so the vCPU goes idle
+                drawn = droidvm_virtgpu_finished(frame.work);
+            }
+            if (!drawn) droidvm_virtio_present_late = droidvm_virtio_present_late + 1;
             const uint64_t waited = nowUs() - begin;
             uint64_t sample = droidvm_virtio_present_probes;
             droidvm_virtio_present_probes = sample + 1;
-            if (int32_t(frame.producer - retired) > 0) droidvm_virtio_present_busy = droidvm_virtio_present_busy + 1;
+            if (busy) droidvm_virtio_present_busy = droidvm_virtio_present_busy + 1;
             droidvm_virtio_present_wait_us = droidvm_virtio_present_wait_us + waited;
             Resource *r = surface(frame);
             const uint64_t flushBegin = nowUs();
             status = producerStatus ? producerStatus : r ? present(*r) : kIOReturnIOError;
-            droidvm_virtio_present_samples[sample % 64] = {sample + 1, frame.producer, retired, mode, uint32_t(status), waited, nowUs() - flushBegin};
+            // Without the droidvm-gpu device the sample's fence is the virtio GPU's work number, and retired says it was drawn.
+            droidvm_virtio_present_samples[sample % 64] = {sample + 1, frame.producer ? frame.producer : uint32_t(frame.work),
+                frame.producer ? retired : uint32_t(drawn ? frame.work : 0), mode, uint32_t(status), waited, nowUs() - flushBegin};
             droidvm_virtio_display_last_status = status;
             if (producerStatus || !ready()) {
                 // Neither an unfinished producer nor an unacknowledged display DMA is a
@@ -202,7 +217,8 @@ extern "C" bool droidvm_virtio_gpu_offer(void *display, IOMemoryDescriptor *memo
     bool accepted = !pending.memory;
     if (accepted) {
         auto service = static_cast<IOService *>(display);
-        memory->retain(); service->retain(); pending = {service, memory, stride, width, height, droidvm_gpu_scanout_fence()}; compositor = true;
+        memory->retain(); service->retain(); pending = {service, memory, stride, width, height, droidvm_gpu_scanout_fence(), droidvm_virtgpu_submitted()};
+        compositor = true;
     }
     IOLockUnlock(frameLock); return accepted;
 }
