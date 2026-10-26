@@ -2,7 +2,7 @@
 
 This package builds the pinned GFXBench 5.0.0 Metal iOS app from a local source checkout. It is a local port, not an official GFXBench release or score.
 
-The source checkout must be at the revision in `source-pin.json`. The compatibility changes in `compat.patch` include the corporate Metal 5.0 test list; the build script applies them without resetting or cleaning the checkout. It runs the repository's `scripts/build-3rdparty.sh` before `scripts/build.sh`.
+The source checkout is Droid-VM/gfxbench at `fork_revision` in `source-pin.json` (branch `wip/hackintosh`: upstream's pinned revision with `compat.patch` as one commit), or upstream at `revision`, to which the script applies `compat.patch`. The compatibility changes in `compat.patch` include the corporate Metal 5.0 test list; the build script applies them without resetting or cleaning the checkout. It runs the repository's `scripts/build-3rdparty.sh` before `scripts/build.sh`.
 
 The full benchmark data is about 2.6 GiB. `BUNDLE_DATA=true` places it in the app. The app also compiles Metal source at runtime; that path still needs validation in the guest. Build on macOS with Xcode's iOS Metal toolchain, CMake, and the licenses in `LICENSE` in place.
 
@@ -12,11 +12,21 @@ Run:
 scripts/build-droidvm-gfxbench.sh /path/to/gfxbench-source /path/to/output /path/to/UniXNU/out/droidvm/tree
 ```
 
-The signed app is written to `output/GFXBench.app`. The script writes a category 0 owner trust entry under `TREE_ROOT/build/owner-trust-extra/gfxbench.json`, where UniXNU's trust bundle builder reads it; it does not deploy the app or trust entry.
+The signed app is written to `output/GFXBench.app`. Pass a scratch `TREE_ROOT` for a build that is not for the guest, or its trust entry replaces the guest's. The script writes a category 0 owner trust entry under `TREE_ROOT/build/owner-trust-extra/gfxbench.json`, where UniXNU's trust bundle builder reads it; it does not deploy the app or trust entry.
 
 The compatibility patch also retains the service-ready state across loading-controller appearance, so an initialization notification arriving before `viewWillAppear` is not lost. It guards the transition against duplicate notifications.
 
 Stage the signed/trusted app in `ngpu/apps`, then use `lsdiag owner-install` to move it into an MCM bundle container and `lsdiag -c -u 501 owner-register` to register that real path. `ngpu/apps/GFXBench.app` remains a CLI compatibility symlink. Direct UI execution from the original staging directory is blocked by the system and icon service policies. See the Metal Check README for the installation sequence.
+
+## IPA for a real device
+
+The same build serves as a reference on a real iPad or iPhone (iOS 17 or later; Metal, arm64):
+
+```sh
+scripts/package-gfxbench-ipa.sh /path/to/output/GFXBench.app /path/to/ipa
+```
+
+It replaces the guest's signature and private entitlements with an ad-hoc signature without entitlements, restores GFXBench's landscape-only iPad orientations, and zips `Payload/GFXBench.app`. A sideloading tool (Sideloadly, AltStore, …) re-signs it with the user's certificate. With the bundled data the IPA is over GitHub's 2 GiB asset limit, so it is also cut into 1.9 GiB parts: `cat GFXBench-Metal-5.0.0-droidvm.ipa.part-* > GFXBench-Metal-5.0.0-droidvm.ipa`. The Droid-VM/gfxbench releases carry these parts.
 
 ## Guest validation status
 

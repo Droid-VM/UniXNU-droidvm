@@ -5,9 +5,11 @@ usage() {
     cat <<'EOF'
 Usage: build-droidvm-gfxbench.sh SOURCE_DIR OUTPUT_DIR TREE_ROOT
 
-Builds the pinned GFXBench Metal iOS app from a source checkout. The checkout
-is never cleaned or reset; the packaged compatibility patch is applied if
-needed. Requires macOS, Xcode, CMake, and the iOS Metal toolchain.
+Builds the pinned GFXBench Metal iOS app from a source checkout: Droid-VM/gfxbench
+at FORK_REVISION (the compatibility changes committed), or upstream at
+PINNED_REVISION, to which the packaged compatibility patch is applied if needed.
+The checkout is never cleaned or reset. Requires macOS, Xcode, CMake, and the
+iOS Metal toolchain.
 EOF
 }
 
@@ -25,6 +27,8 @@ TREE_ROOT=$(cd "$3" && pwd -P)
 PACKAGE_DIR="$DEVICE_ROOT/package/gfxbench"
 PATCH_FILE="$PACKAGE_DIR/compat.patch"
 PINNED_REVISION=89aa956f43836798d1eaaab8ec32d3dc8b02eead
+# Droid-VM/gfxbench wip/hackintosh: PINNED_REVISION with compat.patch as one commit.
+FORK_REVISION=dfa8df19b92d3e83cbd07b7176019f730e7a332b
 PINNED_PATCH_SHA256=f79c92798f54212851fbcd0a88ad3e6fe7dfc964752c70991f71fad255fbb9bf
 APP_NAME='GFXBench Metal'
 APP_VERSION=5.0.0
@@ -41,11 +45,15 @@ die() {
 SOURCE_ROOT=$(git -C "$SOURCE_DIR" rev-parse --show-toplevel)
 [[ "$(cd "$SOURCE_ROOT" && pwd -P)" == "$SOURCE_DIR" ]] || die 'SOURCE_DIR must name the checkout root'
 ACTUAL_REVISION=$(git -C "$SOURCE_DIR" rev-parse HEAD)
-[[ "$ACTUAL_REVISION" == "$PINNED_REVISION" ]] || die "expected source revision $PINNED_REVISION, got $ACTUAL_REVISION"
 ACTUAL_PATCH_SHA256=$(shasum -a 256 "$PATCH_FILE" | awk '{print $1}')
 [[ "$ACTUAL_PATCH_SHA256" == "$PINNED_PATCH_SHA256" ]] || die 'compat.patch does not match the pinned package metadata'
 
-if git -C "$SOURCE_DIR" apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
+if [[ "$ACTUAL_REVISION" == "$FORK_REVISION" ]]; then
+    git -C "$SOURCE_DIR" diff --quiet HEAD -- || die 'the Droid-VM/gfxbench checkout has uncommitted changes'
+    printf 'Droid-VM/gfxbench %s: the compatibility changes are committed.\n' "$FORK_REVISION"
+elif [[ "$ACTUAL_REVISION" != "$PINNED_REVISION" ]]; then
+    die "expected source revision $FORK_REVISION (Droid-VM/gfxbench) or $PINNED_REVISION (upstream), got $ACTUAL_REVISION"
+elif git -C "$SOURCE_DIR" apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
     printf 'Compatibility patch is already applied.\n'
 elif git -C "$SOURCE_DIR" apply --check "$PATCH_FILE" >/dev/null 2>&1; then
     git -C "$SOURCE_DIR" apply "$PATCH_FILE"
@@ -140,7 +148,7 @@ IOS_SDK_VERSION=$(xcrun --sdk iphoneos --show-sdk-version)
 IOS_SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
 XCODE_VERSION=$(xcodebuild -version | tr '\n' ';' | sed 's/;$//')
 "$TOOLS_DIR/python" - "$STAGED_APP/Info.plist" "$STAGED_APP/BuildProvenance.json" \
-    "$PINNED_REVISION" "$PINNED_PATCH_SHA256" "$IOS_SDK_VERSION" "$IOS_SDK_PATH" "$XCODE_VERSION" <<'PY'
+    "$ACTUAL_REVISION" "$PINNED_PATCH_SHA256" "$IOS_SDK_VERSION" "$IOS_SDK_PATH" "$XCODE_VERSION" <<'PY'
 import json
 import plistlib
 import sys
@@ -164,6 +172,7 @@ info.update({
 plist_path.write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_XML, sort_keys=True))
 provenance = {
     'source_repository': 'https://github.com/Kishonti-Opensource/gfxbench.git',
+    'fork_repository': 'https://github.com/Droid-VM/gfxbench.git',
     'source_revision': sys.argv[3],
     'compatibility_patch_sha256': sys.argv[4],
     'product': 'GFXBench Metal',
@@ -210,7 +219,7 @@ TRUST_DIR="$TREE_ROOT/build/owner-trust-extra"
 mkdir -p "$TRUST_DIR"
 BUNDLE_EXECUTABLE=$("$TOOLS_DIR/python" -c 'import plistlib, sys; print(plistlib.load(open(sys.argv[1], "rb"))["CFBundleExecutable"])' "$FINAL_APP/Info.plist")
 [[ -x "$FINAL_APP/$BUNDLE_EXECUTABLE" ]] || die "app executable is missing: $BUNDLE_EXECUTABLE"
-"$TOOLS_DIR/python" - "$TRUST_DIR/gfxbench.json" "$CDHASH" "$FINAL_APP/$BUNDLE_EXECUTABLE" "$TREE_ROOT" <<'PY'
+"$TOOLS_DIR/python" - "$TRUST_DIR/gfxbench.json" "$CDHASH" "$FINAL_APP/$BUNDLE_EXECUTABLE" "$TREE_ROOT" "$ACTUAL_REVISION" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -226,7 +235,7 @@ trust_path.write_text(json.dumps({
     'cdhashes': [sys.argv[2]],
     'category': 0,
     'binary': binary_ref,
-    'source': 'package/gfxbench; iphoneos; source 89aa956f43836798d1eaaab8ec32d3dc8b02eead',
+    'source': 'package/gfxbench; iphoneos; source ' + sys.argv[5],
 }, indent=2) + '\n')
 PY
 

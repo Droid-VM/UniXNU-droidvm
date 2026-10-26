@@ -1,6 +1,9 @@
 {
   "repository": "https://github.com/Kishonti-Opensource/gfxbench.git",
   "revision": "89aa956f43836798d1eaaab8ec32d3dc8b02eead",
+  "fork_repository": "https://github.com/Droid-VM/gfxbench.git",
+  "fork_branch": "wip/hackintosh",
+  "fork_revision": "dfa8df19b92d3e83cbd07b7176019f730e7a332b",
   "product": "GFXBench Metal",
   "product_id": "gfxbench_metal",
   "version": "5.0.0",
