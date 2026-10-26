@@ -253,10 +253,21 @@ __attribute__((noinline)) void native_legacy_transfer_observed(IOReturn status,c
         boot_progress_stage(message);
     }
 }
+// Whether the frame just offered went to the virtio GPU display. Its host has finished reading a frame when it answers the frame's
+// flush (crosvm copies it out: a flip's flush waits for the display's blit to read it, the other sinks read it before returning),
+// and the display reports a frame only after that, which is when NativeLegacyDisplay offers the next one. So the swap may retire
+// as soon as the display takes it: that releases the frame before, already copied, and the render server may draw the next frame
+// while this one waits for its GPU work and its flush (home-page drags about 26 -> 28 fps in an A/B; each frame still waits
+// about 20 ms for its GPU work and 20 ms for its flush, one after the other).
+static bool offeredToVirtioDisplay;
+// 0 retires the virtio display's swaps after its report again, as other clients' (an A/B switch, written in guest memory).
+volatile uint32_t droidvm_virtio_retire_on_offer=1;
 bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
-    if(droidvm_virtio_gpu_offer(display,memory,stride,width,height))return true;
+    offeredToVirtioDisplay=droidvm_virtio_gpu_offer(display,memory,stride,width,height);
+    if(offeredToVirtioDisplay)return true;
     return gpuHandoffPresenter && native_gop_gpu_offer(gpuHandoffPresenter,display,memory,stride,width,height);
 }
+extern "C" bool native_legacy_gpu_retires_on_offer(void *) {return offeredToVirtioDisplay && droidvm_virtio_retire_on_offer;}
 void native_legacy_gpu_fallback_observed(int status) {
     native_legacy_gpu_last_status=(uint32_t)status;native_legacy_gpu_fallbacks=native_legacy_gpu_fallbacks+1;
 }
