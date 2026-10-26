@@ -171,6 +171,7 @@
 #import <os/lock.h>
 #import <sys/mman.h>
 #import <sys/stat.h>
+#import <notify.h>
 #import <sys/sysctl.h>
 #import <unistd.h>
 
@@ -1719,6 +1720,20 @@ static int setOrientation(long orientation) {
 // kern.droidvm_motion (DroidVMMotion.c): the motion sensors' latest frame and the UIDeviceOrientation it says, 0 for none yet.
 struct DroidVMMotionSample { uint32_t seq; int32_t orientation, accel[3], gyro[3]; };
 
+// Whether SpringBoard has blanked the screen (its com.apple.springboard.hasBlankedScreen state is 1 while the display is off),
+// updated when the state changes. Without the notification the screen counts as on.
+static bool screenBlanked(int token, bool blanked) {
+    int changed = 0;
+    if (token < 0 || notify_check(token, &changed) != NOTIFY_STATUS_OK || !changed) return blanked;
+    uint64_t state = 0;
+    if (notify_get_state(token, &state) != NOTIFY_STATUS_OK) return blanked;
+    if ((state == 1) != blanked) {
+        printf("screen %s\n", state == 1 ? "blanked" : "on");
+        fflush(stdout);
+    }
+    return state == 1;
+}
+
 static int followOrientation(void) {
     void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
     void (*set)(long) = bbs ? (void (*)(long))dlsym(bbs, "BKSHIDServicesSetDeviceOrientationForAutomation") : NULL;
@@ -1726,9 +1741,16 @@ static int followOrientation(void) {
         fprintf(stderr, "no BKSHIDServicesSetDeviceOrientationForAutomation\n");
         return 1;
     }
+    // An orientation sent while the screen is off reaches backboardd, but the lock screen it wakes to keeps the one before
+    // (seen 2026-10-27: sent 4 then 1 asleep, woke at 3). So nothing is sent then: the screen wakes in the last orientation
+    // sent, and the one the sensors say now is a real change, sent once it is on.
+    int blankToken = -1;
+    if (notify_register_check("com.apple.springboard.hasBlankedScreen", &blankToken) != NOTIFY_STATUS_OK) blankToken = -1;
+    bool blanked = false;
     int32_t sent = 0;
     bool missing = false;
     for (;;) {
+        blanked = screenBlanked(blankToken, blanked);
         struct DroidVMMotionSample sample;
         size_t size = sizeof(sample);
         if (sysctlbyname("kern.droidvm_motion", &sample, &size, NULL, 0) != 0 || size != sizeof(sample)) {
@@ -1740,7 +1762,7 @@ static int followOrientation(void) {
         }
         missing = false;
         // backboardd follows; it would also take the same value again, but there is no reason to send it.
-        if (sample.orientation >= 1 && sample.orientation <= 4 && sample.orientation != sent) {
+        if (!blanked && sample.orientation >= 1 && sample.orientation <= 4 && sample.orientation != sent) {
             set(sample.orientation);
             printf("device orientation %d (gravity %d %d %d)\n", sample.orientation, sample.accel[0], sample.accel[1],
                    sample.accel[2]);
