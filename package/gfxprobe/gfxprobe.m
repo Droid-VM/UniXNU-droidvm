@@ -129,6 +129,18 @@
 //                                       a copy of the pages holding its guard, its environ pointer and os_alloc_once's table and
 //                                       prints, per page, how many words differ from it and the first few
 //
+//   gfxprobe tess                       Metal tessellation, drawn and checked: a triangle patch and a quad patch (control points
+//                                       as per-patch-control-point vertex attributes, half factors from a buffer) at factors 1, 4
+//                                       and 16, integer and fractional-even partitioning, into a 128 x 128 target cleared to black;
+//                                       each frame is compared with the shape rasterized on the CPU (texels lit outside it: stray
+//                                       geometry; dark inside it: holes) and saved to /private/var/tmp/tess-CASE.ppm. Then GFXBench Car
+//                                       Chase's own tessellation, one feature added at a time: fractional-odd partitioning; its control
+//                                       points (buffer 7, 36 bytes: float3 position, two uchar3-normalized vectors, two float2); a
+//                                       uint16 control-point index buffer; factors per patch and instance. Each control point's first
+//                                       vector is a colour (red, green, blue, yellow), so every texel's colour is checked too. Last,
+//                                       Car Chase's Bezier car body: a patch(quad, 0) function, no control points, each patch's
+//                                       corners read from a buffer by patch_id (its patchType and control point count printed)
+//
 //   gfxprobe virtgpu                    one DRM context through the accelerator's virtgpu methods (DroidVMVirtgpuABI.h), as mesa's
 //                                       vdrm drives them: capset, context, the msm shmem, GET_PARAM ccmds, a guest-alloc BO (GEM_NEW
 //                                       and a HOST3D_GUEST blob) written through its mapping, a fenced NOP waited for, then closed
@@ -990,6 +1002,348 @@ static int cowCheck(unsigned procs, unsigned long lifeMs, unsigned long seconds)
     return (foreign || signalled) ? 2 : 0;
 }
 
+static NSString *const kTessSource = @
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct ControlPoint { float4 position [[attribute(0)]]; };\n"
+    "struct Patch { patch_control_point<ControlPoint> cp; };\n"
+    "struct Out { float4 position [[position]]; float4 color; };\n"
+    "[[patch(triangle, 3)]] vertex Out tri_vertex(Patch p [[stage_in]], float3 b [[position_in_patch]]) {\n"
+    "  Out o; o.position = p.cp[0].position * b.x + p.cp[1].position * b.y + p.cp[2].position * b.z;\n"
+    "  o.color = float4(b, 1); return o; }\n"
+    "[[patch(quad, 4)]] vertex Out quad_vertex(Patch p [[stage_in]], float2 uv [[position_in_patch]]) {\n"
+    "  float4 a = mix(p.cp[0].position, p.cp[1].position, uv.x), c = mix(p.cp[3].position, p.cp[2].position, uv.x);\n"
+    "  Out o; o.position = mix(a, c, uv.y); o.color = float4(uv, 1, 1); return o; }\n"
+    "fragment float4 color_fragment(Out in [[stage_in]]) { return in.color; }\n"
+    "struct CP36 { float3 position [[attribute(0)]]; float3 normal [[attribute(1)]]; float3 tangent [[attribute(2)]];\n"
+    "  float2 uv0 [[attribute(3)]]; float2 uv1 [[attribute(4)]]; };\n"
+    "struct Patch36 { patch_control_point<CP36> cp; };\n"
+    "[[patch(triangle, 3)]] vertex Out cc_vertex(Patch36 p [[stage_in]], float3 b [[position_in_patch]]) {\n"
+    "  Out o; o.position = float4(p.cp[0].position * b.x + p.cp[1].position * b.y + p.cp[2].position * b.z, 1);\n"
+    "  o.color = float4(p.cp[0].normal * b.x + p.cp[1].normal * b.y + p.cp[2].normal * b.z, 1); return o; }\n"
+    "[[patch(quad, 0)]] vertex Out bezier_vertex(float2 uv [[position_in_patch]], uint pid [[patch_id]],\n"
+    "  const device float4 *corners [[buffer(1)]]) {\n"
+    "  float4 a = mix(corners[pid * 4], corners[pid * 4 + 1], uv.x), c = mix(corners[pid * 4 + 3], corners[pid * 4 + 2], uv.x);\n"
+    "  Out o; o.position = mix(a, c, uv.y); o.color = float4(uv.x, uv.y, pid ? 1.0 : 0.0, 1); return o; }\n"
+    "[[patch(triangle, 3)]] vertex Out cc4_vertex(Patch p [[stage_in]], float3 b [[position_in_patch]]) {\n"
+    "  Out o; o.position = p.cp[0].position * b.x + p.cp[1].position * b.y + p.cp[2].position * b.z;\n"
+    "  o.color = float4(1, 1, 1, 1); return o; }\n";
+// tess: whether a texel's centre lies in the polygon (NDC corners, counter-clockwise or not), the texel at (x, y) of a size x size target.
+static bool tessInside(const float (*corner)[2], int corners, int x, int y, int size) {
+    const float px = (x + 0.5f) * 2 / size - 1, py = 1 - (y + 0.5f) * 2 / size;
+    int sign = 0;
+    for (int i = 0; i < corners; ++i) {
+        const float *a = corner[i], *b = corner[(i + 1) % corners];
+        const float e = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
+        const int s = e > 0 ? 1 : e < 0 ? -1 : 0;
+        if (s && sign && s != sign) return false;
+        if (s) sign = s;
+    }
+    return true;
+}
+static int tessCheck(void) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:kTessSource options:nil error:&error];
+    if (!library) { printf("tess: no library: %s\n", error.description.UTF8String); return 1; }
+    enum { Size = 128 };
+    static const float triangle[3][2] = {{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.0f, 0.8f}};
+    static const float quad[4][2] = {{-0.7f, -0.6f}, {0.6f, -0.7f}, {0.7f, 0.6f}, {-0.6f, 0.7f}};
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    int failures = 0;
+    for (int shape = 0; shape < 2; ++shape)
+        for (int partition = 0; partition < 2; ++partition)
+            for (int f = 0; f < 3; ++f) {
+                const float factor = (float[]){1, 4, 16}[f];
+                const bool quadPatch = shape == 1;
+                MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+                pd.vertexFunction = [library newFunctionWithName:quadPatch ? @"quad_vertex" : @"tri_vertex"];
+                pd.fragmentFunction = [library newFunctionWithName:@"color_fragment"];
+                pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                pd.maxTessellationFactor = 16;
+                pd.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+                pd.tessellationPartitionMode = partition ? MTLTessellationPartitionModeFractionalEven : MTLTessellationPartitionModeInteger;
+                pd.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionConstant;
+                pd.tessellationOutputWindingOrder = MTLWindingCounterClockwise;
+                MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+                vd.attributes[0].format = MTLVertexFormatFloat4; vd.attributes[0].offset = 0; vd.attributes[0].bufferIndex = 0;
+                vd.layouts[0].stride = 16; vd.layouts[0].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
+                pd.vertexDescriptor = vd;
+                id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+                const char *name = quadPatch ? "quad" : "triangle", *mode = partition ? "fractional-even" : "integer";
+                if (!state) { printf("tess %s %s %g: no pipeline: %s\n", name, mode, factor, error.description.UTF8String); ++failures; continue; }
+                const int corners = quadPatch ? 4 : 3;
+                float points[4][4];
+                for (int i = 0; i < corners; ++i) {
+                    points[i][0] = quadPatch ? quad[i][0] : triangle[i][0]; points[i][1] = quadPatch ? quad[i][1] : triangle[i][1];
+                    points[i][2] = 0.5f; points[i][3] = 1;
+                }
+                id<MTLBuffer> controlPoints = [device newBufferWithBytes:points length:sizeof points options:MTLResourceStorageModeShared];
+                __fp16 factors[6];
+                for (int i = 0; i < 6; ++i) factors[i] = (__fp16)factor;
+                id<MTLBuffer> factorBuffer = [device newBufferWithBytes:factors length:sizeof factors options:MTLResourceStorageModeShared];
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:Size height:Size
+                                                                                         mipmapped:NO];
+                td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
+                id<MTLTexture> target = [device newTextureWithDescriptor:td];
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = target; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+                [enc setRenderPipelineState:state];
+                [enc setVertexBuffer:controlPoints offset:0 atIndex:0];
+                [enc setTessellationFactorBuffer:factorBuffer offset:0 instanceStride:0];
+                [enc drawPatches:(NSUInteger)corners patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1
+                    baseInstance:0];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                if (cb.error) { printf("tess %s %s %g: command buffer: %s\n", name, mode, factor, cb.error.description.UTF8String); ++failures; continue; }
+                static uint8_t texels[Size * Size * 4];
+                [target getBytes:texels bytesPerRow:Size * 4 fromRegion:MTLRegionMake2D(0, 0, Size, Size) mipmapLevel:0];
+                int stray = 0, holes = 0, lit = 0;
+                for (int y = 0; y < Size; ++y)
+                    for (int x = 0; x < Size; ++x) {
+                        const uint8_t *t = texels + (y * Size + x) * 4;
+                        const bool on = t[0] | t[1] | t[2];
+                        lit += on;
+                        // Texels within a texel of an edge may go either way.
+                        bool sure = true, inside = tessInside(quadPatch ? quad : triangle, corners, x, y, Size);
+                        for (int dy = -1; dy <= 1 && sure; ++dy)
+                            for (int dx = -1; dx <= 1 && sure; ++dx)
+                                if (tessInside(quadPatch ? quad : triangle, corners, x + dx, y + dy, Size) != inside) sure = false;
+                        if (!sure) continue;
+                        if (on && !inside) ++stray;
+                        if (!on && inside) ++holes;
+                    }
+                const bool bad = stray || holes;
+                failures += bad;
+                printf("tess %-8s %-15s factor %2g: %5d texels lit, %4d stray, %4d holes%s\n", name, mode, factor, lit, stray, holes,
+                       bad ? "  BAD" : "");
+                char path[96];
+                snprintf(path, sizeof path, "/private/var/tmp/tess-%s-%s-%g.ppm", name, mode, factor);
+                FILE *ppm = fopen(path, "wb");
+                if (ppm) {
+                    fprintf(ppm, "P6 %d %d 255\n", Size, Size);
+                    for (int i = 0; i < Size * Size; ++i) fwrite(texels + i * 4, 1, 3, ppm);
+                    fclose(ppm);
+                }
+            }
+    printf("tess: %d of 12 cases wrong\n", failures);
+    // Car Chase's features, one at a time. A quad of two triangle patches over corners 0-3; each corner's colour vector.
+    static const float corner[4][2] = {{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.8f, 0.8f}, {-0.8f, 0.8f}};
+    static const uint8_t colour[4][3] = {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0}};
+    static const uint16_t indices[6] = {0, 1, 2, 0, 2, 3};
+    struct { const char *name; bool odd, layout36, indexed, perPatch; } cases[] = {
+        {"fractional-odd", true, false, false, false},
+        {"car-chase-vertex-layout", false, true, false, false},
+        {"layout+index-buffer", false, true, true, false},
+        {"layout+per-patch-factors", false, true, false, true},
+        {"car-chase-all", true, true, true, true},
+    };
+    int carFailures = 0;
+    for (unsigned c = 0; c < sizeof cases / sizeof cases[0]; ++c) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [library newFunctionWithName:cases[c].layout36 ? @"cc_vertex" : @"cc4_vertex"];
+        pd.fragmentFunction = [library newFunctionWithName:@"color_fragment"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        pd.maxTessellationFactor = 16;
+        pd.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+        pd.tessellationPartitionMode = cases[c].odd ? MTLTessellationPartitionModeFractionalOdd : MTLTessellationPartitionModeInteger;
+        pd.tessellationFactorStepFunction = cases[c].perPatch ? MTLTessellationFactorStepFunctionPerPatchAndPerInstance
+                                                              : MTLTessellationFactorStepFunctionConstant;
+        pd.tessellationOutputWindingOrder = MTLWindingCounterClockwise;
+        pd.tessellationControlPointIndexType = cases[c].indexed ? MTLTessellationControlPointIndexTypeUInt16 : MTLTessellationControlPointIndexTypeNone;
+        MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+        NSUInteger slot = 0;
+        if (cases[c].layout36) {
+            slot = 7;
+            const MTLVertexFormat formats[5] = {MTLVertexFormatFloat3, MTLVertexFormatUChar3Normalized, MTLVertexFormatUChar3Normalized,
+                                                MTLVertexFormatFloat2, MTLVertexFormatFloat2};
+            const NSUInteger offsets[5] = {0, 12, 16, 20, 28};
+            for (int a = 0; a < 5; ++a) { vd.attributes[a].format = formats[a]; vd.attributes[a].offset = offsets[a]; vd.attributes[a].bufferIndex = slot; }
+            vd.layouts[slot].stride = 36;
+        } else {
+            vd.attributes[0].format = MTLVertexFormatFloat4; vd.attributes[0].offset = 0; vd.attributes[0].bufferIndex = 0;
+            vd.layouts[0].stride = 16;
+        }
+        vd.layouts[slot].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
+        pd.vertexDescriptor = vd;
+        id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+        if (!state) { printf("tess %s: no pipeline: %s\n", cases[c].name, error.description.UTF8String); ++carFailures; continue; }
+        // Control points: without an index buffer, each patch's three in order (0 1 2, 0 2 3).
+        uint8_t points[6][36];
+        const int count = cases[c].indexed ? 4 : 6;
+        for (int i = 0; i < count; ++i) {
+            const int k = cases[c].indexed ? i : indices[i];
+            memset(points[i], 0, 36);
+            if (cases[c].layout36) {
+                const float position[3] = {corner[k][0], corner[k][1], 0.5f}, uv[4] = {0.25f, 0.75f, 0.5f, 0.5f};
+                memcpy(points[i], position, 12); memcpy(points[i] + 12, colour[k], 3); points[i][16] = 128; points[i][17] = 128; points[i][18] = 255;
+                memcpy(points[i] + 20, uv, 16);
+            } else {
+                const float position[4] = {corner[k][0], corner[k][1], 0.5f, 1};
+                memcpy(points[i], position, 16);
+            }
+        }
+        const NSUInteger stride = cases[c].layout36 ? 36 : 16;
+        uint8_t packed[6 * 36];
+        for (int i = 0; i < count; ++i) memcpy(packed + i * stride, points[i], stride);
+        id<MTLBuffer> controlPoints = [device newBufferWithBytes:packed length:count * stride options:MTLResourceStorageModeShared];
+        id<MTLBuffer> indexBuffer = [device newBufferWithBytes:indices length:sizeof indices options:MTLResourceStorageModeShared];
+        __fp16 factors[2][4];
+        for (int patch = 0; patch < 2; ++patch) for (int i = 0; i < 4; ++i) factors[patch][i] = (__fp16)(patch ? 5.0f : 3.0f);
+        id<MTLBuffer> factorBuffer = [device newBufferWithBytes:factors length:sizeof factors options:MTLResourceStorageModeShared];
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:Size height:Size mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
+        id<MTLTexture> target = [device newTextureWithDescriptor:td];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = target; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:state];
+        [enc setVertexBuffer:controlPoints offset:0 atIndex:slot];
+        [enc setTessellationFactorBuffer:factorBuffer offset:0 instanceStride:cases[c].perPatch ? sizeof factors : 0];
+        if (cases[c].indexed)
+            [enc drawIndexedPatches:3 patchStart:0 patchCount:2 patchIndexBuffer:nil patchIndexBufferOffset:0 controlPointIndexBuffer:indexBuffer
+                controlPointIndexBufferOffset:0 instanceCount:1 baseInstance:0];
+        else
+            [enc drawPatches:3 patchStart:0 patchCount:2 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.error) { printf("tess %s: command buffer: %s\n", cases[c].name, cb.error.description.UTF8String); ++carFailures; continue; }
+        static uint8_t texels[Size * Size * 4];
+        [target getBytes:texels bytesPerRow:Size * 4 fromRegion:MTLRegionMake2D(0, 0, Size, Size) mipmapLevel:0];
+        int stray = 0, holes = 0, wrong = 0, lit = 0;
+        for (int y = 0; y < Size; ++y)
+            for (int x = 0; x < Size; ++x) {
+                const uint8_t *t = texels + (y * Size + x) * 4;
+                const bool on = t[0] | t[1] | t[2];
+                lit += on;
+                bool sure = true;
+                const bool inside = tessInside(corner, 4, x, y, Size);
+                for (int dy = -1; dy <= 1 && sure; ++dy)
+                    for (int dx = -1; dx <= 1 && sure; ++dx)
+                        if (tessInside(corner, 4, x + dx, y + dy, Size) != inside) sure = false;
+                if (!sure) continue;
+                if (on && !inside) { ++stray; continue; }
+                if (!on && inside) { ++holes; continue; }
+                if (!inside || !cases[c].layout36) continue;
+                // The texel's expected colour: the barycentric blend of its triangle's corner colours.
+                const float px = (x + 0.5f) * 2 / Size - 1, py = 1 - (y + 0.5f) * 2 / Size;
+                for (int tri = 0; tri < 2; ++tri) {
+                    const float *a = corner[indices[tri * 3]], *b = corner[indices[tri * 3 + 1]], *d = corner[indices[tri * 3 + 2]];
+                    const float area = (b[0] - a[0]) * (d[1] - a[1]) - (b[1] - a[1]) * (d[0] - a[0]);
+                    const float wb = ((px - a[0]) * (d[1] - a[1]) - (py - a[1]) * (d[0] - a[0])) / area;
+                    const float wd = ((b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])) / area;
+                    const float wa = 1 - wb - wd;
+                    if (wa < -0.01f || wb < -0.01f || wd < -0.01f) continue;
+                    bool off = false;
+                    for (int ch = 0; ch < 3; ++ch) {
+                        const float want = (colour[indices[tri * 3]][ch] * wa + colour[indices[tri * 3 + 1]][ch] * wb +
+                                            colour[indices[tri * 3 + 2]][ch] * wd);
+                        if (fabsf(want - t[ch]) > 24) off = true;
+                    }
+                    wrong += off;
+                    break;
+                }
+            }
+        const bool bad = stray || holes || wrong;
+        carFailures += bad;
+        printf("tess %-25s: %5d texels lit, %4d stray, %4d holes, %4d wrong colours%s\n", cases[c].name, lit, stray, holes, wrong, bad ? "  BAD" : "");
+        char path[96];
+        snprintf(path, sizeof path, "/private/var/tmp/tess-%s.ppm", cases[c].name);
+        FILE *ppm = fopen(path, "wb");
+        if (ppm) {
+            fprintf(ppm, "P6 %d %d 255\n", Size, Size);
+            for (int i = 0; i < Size * Size; ++i) fwrite(texels + i * 4, 1, 3, ppm);
+            fclose(ppm);
+        }
+    }
+    printf("tess: %d of %zu Car Chase cases wrong\n", carFailures, sizeof cases / sizeof cases[0]);
+    // The Bezier body's form: patch(quad, 0), corners by patch_id. Two patches, the left and right halves of the target.
+    {
+        id<MTLFunction> bezier = [library newFunctionWithName:@"bezier_vertex"];
+        printf("tess bezier: function patchType %ld, patchControlPointCount %ld (Metal: quad = 2, 0)\n", (long)bezier.patchType,
+               (long)bezier.patchControlPointCount);
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = bezier;
+        pd.fragmentFunction = [library newFunctionWithName:@"color_fragment"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        pd.maxTessellationFactor = 16;
+        pd.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+        pd.tessellationPartitionMode = MTLTessellationPartitionModeFractionalOdd;
+        pd.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+        pd.tessellationOutputWindingOrder = MTLWindingCounterClockwise;
+        id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+        if (!state) { printf("tess bezier: no pipeline: %s\n", error.description.UTF8String); return 2; }
+        static const float quads[2][4][2] = {{{-0.8f, -0.8f}, {0.0f, -0.8f}, {0.0f, 0.8f}, {-0.8f, 0.8f}},
+                                             {{0.0f, -0.8f}, {0.8f, -0.8f}, {0.8f, 0.8f}, {0.0f, 0.8f}}};
+        float corners4[8][4];
+        for (int q = 0; q < 2; ++q) for (int i = 0; i < 4; ++i) {
+            corners4[q * 4 + i][0] = quads[q][i][0]; corners4[q * 4 + i][1] = quads[q][i][1]; corners4[q * 4 + i][2] = 0.5f; corners4[q * 4 + i][3] = 1;
+        }
+        id<MTLBuffer> cornerBuffer = [device newBufferWithBytes:corners4 length:sizeof corners4 options:MTLResourceStorageModeShared];
+        __fp16 quadFactors[2][6];
+        for (int q = 0; q < 2; ++q) for (int i = 0; i < 6; ++i) quadFactors[q][i] = (__fp16)5.0f;
+        id<MTLBuffer> factorBuffer = [device newBufferWithBytes:quadFactors length:sizeof quadFactors options:MTLResourceStorageModeShared];
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:Size height:Size mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
+        id<MTLTexture> target = [device newTextureWithDescriptor:td];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = target; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:state];
+        [enc setVertexBuffer:cornerBuffer offset:0 atIndex:1];
+        [enc setTessellationFactorBuffer:factorBuffer offset:0 instanceStride:0];
+        [enc drawPatches:0 patchStart:0 patchCount:2 patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.error) { printf("tess bezier: command buffer: %s\n", cb.error.description.UTF8String); return 2; }
+        static uint8_t texels[Size * Size * 4];
+        [target getBytes:texels bytesPerRow:Size * 4 fromRegion:MTLRegionMake2D(0, 0, Size, Size) mipmapLevel:0];
+        static const float outline[4][2] = {{-0.8f, -0.8f}, {0.8f, -0.8f}, {0.8f, 0.8f}, {-0.8f, 0.8f}};
+        int stray = 0, holes = 0, wrong = 0, lit = 0;
+        for (int y = 0; y < Size; ++y)
+            for (int x = 0; x < Size; ++x) {
+                const uint8_t *t = texels + (y * Size + x) * 4;
+                const bool on = t[0] | t[1] | t[2];
+                lit += on;
+                bool sure = true;
+                const bool inside = tessInside(outline, 4, x, y, Size);
+                for (int dy = -1; dy <= 1 && sure; ++dy)
+                    for (int dx = -1; dx <= 1 && sure; ++dx)
+                        if (tessInside(outline, 4, x + dx, y + dy, Size) != inside) sure = false;
+                if (!sure) continue;
+                if (on && !inside) { ++stray; continue; }
+                if (!on && inside) { ++holes; continue; }
+                if (!inside) continue;
+                // Expected: u across the patch (0 at its left edge), v up it, blue for the right patch.
+                const float px = (x + 0.5f) * 2 / Size - 1, py = 1 - (y + 0.5f) * 2 / Size;
+                if (fabsf(px) < 0.03f) continue;
+                const int q = px > 0;
+                const float u = (px - quads[q][0][0]) / 0.8f, v = (py + 0.8f) / 1.6f;
+                if (fabsf(u * 255 - t[0]) > 24 || fabsf(v * 255 - t[1]) > 24 || abs((q ? 255 : 0) - (int)t[2]) > 24) ++wrong;
+            }
+        printf("tess bezier quad(0)            : %5d texels lit, %4d stray, %4d holes, %4d wrong colours%s\n", lit, stray, holes, wrong,
+               (stray || holes || wrong) ? "  BAD" : "");
+        FILE *ppm = fopen("/private/var/tmp/tess-bezier.ppm", "wb");
+        if (ppm) {
+            fprintf(ppm, "P6 %d %d 255\n", Size, Size);
+            for (int i = 0; i < Size * Size; ++i) fwrite(texels + i * 4, 1, 3, ppm);
+            fclose(ppm);
+        }
+        if (stray || holes || wrong) ++carFailures;
+    }
+    return (failures || carFailures) ? 2 : 0;
+}
+
 static volatile int regStop;
 static volatile uint64_t regRounds, regBad, regCpuMax;
 static void *registerWorker(void *argument) {
@@ -1492,6 +1846,8 @@ int main(int argc, char **argv) {
         }
         if (argc >= 3 && !strcmp(argv[1], "orient"))
             return setOrientation(strtol(argv[2], NULL, 0));
+        if (argc >= 2 && !strcmp(argv[1], "tess"))
+            return tessCheck();
         if (argc >= 2 && !strcmp(argv[1], "ci"))
             return ciProbe(argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 64, argc >= 4 ? argv[3] : NULL);
         if (argc >= 2 && !strcmp(argv[1], "virtgpu"))
