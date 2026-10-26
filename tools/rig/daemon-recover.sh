@@ -9,7 +9,8 @@ A="adb -s $PHONE"
 RUN=/data/data/cn.classfun.droidvm/run
 IPC=${DVMIPC:?set DVMIPC to the path of the DroidVM daemon IPC client dvmipc.py}
 CONFIG=$(dirname "$0")/unixnu-vm.config.json
-pid=$($A shell "su -c 'cat $RUN/droidvmd.pid 2>/dev/null'" | tr -dc 0-9)
+# A daemon that exited cleanly removed its pid file: no file is no daemon (set -e would end the script on the failed cat).
+pid=$($A shell "su -c 'cat $RUN/droidvmd.pid 2>/dev/null'" | tr -dc 0-9 || true)
 # The pid file outlives a crash of the phone, and its number may belong to another process by now.
 if [ -z "$pid" ] || ! $A shell "su -c 'grep -q cn.classfun.droidvm.daemon /proc/$pid/cmdline'" 2>/dev/null; then
   apk=$($A shell pm path cn.classfun.droidvm | sed 's/^package://' | tr -d '\r')

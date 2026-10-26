@@ -25,5 +25,15 @@ $A shell 'input keyevent KEYCODE_WAKEUP; dumpsys window | grep -q "isKeyguardSho
 $A shell "su -c 'am start --activity-clear-task -n cn.classfun.droidvm/.ui.vm.display.nativedisplay.display.VMNativeDisplayActivity \
   --es vm_id $VM --es vm_name \"UniXNU (DroidVM)\" --es screen $screen_id --ez input_enabled true \
   --ei display_width $screen_width --ei display_height $screen_height'" >/dev/null
-sleep 2
+sleep 3
+# The app hands crosvm the display Surface from the new instance before the instance it replaces stops, and the old one's
+# surfaceDestroyed then calls removeSurface, which takes away the new Surface: the phone keeps the last frame while the guest
+# runs on (DisplayProvider; every relaunch over a live console froze it). Sending the survivor to the background and back makes
+# it remove and re-send its own Surface, in that order. SHOWVM_NO_CYCLE=1 skips it (to test an app that owns its Surface).
+if [ "${SHOWVM_NO_CYCLE:-0}" != 1 ]; then
+  $A shell 'input keyevent KEYCODE_HOME' >/dev/null
+  sleep 2
+  $A shell "su -c 'am start --activity-reorder-to-front -n cn.classfun.droidvm/.ui.vm.display.nativedisplay.display.VMNativeDisplayActivity'" >/dev/null 2>&1
+  sleep 2
+fi
 $A shell 'dumpsys activity activities | grep -m1 topResumedActivity'

@@ -70,6 +70,14 @@ the environment wins):
 | `plugin-redeploy.sh` | Build the Metal plugin on the Mac from `FORK`, keep the running plugin trusted, stage the new one into the guest's Data, flush it, `payload-redeploy.sh`, and check it survived the reboot |
 | `crosvm-deploy.sh` | Install `CROSVM_BIN` as the app's crosvm (VM stopped), keeping a backup and the old binary's owner, mode and SELinux label; guest and crosvm must agree on the droidvm-gpu wire version |
 | `daemon-recover.sh` | Restart droidvmd the way the app does and recreate the VM from its saved config (`unixnu-vm.config.json`, rig-local); change a running daemon's copy with `vm_modify` |
+| `vmguard2.sh [SPINS]`, `guard-start.sh` (on the phone, as root) | Guard the host against a guest vCPU that holds its core: SIGSTOP crosvm when a started secondary never sleeps, or when every one spins SPINS samples. `guard-start.sh` runs it detached, logging to `/data/local/tmp/vmguard.log`. `vmguard.sh` is the earlier sampler |
+| `killvm.sh` (on the phone) | SIGKILL a stopped UniXNU crosvm after the guard froze it |
+| `early-trace.py` | The early boot trace of a VM the guard stopped: ArmCpu bring-up stages and where each CPU was |
+| `boot-cycles.sh N` | Restart the VM N times under the guard; record the early trace of any boot it stops |
+| `guestcpus.py`, `vcpu-busy.py` | The guest CPUs' state from guest RAM, and which crosvm vCPU threads are busy |
+| `crosvm-tail.sh STREAM VM_ID` (on the phone) | Follow one console log of a VM (`stderr`, `serial1`) from now on |
+| `display-ab.sh LABEL` | Whether the phone's display follows the guest (Settings, then Home; changed-pixel fraction) |
+| `dumpimg.py GFX_ERR OUTDIR` | Turn NativeMetal's `NATIVE_METAL_DUMP_IMAGE` lines of a gfx.err into PNGs |
 
 After the phone itself restarts, open the DroidVM app once (or `insmod` the modules of its autostart set from
 `files/../usr/lib/modules/<kmi>/`): a pseudo-unprotected VM shares its RAM through `/dev/gunyah_share`, and
