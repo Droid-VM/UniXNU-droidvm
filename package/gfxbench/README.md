@@ -26,7 +26,7 @@ The same build serves as a reference on a real iPad or iPhone (iOS 17 or later; 
 scripts/package-gfxbench-ipa.sh /path/to/output/GFXBench.app /path/to/ipa
 ```
 
-It replaces the guest's signature and private entitlements with an ad-hoc signature without entitlements, restores GFXBench's landscape-only iPad orientations, and zips `Payload/GFXBench.app`. A sideloading tool (Sideloadly, AltStore, …) re-signs it with the user's certificate. With the bundled data the IPA is over GitHub's 2 GiB asset limit, so it is also cut into 1.9 GiB parts: `cat GFXBench-Metal-5.0.0-droidvm.ipa.part-* > GFXBench-Metal-5.0.0-droidvm.ipa`. The Droid-VM/gfxbench releases carry these parts.
+It replaces the guest's signature and private entitlements with an ad-hoc signature without entitlements, restores GFXBench's landscape-only iPad orientations, and zips `Payload/GFXBench.app`. A sideloading tool (Sideloadly, AltStore, …) re-signs it with the user's certificate. With the bundled data (2.6 GiB) the IPA zips to about 1.53 GiB, under GitHub's 2 GiB asset limit; a larger one would also be cut into 1.9 GiB parts (`cat NAME.part-* > NAME`). The Droid-VM/gfxbench releases carry the IPA.
 
 ## Guest validation status
 
