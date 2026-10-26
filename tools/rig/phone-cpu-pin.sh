@@ -4,7 +4,10 @@
 #                                                 target (default 2400000 for the big policies, 1800000 for policy0), then the
 #                                                 two files read-only, so the vendor's power daemons (OPLUS capped the big cores
 #                                                 at 1.71 GHz) cannot move them; the old values go to /data/local/tmp/cpu-pin.saved
-#   phone-cpu-pin.sh unpin                        the saved values back, the files writable again
+#   phone-cpu-pin.sh unpin                        the saved values back, the files writable again (the values of when pin ran,
+#                                                 a vendor cap of that moment included)
+#   phone-cpu-pin.sh free                         every policy back to its hardware range (cpuinfo_min/max_freq), writable: the
+#                                                 governor and the vendor's caps decide, as before any pin
 #   phone-cpu-pin.sh show                         each policy's limits and current frequency
 # The kernel's own thermal limits (freq QoS of the cooling devices) still apply when pinned.
 SAVED=/data/local/tmp/cpu-pin.saved
@@ -41,6 +44,13 @@ unpin)
     chmod 644 $p/scaling_min_freq $p/scaling_max_freq
     echo $min > $p/scaling_min_freq; echo $max > $p/scaling_max_freq; echo $min > $p/scaling_min_freq
   done < $SAVED
+  rm -f $SAVED
+  show;;
+free)
+  for p in /sys/devices/system/cpu/cpufreq/policy*; do
+    chmod 644 $p/scaling_min_freq $p/scaling_max_freq
+    echo $(cat $p/cpuinfo_max_freq) > $p/scaling_max_freq; echo $(cat $p/cpuinfo_min_freq) > $p/scaling_min_freq
+  done
   rm -f $SAVED
   show;;
 *) show;;
