@@ -3,10 +3,10 @@
   "revision": "89aa956f43836798d1eaaab8ec32d3dc8b02eead",
   "fork_repository": "https://github.com/Droid-VM/gfxbench.git",
   "fork_branch": "wip/hackintosh",
-  "fork_revision": "dfa8df19b92d3e83cbd07b7176019f730e7a332b",
+  "fork_revision": "0e0088ea85a43a1399cd80b01afc09dde2b742b4",
   "product": "GFXBench Metal",
   "product_id": "gfxbench_metal",
   "version": "5.0.0",
   "compatibility_patch": "compat.patch",
-  "compatibility_patch_sha256": "f79c92798f54212851fbcd0a88ad3e6fe7dfc964752c70991f71fad255fbb9bf"
+  "compatibility_patch_sha256": "63a543694696632fc5932a9b4522884fed470f60ceff0eaa46ce1fc7c656ec9c"
 }

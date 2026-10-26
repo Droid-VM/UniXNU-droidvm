@@ -27,9 +27,10 @@ TREE_ROOT=$(cd "$3" && pwd -P)
 PACKAGE_DIR="$DEVICE_ROOT/package/gfxbench"
 PATCH_FILE="$PACKAGE_DIR/compat.patch"
 PINNED_REVISION=89aa956f43836798d1eaaab8ec32d3dc8b02eead
-# Droid-VM/gfxbench wip/hackintosh: PINNED_REVISION with compat.patch as one commit.
-FORK_REVISION=dfa8df19b92d3e83cbd07b7176019f730e7a332b
-PINNED_PATCH_SHA256=f79c92798f54212851fbcd0a88ad3e6fe7dfc964752c70991f71fad255fbb9bf
+# Droid-VM/gfxbench wip/hackintosh: PINNED_REVISION with the changes in compat.patch, as commits
+# (compat.patch is `git diff PINNED_REVISION FORK_REVISION`).
+FORK_REVISION=0e0088ea85a43a1399cd80b01afc09dde2b742b4
+PINNED_PATCH_SHA256=63a543694696632fc5932a9b4522884fed470f60ceff0eaa46ce1fc7c656ec9c
 APP_NAME='GFXBench Metal'
 APP_VERSION=5.0.0
 
@@ -164,10 +165,6 @@ info.update({
     'CFBundleShortVersionString': '5.0.0',
     'CFBundleVersion': '5.0.0',
     'MinimumOSVersion': '17.0',
-    # The guest's panel is landscape-native (1366x1024): iPadOS's portrait is its wide, upright screen and its landscape is
-    # sideways, so an app that allows only landscape on iPad (GFXBench's own list) is drawn turned 90 degrees.
-    'UISupportedInterfaceOrientations~ipad': ['UIInterfaceOrientationPortrait', 'UIInterfaceOrientationPortraitUpsideDown',
-                                              'UIInterfaceOrientationLandscapeLeft', 'UIInterfaceOrientationLandscapeRight'],
 })
 plist_path.write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_XML, sort_keys=True))
 provenance = {
@@ -231,8 +228,14 @@ try:
     binary_ref = binary.relative_to(tree_root).as_posix()
 except ValueError:
     binary_ref = str(binary)
+# Keep the CDHashes already trusted, so an installed earlier build still runs until it is replaced.
+try:
+    cdhashes = json.loads(trust_path.read_text()).get('cdhashes', [])
+except (FileNotFoundError, ValueError):
+    cdhashes = []
+cdhashes = [cdhash for cdhash in cdhashes if cdhash != sys.argv[2]] + [sys.argv[2]]
 trust_path.write_text(json.dumps({
-    'cdhashes': [sys.argv[2]],
+    'cdhashes': cdhashes,
     'category': 0,
     'binary': binary_ref,
     'source': 'package/gfxbench; iphoneos; source ' + sys.argv[5],
