@@ -94,10 +94,16 @@ index ab7f889d..402c36e5 100644
          tfw_deviceinfo
          benchmarkservice
 diff --git a/app_ios/iOS-Info.plist.in b/app_ios/iOS-Info.plist.in
-index 8dfb6e92..21ba2ce6 100644
+index 8dfb6e92..4e49449d 100644
 --- a/app_ios/iOS-Info.plist.in
 +++ b/app_ios/iOS-Info.plist.in
-@@ -83,6 +83,8 @@
+@@ -80,12 +80,34 @@
+ 	<key>UISupportedInterfaceOrientations</key>
+ 	<array>
+ 		<string>UIInterfaceOrientationPortrait</string>
++		<string>UIInterfaceOrientationPortraitUpsideDown</string>
++		<string>UIInterfaceOrientationLandscapeLeft</string>
++		<string>UIInterfaceOrientationLandscapeRight</string>
  	</array>
  	<key>UISupportedInterfaceOrientations~ipad</key>
  	<array>
@@ -106,6 +112,26 @@ index 8dfb6e92..21ba2ce6 100644
  		<string>UIInterfaceOrientationLandscapeLeft</string>
  		<string>UIInterfaceOrientationLandscapeRight</string>
  	</array>
++	<key>UIApplicationSceneManifest</key>
++	<dict>
++		<key>UIApplicationSupportsMultipleScenes</key>
++		<false/>
++		<key>UISceneConfigurations</key>
++		<dict>
++			<key>UIWindowSceneSessionRoleApplication</key>
++			<array>
++				<dict>
++					<key>UISceneConfigurationName</key>
++					<string>Default Configuration</string>
++					<key>UISceneDelegateClassName</key>
++					<string>NUISceneDelegate</string>
++				</dict>
++			</array>
++		</dict>
++	</dict>
+ 	<key>UIFileSharingEnabled</key>
+ 	<@ENABLE_FILE_SHARING@/>
+ 	<key>BUIProdctId</key>
 diff --git a/app_ios/src/Common/NUIAppData.h b/app_ios/src/Common/NUIAppData.h
 index 53b378ee..6d1fbc34 100644
 --- a/app_ios/src/Common/NUIAppData.h
@@ -139,31 +165,169 @@ index 3bfa75b2..20e5eedf 100644
      dispatch_async(dispatch_get_main_queue(),
                     ^{
                         [UIApplication sharedApplication].idleTimerDisabled = YES;
+diff --git a/app_ios/src/Common/NUIAppDelegate.h b/app_ios/src/Common/NUIAppDelegate.h
+index e389b46e..0fbdc2e7 100644
+--- a/app_ios/src/Common/NUIAppDelegate.h
++++ b/app_ios/src/Common/NUIAppDelegate.h
+@@ -17,4 +17,7 @@
+ @property (strong, nonatomic) NSString *viewName;
+ @property (strong, nonatomic) NUIAppInfo *info;
+ 
++// Make the window in the app's window scene and start (NUISceneDelegate, when the scene connects).
++- (void)showInWindowScene:(UIWindowScene *)scene;
++
+ @end
 diff --git a/app_ios/src/Common/NUIAppDelegate.mm b/app_ios/src/Common/NUIAppDelegate.mm
-index 21a043ff..646f21cf 100644
+index 21a043ff..07493768 100644
 --- a/app_ios/src/Common/NUIAppDelegate.mm
 +++ b/app_ios/src/Common/NUIAppDelegate.mm
-@@ -111,6 +111,20 @@ - (void)applicationWillTerminate:(UIApplication *)application
-     // Called when the application is about to terminate. Save data if appropriate. See also applicationDidEnterBackground:.
- }
+@@ -36,10 +36,30 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+         [[UIDevice currentDevice] setBatteryMonitoringEnabled:YES];
  
-+// GFXBench lays out and renders for a wide screen. On an iPad that is the two landscape orientations; on a panel that is wide
-+// in the device's portrait (a virtual machine's 1366x1024 screen, for one) it is portrait and upside-down instead, and the
-+// landscape ones would turn the app sideways. Info.plist lists all four on iPad; this picks the wide ones.
-+- (UIInterfaceOrientationMask)application:(UIApplication *)application supportedInterfaceOrientationsForWindow:(UIWindow *)window
-+{
-+    if([[UIDevice currentDevice] userInterfaceIdiom] != UIUserInterfaceIdiomPad)
-+        return UIInterfaceOrientationMaskPortrait;
-+    // nativeBounds is the panel in pixels in the portrait-up orientation, whatever the device's orientation.
-+    CGSize panel = [[UIScreen mainScreen] nativeBounds].size;
-+    if(panel.width > panel.height)
-+        return UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown;
-+    return UIInterfaceOrientationMaskLandscape;
+         _viewName = @"TheStoryboard";
++    }
++    catch(NSException *ex)
++    {
++        NSLog(@"-------- INIT ERROR ---------");
++        NSLog(@"%@", ex.reason);
++        NSLog(@"-----------------------------");
++        exit(-1);
++    }
++    catch(...)
++    {
++        NSLog(@"-------- INIT ERROR ---------");
++        exit(-1);
++    }
+ 
++    return YES;
 +}
 +
++- (void)showInWindowScene:(UIWindowScene *)scene
++{
++    try
++    {
+         if(self.cmdline != nil)
+         {
+-            self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
++            self.window = [[UIWindow alloc] initWithWindowScene:scene];
+             UIStoryboard *storyboard = [UIStoryboard storyboardWithName:_viewName bundle:nil];
+             NUITestViewController *viewController = [storyboard instantiateViewControllerWithIdentifier:@"NUITestViewController"];
+             viewController.CommandLine = self.cmdline;
+@@ -47,7 +67,7 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+         }
+         else
+         {
+-            self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
++            self.window = [[UIWindow alloc] initWithWindowScene:scene];
+             UIStoryboard *storyboard = [UIStoryboard storyboardWithName:_viewName bundle:nil];
+ 
+             UIViewController *viewController = [storyboard instantiateViewControllerWithIdentifier:@"RootNavigatorVC"];
+@@ -76,40 +96,9 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+         NSLog(@"-------- INIT ERROR ---------");
+         exit(-1);
+     }
+-
+-    return YES;
+-}
+-
+-- (void)applicationWillResignActive:(UIApplication *)application
+-{
+-    // Sent when the application is about to move from active to inactive state. This can occur for certain types of temporary interruptions (such as an incoming phone call or SMS message) or when the user quits the application and it begins the transition to the background state.
+-    // Use this method to pause ongoing tasks, disable timers, and throttle down OpenGL ES frame rates. Games should use this method to pause the game.
+-    [[NSNotificationCenter defaultCenter] postNotificationName:NUI_Request_CancelTest object:self];
+-    [[UIDevice currentDevice] setBatteryMonitoringEnabled:NO];
+-
+-}
+-
+-- (void)applicationDidEnterBackground:(UIApplication *)application
+-{
+-    // Use this method to release shared resources, save user data, invalidate timers, and store enough application state information to restore your application to its current state in case it is terminated later.
+-    // If your application supports background execution, this method is called instead of applicationWillTerminate: when the user quits.
+ }
+ 
+-- (void)applicationWillEnterForeground:(UIApplication *)application
+-{
+-    // Called as part of the transition from the background to the inactive state; here you can undo many of the changes made on entering the background.
+-}
+-
+-- (void)applicationDidBecomeActive:(UIApplication *)application
+-{
+-    // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
+-    [[UIDevice currentDevice] setBatteryMonitoringEnabled:YES];
+-}
+-
+-- (void)applicationWillTerminate:(UIApplication *)application
+-{
+-    // Called when the application is about to terminate. Save data if appropriate. See also applicationDidEnterBackground:.
+-}
++// With scenes adopted, the active and inactive callbacks go to the scene: NUISceneDelegate.
+ 
  - (NUICommandLineParser *)getCmdline
  {
-     if(self.cmdline == nil)
+diff --git a/app_ios/src/Common/NUISceneDelegate.h b/app_ios/src/Common/NUISceneDelegate.h
+new file mode 100644
+index 00000000..8f1f83db
+--- /dev/null
++++ b/app_ios/src/Common/NUISceneDelegate.h
+@@ -0,0 +1,17 @@
++/*
++ * Copyright (c) 2005-2025, Kishonti Ltd
++ * SPDX-License-Identifier: BSD-3-Clause
++ * This file is part of GFXBench. See the top-level LICENSE file for details.
++ */
++
++
++#import <UIKit/UIKit.h>
++
++// The app's one window scene (UIApplicationSceneManifest in Info.plist). An app built with the iOS 27 SDK must adopt the
++// scene life cycle or it fails to launch; once it does, UIKit sends the active and inactive callbacks to the scene, not to
++// the application delegate, which still makes the window (NUIAppDelegate showInWindowScene:).
++@interface NUISceneDelegate : UIResponder <UIWindowSceneDelegate>
++
++@property (strong, nonatomic) UIWindow *window;
++
++@end
+diff --git a/app_ios/src/Common/NUISceneDelegate.mm b/app_ios/src/Common/NUISceneDelegate.mm
+new file mode 100644
+index 00000000..795907cb
+--- /dev/null
++++ b/app_ios/src/Common/NUISceneDelegate.mm
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (c) 2005-2025, Kishonti Ltd
++ * SPDX-License-Identifier: BSD-3-Clause
++ * This file is part of GFXBench. See the top-level LICENSE file for details.
++ */
++
++
++#import "NUISceneDelegate.h"
++#import "NUIAppDelegate.h"
++#import "Utils/NUIMessageKeys.h"
++
++@implementation NUISceneDelegate
++
++- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions
++{
++    if(![scene isKindOfClass:[UIWindowScene class]])
++        return;
++    NUIAppDelegate *app = (NUIAppDelegate *)[[UIApplication sharedApplication] delegate];
++    [app showInWindowScene:(UIWindowScene *)scene];
++    self.window = app.window;
++}
++
++- (void)sceneWillResignActive:(UIScene *)scene
++{
++    // Pause: a running test is cancelled, as the application delegate did before scenes.
++    [[NSNotificationCenter defaultCenter] postNotificationName:NUI_Request_CancelTest object:self];
++    [[UIDevice currentDevice] setBatteryMonitoringEnabled:NO];
++}
++
++- (void)sceneDidBecomeActive:(UIScene *)scene
++{
++    [[UIDevice currentDevice] setBatteryMonitoringEnabled:YES];
++}
++
++@end
 diff --git a/app_ios/src/Pages/NUILoadingViewController.mm b/app_ios/src/Pages/NUILoadingViewController.mm
 index 19eb7302..164ad28c 100644
 --- a/app_ios/src/Pages/NUILoadingViewController.mm
