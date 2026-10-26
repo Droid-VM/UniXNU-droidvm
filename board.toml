@@ -111,7 +111,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "3641f6fd54da75040eb6a62a991b2f6213d31157d2473d34e77d612d4eba9ba2",
+  "fda334767e03e316c0b1815fb882211fd96089e4729b1a5df47b15a3e3777773",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -226,13 +226,14 @@ ipad_identity = true
 unique_chip_id = "required"
 chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
 # The third crosvm --virtio-mmio-block (tools/rig/make-data-store.sh) is the store disk, not a NativeVirtioBlock image;
-# --virtio-mmio-input puts the app's four input devices (mouse, multi-touch, absolute mouse, keyboard) after the disks,
-# and --virtio-mmio-net the --net device after them (/arm-io/net, package/DroidVMVirtioNet.c).
+# --virtio-mmio-input puts the app's five input devices (mouse, multi-touch, absolute mouse, keyboard, and the motion sensors
+# its "motion_sensor" adds last) after the disks, and --virtio-mmio-net the --net device after them (/arm-io/net,
+# package/DroidVMVirtioNet.c).
 # --display-gamut sRGB: the display chain scans out 8-bit sRGB (BGRX), and with the panel's P3 every app and WebKit drew its layers
 # into wide-color surfaces ('w30r', 'b3a8') that CoreGraphics fills only through the GPU -- which WebKit's sandboxed GPU process
 # cannot map -- so Safari's pages stayed black; sRGB keeps them on 8-bit BGRA surfaces CoreGraphics draws on the CPU too.
 # --virtio-gpu-mmio: the display (--virtio-mmio-gpu, last), with 8 MiB of RAM DarwinBoot keeps for its BLT-only boot screen.
 # package/crosvm-gunyah.dtb is this VM's own FDT, which names that window.
-tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000",
-             "--net-mmio", "0x0a007000", "--virtio-gpu-mmio", "0x0a008000", "--boot-video-mib", "8",
+tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000,0x0a007000",
+             "--net-mmio", "0x0a008000", "--virtio-gpu-mmio", "0x0a009000", "--boot-video-mib", "8",
              "--reclaim-memory", "--display-gamut", "sRGB"]
