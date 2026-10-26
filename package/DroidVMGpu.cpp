@@ -22,6 +22,11 @@
 // attach, pool, publish the service. droidvm-gpu-metal=1 also registers the AGXAccelerator for the original Metal discovery,
 // as sheng-gpu-metal=1 does on sheng. droidvm-gpu-selftest=1 runs one CP_MEM_WRITE through the VM and execbuf first.
 // droidvm-gpu-pool-mib=N sizes the pool (default 512). Progress goes to the kernel log ("droidvm-gpu: ...").
+//
+// Without droidvm-gpu=1 (no droidvm-gpu device: crosvm has only virtio devices) but with vgpu-3d=1 and droidvm-gpu-metal=1, Metal
+// draws through the virtio GPU's DRM context alone (DroidVMVirtioGpu3D.cpp, drm2kgsl on the host). Its user client, open type
+// 0x4149, is NativeAdreno's accelerator user client, which serves only once published, so the service is published with the KGSL
+// objects left unattached (droidvm_gpu_state stays 0, and the KGSL path, 0x4147, refuses its opens) and the accelerator registered.
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -1025,10 +1030,25 @@ void gpuThread(void *, wait_result_t)
 // The first client window starts at the VBO (NativeAdrenoPublish.cpp's windows are offsets from it, see build-droidvm-gpu.py).
 extern "C" uint64_t droidvm_gpu_window_base(void) {return droidvm_gpu_facts.va_start;}
 
+// Metal over the virtio GPU only (no droidvm-gpu device): the publish and the accelerator, nothing attached.
+static void virtioMetalThread(void *, wait_result_t)
+{
+    const IOReturn status = native_adreno_publish(&gVm, &gSubmit, &gRing, &gClock, &gTimer, &gDeviceInfo, 48, 40);
+    droidvm_gpu_stats[13] = uint32_t(status);
+    if (status) {IOLog("droidvm-gpu: publish for the virtio GPU failed (%#x)\n", status); return;}
+    IOLog("droidvm-gpu: published for the virtio GPU only (no droidvm-gpu device)\n");
+    publishMetal();
+    IOLog("droidvm-gpu: Metal accelerator stage %llu status %#llx\n", droidvm_gpu_stats[14], droidvm_gpu_stats[15]);
+}
+
 // The board's GPU hook, from the late display probe (before launchd starts the render server).
 extern "C" void sheng_gpu_power_probe(void)
 {
-    if (!bootArg("droidvm-gpu", 0)) return;
+    thread_continue_t body = gpuThread;
+    if (!bootArg("droidvm-gpu", 0)) {
+        if (!bootArg("vgpu-3d", 0) || bootArg("droidvm-gpu-metal", 0) != 1) return;
+        body = virtioMetalThread;
+    }
     thread_t thread = nullptr;
-    if (kernel_thread_start(gpuThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    if (kernel_thread_start(body, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
 }

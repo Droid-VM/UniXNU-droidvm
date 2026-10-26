@@ -111,7 +111,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "e73554925507cc2aa3d47e4487dbccd5468e3e0c96c891914542baf99146a815",
+  "74ad470b49335d848f4a0b9b14ecbc845db89f164baaba3c3e8e5c925d4cedc6",
 ]
 kernel_args = [
   "debug=0x14e",
@@ -188,11 +188,10 @@ kernel_args = [
   # A label without a "com." domain is under com.apple. bluetoothd runs: without its MachServices audiomxd's Bluetooth audio plugin
   # retried com.apple.BTAudioHALPlugin.xpc about 110 times a second (95% of the unified log), and it needs only the keychain.
   "droidvm-disable-jobs=watchdogd,identityservicesd,locationd,CommCenter,fairplayd.A2",
-  # the host phone's GPU through crosvm --droidvm-gpu (kits/droidvm/DroidVMGpu.cpp): NativeAdreno's service over KGSL
-  # (droidvm-gpu-selftest=1 first runs one CP_MEM_WRITE through it; left out, the command line is at its 1000-byte limit)
-  "droidvm-gpu=1",
-  # Metal's 3D through the virtio GPU's DRM context (drm2kgsl) by default, droidvm-gpu still there: turnip asks the kernel
-  # (package/DroidVMVirtioGpu3D.cpp, DROIDVM_VIRTGPU_PARAM_DEFAULT_3D); TU_DARWIN_VIRTGPU=0 or 1 in a process overrides it
+  # Metal's 3D through the virtio GPU's DRM context (drm2kgsl on the host): turnip asks the kernel (package/DroidVMVirtioGpu3D.cpp,
+  # DROIDVM_VIRTGPU_PARAM_DEFAULT_3D). The VM has no droidvm-gpu device any more (crosvm's --droidvm-gpu KGSL proxy); without
+  # droidvm-gpu=1, DroidVMGpu.cpp only publishes NativeAdreno's user client, which serves the virtio GPU's opens, and the accelerator.
+  # A VM that still has the device can take droidvm-gpu=1 back (TU_DARWIN_VIRTGPU=0 in a process then picks it).
   "vgpu-3d=1",
   # the AGXAccelerator for the original Metal discovery, and the plugin bundle (staged in the Data seed by add-gpu-plugin-data.py)
   # mounted over /System/Library/Extensions
@@ -228,12 +227,12 @@ unique_chip_id = "required"
 chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
 # The third crosvm --virtio-mmio-block (tools/rig/make-data-store.sh) is the store disk, not a NativeVirtioBlock image;
 # --virtio-mmio-input puts the app's four input devices (mouse, multi-touch, absolute mouse, keyboard) after the disks,
-# --droidvm-gpu its GPU after them, and --virtio-mmio-net the --net device last (/arm-io/net, package/DroidVMVirtioNet.c).
+# and --virtio-mmio-net the --net device after them (/arm-io/net, package/DroidVMVirtioNet.c).
 # --display-gamut sRGB: the display chain scans out 8-bit sRGB (BGRX), and with the panel's P3 every app and WebKit drew its layers
 # into wide-color surfaces ('w30r', 'b3a8') that CoreGraphics fills only through the GPU -- which WebKit's sandboxed GPU process
 # cannot map -- so Safari's pages stayed black; sRGB keeps them on 8-bit BGRA surfaces CoreGraphics draws on the CPU too.
 # --virtio-gpu-mmio: the display (--virtio-mmio-gpu, last), with 8 MiB of RAM DarwinBoot keeps for its BLT-only boot screen.
 # package/crosvm-gunyah.dtb is this VM's own FDT, which names that window.
 tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000",
-             "--gpu-mmio", "0x0a007000", "--net-mmio", "0x0a008000", "--virtio-gpu-mmio", "0x0a009000", "--boot-video-mib", "8",
+             "--net-mmio", "0x0a007000", "--virtio-gpu-mmio", "0x0a008000", "--boot-video-mib", "8",
              "--reclaim-memory", "--display-gamut", "sRGB"]

@@ -66,8 +66,6 @@ def validate(values, baseline=None):
         raise RuntimeError('source surfaces have been retired before display completion')
     if not values['backboardd_pid']:
         raise RuntimeError('backboardd is absent')
-    if not values['droidvm_gpu_capabilities'] & 1:
-        raise RuntimeError('host per-client loss status was not negotiated')
     if values['droidvm_gpu_lost_mask']:
         raise RuntimeError('a current GPU connection has lost its context')
     if baseline:

@@ -68,8 +68,11 @@ def main():
         return row
 
     baseline = snapshot()
-    if baseline['kernel_debugger_entry_count'] or baseline['droidvm_gpu_lost_mask'] or not baseline['droidvm_gpu_capabilities'] & 1:
-        raise SystemExit('guest must be healthy with per-client GPU loss reporting')
+    # Per-client loss reporting is droidvm-gpu's; a VM without that device (Metal on the virtio GPU only) has none to check.
+    if baseline['kernel_debugger_entry_count'] or baseline['droidvm_gpu_lost_mask']:
+        raise SystemExit('guest must be healthy')
+    if not baseline['droidvm_gpu_capabilities'] & 1:
+        print('no droidvm-gpu per-client loss reporting (virtio GPU only)', flush=True)
     if baseline['native_legacy_early_retires'] or baseline['droidvm_virtio_present_wait'] != 1:
         raise SystemExit('guest must retain surfaces and wait for GPU producers')
     guest_report = '/private/var/ngpu/metalcheck-' + str(time.time_ns()) + '.json'
