@@ -16,6 +16,8 @@ for t in "$@"; do
     A=$(GSSH_TIMEOUT=30 ./guest-ssh.sh '/bin/ps -A -o comm | /private/var/ngpu/bin/toybox grep -c GFXBench.app' 2>/dev/null | tail -1)
     [ "$A" = "0" ] && break
   done
+  # The app writes its result and exits within one poll: read the output once more after it has gone.
+  case "$R" in *status*|*ERROR*) ;; *) R=$(GSSH_TIMEOUT=30 ./guest-ssh.sh '/private/var/ngpu/bin/toybox cat /private/var/tmp/gfx.out 2>/dev/null' 2>/dev/null | grep -o -E '"(score|fps|frame_count|status)"[^,}]*|ERROR.*' | tr '\n' ' ');; esac
   after=$(GSSH_TIMEOUT=30 ./guest-ssh.sh '/private/var/ngpu/bin/toybox ls -t /private/var/mobile/Library/Logs/CrashReporter/ | /private/var/ngpu/bin/toybox grep "^app_ios-" | /private/var/ngpu/bin/toybox head -1' 2>/dev/null | tail -1)
   crash=""; [ "$after" != "$before" ] && crash="NEW CRASH $after"
   # A failed run's standard error is kept (the next launch clears gfx.err): /private/var/tmp/gfx-err-TEST-TIME.txt
