@@ -24,16 +24,19 @@ class DroidVMMotionHid : public IOHIDDevice {
     bool gyroscope = false;
     uint32_t lastSeq = 0;
 
-    // One application collection (vendor page, the usage locationd matches) holding the sensor's physical collection: three
-    // signed 32-bit fields, logical and physical range +-1000000, unit exponent -3, so IOHIDEventDriver's exponent scaling
-    // gives the value in thousandths as the event's IOFixed: milli-g (accelerometer), milliradians per second (gyroscope).
+    // Two application collections. The first is the primary usage pair locationd matches (vendor page, usage 3 or 9) and holds the
+    // sensor's physical collection: three signed 32-bit fields, logical and physical range +-1000000, unit exponent -3, so
+    // IOHIDEventDriver's exponent scaling gives the value in thousandths as the event's IOFixed: milli-g (accelerometer),
+    // milliradians per second (gyroscope). The second, empty, is only a usage pair: IOHIDFamily attaches IOHIDEventDriver to an
+    // interface by its pairs, and the one personality that takes a motion sensor ("HID Sensor") names {0xff0c, 3}.
 #define DROIDVM_MOTION_DESCRIPTOR(usage, sensor, field)                                                                    \
     {0x06, 0x00, 0xff, 0x09, usage, 0xa1, 0x01,                                                                           \
      0x05, 0x20, 0x09, sensor, 0xa1, 0x00,                                                                                \
      0x0a, field, 0x04, 0x0a, field + 1, 0x04, 0x0a, field + 2, 0x04,                                                     \
      0x17, 0xc0, 0xbd, 0xf0, 0xff, 0x27, 0x40, 0x42, 0x0f, 0x00,                                                          \
      0x37, 0xc0, 0xbd, 0xf0, 0xff, 0x47, 0x40, 0x42, 0x0f, 0x00,                                                          \
-     0x55, 0x0d, 0x75, 0x20, 0x95, 0x03, 0x81, 0x02, 0xc0, 0xc0}
+     0x55, 0x0d, 0x75, 0x20, 0x95, 0x03, 0x81, 0x02, 0xc0, 0xc0,                                                          \
+     0x06, 0x0c, 0xff, 0x09, 0x03, 0xa1, 0x01, 0xc0}
 
     static int32_t clamp(int64_t value) {
         return value > 1000000 ? 1000000 : value < -1000000 ? -1000000 : (int32_t)value;
