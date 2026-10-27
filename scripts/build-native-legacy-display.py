@@ -370,7 +370,7 @@ gpu_objects=[ROOT/p for p in json.loads((ROOT/'build/droidvm-gpu/objects.json').
 gpu_sources=[ROOT/p for p in json.loads((ROOT/'build/droidvm-gpu/sources.json').read_text())]
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end='')
-hid_dir=ROOT/'build/native-hid-input'
+hid_dir=ROOT/'build/sheng-hid-input'
 # The HID device also sends its report 1, the boot keyboard its descriptor already declares, when the board's keyboard driver tells it
 # (native_keyboard_set_sink: kits/droidvm/DroidVMVirtioInput.c, the app's virtio keyboard): NativeHidInput sends only the Home button
 # and touch, so no key typed on the phone reached iOS. Compiled from a staged copy with build-arm-driver.py's own command, after the
