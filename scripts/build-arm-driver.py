@@ -30,8 +30,10 @@ record = json.loads(recipe.read_text().strip().rstrip(','))
 DIRECTORY = {'NativeMobileDisplay': 'GopFramebuffer', 'NativeMetal': 'AdrenoMetal', 'NativeAdreno': 'Adreno740'}
 name = 'NativeMobileDisplay' if component in ('NativeLegacyDisplay','NativeGOPPresenter') else 'NativeMetal' if component in ('NativeOfflineGPU','NativeOfflineAccelerator','NativeIOGPUProviderProbe') else component
 source = ROOT / 'drivers' / DIRECTORY.get(name, name) / {'NativeAdreno':'NativeAdrenoService.cpp'}.get(component, component + '.cpp')
-out = ROOT / 'build' / {'ArmVirtPlatform': 'armvirt-platform', 'ArmDTPlatform': 'armdt-platform', 'ArmCpu': 'armcpu', 'NativeAES': 'native-aes',
-                        'NativeVirtioBlock': 'native-virtio-block', 'NativeRamBlock': 'native-ram-block',
+# The AES and RAM block objects go where upstream's binding scripts and the kernel link read them since the renames
+# (build/software-aes/libSoftwareAES.a, build/ram-block/libRamBlock.a).
+out = ROOT / 'build' / {'ArmVirtPlatform': 'armvirt-platform', 'ArmDTPlatform': 'armdt-platform', 'ArmCpu': 'armcpu', 'NativeAES': 'software-aes',
+                        'NativeVirtioBlock': 'native-virtio-block', 'NativeRamBlock': 'ram-block',
                         'NativeMobileDisplay': 'native-mobile-display', 'NativeVirtioConsole': 'native-virtio-console',
                         'NativeLegacyDisplay': 'native-legacy-display', 'NativeGOPPresenter': 'native-gop-presenter', 'NativeOfflineGPU':'native-offline-gpu','NativeOfflineAccelerator':'native-offline-accelerator','NativeIOGPUProviderProbe':'native-original-provider', 'NativeUfs':'native-ufs', 'NativeHidInput':'native-hid-input', 'NativeKeyStoreEvents':'native-keystore-events', 'NativeAdreno':'native-adreno'}[component]
 if args.verified_root:

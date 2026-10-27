@@ -34,7 +34,7 @@ CONFIG_XNU_BOARD_LAUNCH_POLICY=y
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # APFS volume UUID of build/droidvm-data (prepare-owner-data-fixture.py seed.json); a new seed has a new UUID.
 CONFIG_XNU_OWNER_DATA_VOLUME_UUID="B6E75E79-9594-4B6B-955A-F55B5154990A"
-CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/native-virtio-block-verified-bundle/libNativeVirtioBlock.a"
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/native-virtio-block-verified-bundle/libVirtioMmioBlock.a"
 CONFIG_XNU_VERIFIED_ROOT_ARCHIVE="{tree}/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a"
 CONFIG_XNU_EXTRA_LD_ARCHIVES=""
 CONFIG_XNU_NATIVE_UFS=n

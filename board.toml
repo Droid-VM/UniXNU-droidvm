@@ -42,7 +42,7 @@ archives = [
   "build-arm-driver.py NativeVirtioBlock --verified-root --verified-root-bundle",
   "build-native-virtio-bindings.py --component NativeVirtioBlock --directory build/native-virtio-block-verified-bundle",
   "build-arm-driver.py NativeRamBlock",
-  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
+  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/ram-block",
   "build-libpthread-kernel.py",
   # NativeAdreno's face for Metal over the virtio GPU (DroidVMGpu.cpp); its objects ride in the display archive below.
   "build-droidvm-gpu.py",
