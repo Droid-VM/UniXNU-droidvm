@@ -10,3 +10,15 @@ git = "https://github.com/apple-oss-distributions/IOStorageFamily.git"
 ref = "IOStorageFamily-315"
 commit = "e45fbe30a7879e0b16e26dddb78538f1b00e0bff"
 steps = ["kernel"]
+
+# The HID input driver (touch digitizer, Home button, the app's virtio keyboard through native_keyboard_set_sink), which
+# upstream moved out of the UniXNU tree on 2026-10-25 (ShengHidInput, in the sheng device repository's catalog). The board keeps
+# taking it under its old name: scripts/build-native-legacy-display.py and build-arm-driver.py compile
+# drivers/NativeHidInput/NativeHidInput.cpp. The pin is the commit the board used (ba03e5d) plus one documentation commit.
+[[source]]
+name = "NativeHidInput"
+kind = "driver"
+git = "https://github.com/UniXNU/ShengHidInput.git"
+ref = "main"
+commit = "5f3a37cec0c3fc4234b10726b25489a55f0d77ef"
+steps = ["kernel"]

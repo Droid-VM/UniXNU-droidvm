@@ -7,7 +7,7 @@ NativeAdrenoMemory, NativeAdrenoCpu) and the PM4 encoder they call are compiled 
 NativeAdrenoPublish.cpp, compiled from a staged copy (its client windows, 32 slots and the per-slot hooks below, made for the
 KGSL proxy crosvm's droidvm-gpu device used to be; with that device gone the hooks refuse NativeAdreno's own KGSL-style opens).
 The hardware classes (NativeAdrenoVm, NativeAdrenoRing, NativeAdrenoTimer) come from DroidVMGpu.cpp, never attached, instead of
-their own sources. The staged AGXAccelerator (build-native-adreno-accelerator.py) rides along for droidvm-gpu-metal=1: Metal's
+their own sources. The staged AGXAccelerator (build-adreno740-accelerator.py) rides along for droidvm-gpu-metal=1: Metal's
 user client is the accelerator's, which DroidVMVirtioGpu3D.cpp serves.
 
 The objects land in build/droidvm-gpu; build-native-legacy-display.py archives them into the late display archive, which the
@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'build/droidvm-gpu'
 OUT.mkdir(parents=True, exist_ok=True)
-ADRENO = ROOT / 'drivers/NativeAdreno'
+ADRENO = ROOT / 'drivers/Adreno740'
 
 
 def recipe(name):
@@ -280,9 +280,9 @@ pm4 = OUT / 'AdrenoPM4.kit.o'
 compile_with(c, ROOT / 'kits/AdrenoPM4/AdrenoPM4.c', pm4, includes + warnings)
 objects.append(pm4)
 
-print(subprocess.run(['python3', ROOT / 'scripts/build-native-adreno-accelerator.py'], check=True, capture_output=True,
+print(subprocess.run(['python3', ROOT / 'scripts/build-adreno740-accelerator.py'], check=True, capture_output=True,
                      text=True).stdout, end='')
-accelerator = ROOT / 'build/native-adreno-accelerator'
+accelerator = ROOT / 'build/adreno740-accelerator'
 objects += [accelerator / 'NativeAdrenoAccelerator.late.o', accelerator / 'original-bindings.o']
 
 defined = subprocess.run(['xcrun', 'nm', '-g', '-U', *objects], capture_output=True, text=True, check=True).stdout

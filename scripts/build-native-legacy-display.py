@@ -232,7 +232,7 @@ for gpu_source in virtio_gpu_sources:
     gpu_obj=OUT/(gpu_source.stem+'.o')
     # The virtio-gpu 3D methods' ABI (DroidVMVirtgpuABI.h) is NativeAdreno's, whose user client carries them.
     run([str(gpu_source) if arg==str(source) else str(gpu_obj) if arg==str(OUT/'LegacyDisplayProbe.o') else arg for arg in cmd]+
-        ['-I',str(ROOT/'drivers/NativeAdreno')],cwd=r['directory'])
+        ['-I',str(ROOT/'drivers/Adreno740')],cwd=r['directory'])
     virtio_gpu_objects.append(gpu_obj)
 hid_source=ROOT/'kits/droidvm/HidInputProbe.cpp'
 hid_obj=OUT/'HidInputProbe.o'
@@ -474,8 +474,8 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDisplayProbe.o',hid_obj,keystore_obj,process_obj,trace_obj,
      hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',keyevents_late,stub_obj,policy_obj,clock_obj,export_obj,store_obj,input_obj,motion_obj,bootargs_obj,net_obj,netif_obj,
      ethernet_late,*ionet_objects,*gpu_objects,*virtio_gpu_objects])
-sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',
-         ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,hid_source,keystore_source,process_source,trace_source,ROOT/'kits/droidvm/BootUiTraceCore.h',ROOT/'kits/droidvm/BootUiTraceDetails.h',
+sources=[ROOT/'drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
+         ROOT/'drivers/GopFramebuffer/NativeLegacyRequest.h',source,hid_source,keystore_source,process_source,trace_source,ROOT/'kits/droidvm/BootUiTraceCore.h',ROOT/'kits/droidvm/BootUiTraceDetails.h',
          ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',
          ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',stub_source,policy_source,clock_source,export_source,store_source,input_source,motion_source,bootargs_source,net_source,netif_source,
          ethernet_source,*ionet_sources,*gpu_sources,*virtio_gpu_sources,ROOT/'kits/droidvm/DroidVMVirtioGpu.h']
@@ -486,7 +486,7 @@ run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-
 require(code((gop/'NativeGOPPresenter.o').read_bytes(),macho((gop/'NativeGOPPresenter.o').read_bytes()))==
         code(gop_late.read_bytes(),macho(gop_late.read_bytes())),'Owned presenter instructions unchanged by late init staging')
 run(['xcrun','ar','rcs',archive,gop_late])
-sources.extend([ROOT/'drivers/NativeMobileDisplay/NativeGOPPresenter.cpp',ROOT/'drivers/NativeMobileDisplay/NativeGOPWire.h'])
+sources.extend([ROOT/'drivers/GopFramebuffer/NativeGOPPresenter.cpp',ROOT/'drivers/GopFramebuffer/NativeGOPWire.h'])
 (OUT/'build-report.json').write_text(json.dumps(dict(
     source_sha256={str(p.relative_to(ROOT)):sha(p) for p in sources},generated_abi_sha256=sha(OUT/'OriginalLegacyFramebufferABI.h'),
     original_candidate_sha256=sha(candidate),original_audit_sha256=sha(ROOT/'build/display-analysis/mobile-graphics-legacy-abi.json'),

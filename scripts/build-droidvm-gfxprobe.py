@@ -27,7 +27,7 @@ subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot',
                 '-fno-objc-arc', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface',
                 '-framework', 'QuartzCore', '-framework', 'IOKit', '-framework', 'CoreGraphics', '-framework', 'CoreImage',
                 # `gfxprobe virtgpu`: NativeAdreno's virtio-gpu 3D methods (DroidVMVirtgpuABI.h)
-                '-I', FORK / 'drivers/NativeAdreno', SOURCE, '-o', binary], check=True)
+                '-I', FORK / 'drivers/Adreno740', SOURCE, '-o', binary], check=True)
 entitlements = OUT / 'entitlements.plist'
 # The platform sandbox refuses IOServiceOpen of a user-client class a process is not granted: the surface and GPU clients it opens.
 # com.apple.backboardd.setDeviceOrientation: backboardd's handler of the automation device orientation (MIG 6000013) checks it
