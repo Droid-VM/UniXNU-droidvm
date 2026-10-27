@@ -201,7 +201,9 @@ void worker(void *, wait_result_t) {
             bool drawn = droidvm_virtgpu_finished(frame.work);
             const bool busy = !drawn;
             while (mode && !drawn && nowUs() - begin < 2000000) {
-                IOSleep(1);   // GPU work: sleep, so the vCPU goes idle
+                // GPU work: sleep, so the vCPU goes idle, but in steps of 100 us: IOSleep's 1 ms added half a millisecond
+                // a frame on average to a display that paces the compositor (offered -> done 14-16 ms of a 17-19 ms frame).
+                delay_for_interval(100, NSEC_PER_USEC);
                 drawn = droidvm_virtgpu_finished(frame.work);
             }
             if (!drawn) droidvm_virtio_present_late = droidvm_virtio_present_late + 1;
@@ -238,7 +240,16 @@ void worker(void *, wait_result_t) {
             droidvm_virtio_display_last_status = status;
             if (!status) droidvm_virtio_display_boot_frames = droidvm_virtio_display_boot_frames + 1;
         }
-        IOSleep(1); ++idle;
+        // Until the next frame is offered (offer() wakes this), or 1 ms for the boot console's cadence: a frame no longer waits
+        // up to a millisecond to be taken.
+        IOLockLock(frameLock);
+        if (!pending.memory && !bootDirty) {
+            uint64_t deadline;
+            clock_interval_to_deadline(1, kMillisecondScale, &deadline);
+            IOLockSleepDeadline(frameLock, &pending, deadline, THREAD_UNINT);
+        }
+        IOLockUnlock(frameLock);
+        ++idle;
     }
 }
 }
@@ -270,10 +281,11 @@ extern "C" bool droidvm_virtio_gpu_offer(void *display, IOMemoryDescriptor *memo
         auto service = static_cast<IOService *>(display);
         memory->retain(); service->retain(); pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted()};
         compositor = true;
+        IOLockWakeup(frameLock, &pending, true);
     }
     IOLockUnlock(frameLock); return accepted;
 }
 extern "C" void droidvm_virtio_gpu_boot_dirty(void) {
     if (!frameLock) return;
-    IOLockLock(frameLock); bootDirty = true; IOLockUnlock(frameLock);
+    IOLockLock(frameLock); bootDirty = true; IOLockWakeup(frameLock, &pending, true); IOLockUnlock(frameLock);
 }

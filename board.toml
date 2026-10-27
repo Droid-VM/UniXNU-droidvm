@@ -111,7 +111,7 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # and droidvm-diag's (scripts/build-droidvm-diag.py; make-owner-trust-bundle.py, it changes with every plugin or tool build).
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "ae09a9175c3c0bc31526c76009182e38649576fca7cd3360e1237c6f8d788313",
+  "555b59f0e989a93027e38350db60b9c48149b7cba75f6cf0053e099a124e7a4a",
 ]
 kernel_args = [
   # The switches this board always sets are built into the kernel (package/DroidVMBootArgs.c, PE_builtin_boot_args; UniXNU
