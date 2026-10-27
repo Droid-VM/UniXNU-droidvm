@@ -213,6 +213,10 @@ extern kern_return_t IOObjectRelease(io_object_t object);
 extern kern_return_t IOServiceGetMatchingServices(mach_port_t mainPort, CFDictionaryRef matching, io_object_t *iterator);
 extern io_object_t IOIteratorNext(io_object_t iterator);
 extern CFTypeRef IORegistryEntryCreateCFProperty(io_object_t entry, CFStringRef key, CFAllocatorRef allocator, uint32_t options);
+extern kern_return_t IORegistryEntryCreateCFProperties(io_object_t entry, CFMutableDictionaryRef *properties, CFAllocatorRef allocator,
+                                                       uint32_t options);
+extern kern_return_t IORegistryEntryGetChildIterator(io_object_t entry, const char *plane, io_object_t *iterator);
+extern kern_return_t IOObjectGetClass(io_object_t object, char className[128]);
 
 // CoreGraphics' context over an IOSurface (private), as WebKit makes one for a layer's backing store (IOSurface::createPlatformContext).
 extern CGContextRef CGIOSurfaceContextCreate(IOSurfaceRef, size_t width, size_t height, size_t bitsPerComponent, size_t bitsPerPixel,
@@ -1771,6 +1775,31 @@ static int motionProbe(unsigned seconds) {
     return 0;
 }
 
+// `gfxprobe ioreg CLASS`: every service of CLASS, its properties and its children's classes (the guest has no ioreg).
+static int ioregDump(const char *className) {
+    io_object_t iterator = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(className), &iterator) != KERN_SUCCESS) return 1;
+    unsigned count = 0;
+    for (io_object_t service; (service = IOIteratorNext(iterator)); IOObjectRelease(service), ++count) {
+        CFMutableDictionaryRef properties = NULL;
+        IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0);
+        printf("== %s %u\n%s\n", className, count, properties ? [(id)properties description].UTF8String : "(no properties)");
+        if (properties) CFRelease(properties);
+        io_object_t children = 0;
+        if (IORegistryEntryGetChildIterator(service, "IOService", &children) == KERN_SUCCESS) {
+            for (io_object_t child; (child = IOIteratorNext(children)); IOObjectRelease(child)) {
+                char name[128] = "";
+                IOObjectGetClass(child, name);
+                printf("   child %s\n", name);
+            }
+            IOObjectRelease(children);
+        }
+    }
+    IOObjectRelease(iterator);
+    printf("%u %s\n", count, className);
+    return 0;
+}
+
 static int setOrientation(long orientation) {
     void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
     void (*set)(long) = bbs ? (void (*)(long))dlsym(bbs, "BKSHIDServicesSetDeviceOrientationForAutomation") : NULL;
@@ -2091,6 +2120,8 @@ int main(int argc, char **argv) {
             return setOrientation(strtol(argv[2], NULL, 0));
         if (argc >= 2 && !strcmp(argv[1], "orient-follow"))
             return followOrientation();
+        if (argc >= 3 && !strcmp(argv[1], "ioreg"))
+            return ioregDump(argv[2]);
         if (argc >= 2 && !strcmp(argv[1], "motion"))
             return motionProbe(argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 5);
         if (argc >= 2 && !strcmp(argv[1], "display")) {
