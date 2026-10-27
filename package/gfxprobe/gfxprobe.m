@@ -27,6 +27,8 @@
 //   gfxprobe cpu SECONDS [THREADS]      CPU time each process used over SECONDS (proc_pid_rusage), busiest first, as a share of one
 //                                       CPU; then the threads (PROC_PIDTHREADINFO, named where they have a name) of the THREADS
 //                                       (default 3) busiest processes: what the guest's vCPUs run during an animation
+//   gfxprobe display                    what CoreAnimation makes of the main display: CADisplay's refresh rates, minimum frame
+//                                       duration, modes and VRR, as QuartzCore answers them (KVC, each key that answers)
 //   gfxprobe sync PATH...               F_FULLFSYNC each file, then sync(): a file staged into the Data overlay (export.py put)
 //                                       reaches the store before the VM stops (vm.sh stop is no clean shutdown)
 //   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
@@ -1871,6 +1873,38 @@ static int cpuUse(double seconds, int threadProcesses) {
     return 0;
 }
 
+static void printKeys(NSString *what, id object, NSArray<NSString *> *keys) {
+    printf("%s %s\n", what.UTF8String, [[object description] UTF8String]);
+    for (NSString *key in keys) {
+        @try {
+            id value = [object valueForKey:key];
+            printf("  %s = %s\n", key.UTF8String, [[value description] UTF8String]);
+        } @catch (NSException *e) {
+        }
+    }
+}
+
+static int displayInfo(void) {
+    Class display = objc_getClass("CADisplay");
+    id main = display ? ((id (*)(id, SEL))objc_msgSend)(display, sel_registerName("mainDisplay")) : nil;
+    if (!main) { printf("no CADisplay mainDisplay\n"); return 1; }
+    NSArray *keys = @[@"name", @"displayId", @"refreshRate", @"heartbeatRate", @"minimumFrameDuration", @"maximumRefreshRate",
+                      @"minimumRefreshRate", @"idealRefreshRate", @"hardwareRefreshRate", @"displayRefreshRate", @"supportsVRR",
+                      @"isVRR", @"preferredFramesPerSecond", @"currentMode", @"preferredMode", @"availableModes", @"bounds",
+                      @"frame", @"nativeOrientation", @"currentOrientation", @"compatQuantaMode", @"serverCompatQuantaMode"];
+    printKeys(@"CADisplay mainDisplay", main, keys);
+    id mode = [main valueForKey:@"currentMode"];
+    if (mode) printKeys(@"currentMode", mode, @[@"width", @"height", @"refreshRate", @"isVRR", @"pixelFormat", @"hdrMode"]);
+    Class link = objc_getClass("CADisplayLink");
+    if (link) {
+        id dl = ((id (*)(id, SEL, id, id, SEL))objc_msgSend)(link, sel_registerName("displayLinkWithDisplay:target:selector:"), main,
+                                                          main, sel_registerName("description"));
+        if (dl) printKeys(@"CADisplayLink", dl, @[@"preferredFramesPerSecond", @"maximumRefreshRate", @"duration",
+                                                  @"preferredFrameRateRange"]);
+    }
+    return 0;
+}
+
 static int compileMetal(const char *sourcePath, const char *outPath, const char *options) {
     void *library = dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_NOW);
     void *(*create)(const char *) = library ? dlsym(library, "MTLCodeGenServiceCreate") : NULL;
@@ -2008,6 +2042,10 @@ int main(int argc, char **argv) {
             return setOrientation(strtol(argv[2], NULL, 0));
         if (argc >= 2 && !strcmp(argv[1], "orient-follow"))
             return followOrientation();
+        if (argc >= 2 && !strcmp(argv[1], "display")) {
+            dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_NOW);
+            return displayInfo();
+        }
         if (argc >= 3 && !strcmp(argv[1], "cpu"))
             return cpuUse(atof(argv[2]), argc >= 4 ? atoi(argv[3]) : 3);
         if (argc >= 2 && !strcmp(argv[1], "tess"))
