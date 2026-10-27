@@ -10,7 +10,7 @@ the original script is unchanged.
 
 The original-class audits read a reference candidate kernel. This board's own prelinked kernel
 (out/<board>/kernel) carries the same unchanged original IOMobileGraphicsFamily and IOHIDFamily executables
-(the audits check their hashes), so it is linked in as build/native-prelink/native-owner-ufs-cpu-desktop-
+(the audits check their hashes), so it is linked in as build/xnu-prelink/native-owner-ufs-cpu-desktop-
 droidvm-candidate. The display audit's runtime observation of the original class (a QEMU run) is not
 available; as upstream does when that observation is pruned, its recorded hash is carried over.
 """
@@ -21,13 +21,13 @@ import struct
 import subprocess
 import sys
 ROOT=Path(__file__).resolve().parents[1];OUT=ROOT/'build/native-legacy-display';OUT.mkdir(parents=True,exist_ok=True)
-sys.path.insert(0,str(ROOT/'kits/NativePrelink'))
+sys.path.insert(0,str(ROOT/'kits/XnuPrelink'))
 from native_prelink import macho,backed_offset,exports
 def run(cmd,**kw):return subprocess.check_output([str(x) for x in cmd],timeout=90,**kw)
 def require(v,why):
     if not v:raise SystemExit(why)
 def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
-prelink=ROOT/'build/native-prelink';prelink.mkdir(parents=True,exist_ok=True)
+prelink=ROOT/'build/xnu-prelink';prelink.mkdir(parents=True,exist_ok=True)
 for suffix in ('.macho','.json'):
     link=prelink/('native-owner-ufs-cpu-desktop-droidvm-candidate'+suffix)
     reference=ROOT/'build/reference-candidate'/('kernel'+suffix)   # a kernel without the display/HID/storage drivers
@@ -130,9 +130,9 @@ for segment in image['segments']:
                 if bits>>27&1 and bits>>28==0 and bits>>25&3==3:relocations[sec['va']+offset]=symbols[bits&0xffffff][0]
 compiled=[relocations.get(vtable+16+i*8) for i in range(358)]
 require(all(compiled) and vtable+16+358*8 not in relocations,'Exact owned 358-entry vtable')
-candidate=ROOT/'build/native-prelink/native-owner-mobile-graphics-candidate.macho'
+candidate=ROOT/'build/xnu-prelink/native-owner-mobile-graphics-candidate.macho'
 if not candidate.exists():  # pruned: same fallback as scripts/audit-mobile-graphics-legacy.py (identical original family executable)
-    later=sorted((ROOT/'build/native-prelink').glob('native-owner-ufs-cpu-desktop-*-candidate.macho'),key=lambda f:f.stat().st_mtime)
+    later=sorted((ROOT/'build/xnu-prelink').glob('native-owner-ufs-cpu-desktop-*-candidate.macho'),key=lambda f:f.stat().st_mtime)
     require(later,'No reference candidate available');candidate=later[-1]
 old=candidate.read_bytes();old_image=macho(old)
 names={n:v for v,group in exports(old,old_image).items() for n in group}
