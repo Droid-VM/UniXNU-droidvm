@@ -113,4 +113,11 @@ if deployment != (2, 0x110000):
 archive = out / ('lib' + component + '.a')
 archive.unlink(missing_ok=True)
 subprocess.run(['xcrun', 'ar', 'rcs', archive, destination], check=True)
+# The kernel link checks a storage binding archive's object by the archive's name (build-xnu-4k-baseline.sh: libRamBlock.a's
+# RamBlock.o), which the renamed binding scripts give the canonical component name while they read the object by the legacy one.
+canonical = {'NativeRamBlock': 'RamBlock', 'NativeVirtioBlock': 'VirtioMmioBlock'}.get(component)
+if canonical:
+    alias = out / (canonical + '.o')
+    alias.unlink(missing_ok=True)
+    alias.symlink_to(destination.name)
 print(f'{component}: -Werror build and actual ARM64/iOS 17 object audit passed')
