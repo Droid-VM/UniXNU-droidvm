@@ -46,8 +46,10 @@ Resource resources[32], boot;
 uint64_t useClock;
 // The guest kernel's page (arm64 iOS): a surface's memory is whole pages of it.
 constexpr uint64_t GuestPage = 16384;
-// Zeroed memory that ends a surface's blob when the surface's own last page has no room left (it ends on a page boundary):
-// what the host's driver asks beyond stride x height, which its copy of the visible rows never reads.
+// Zeroed memory that ends a blob when its own last page has no room left (it ends on a page boundary), or is not known to be
+// its own (the boot framebuffer): what the host's driver asks beyond stride x height, which its copy of the visible rows never
+// reads. Up to 3 rows and a page (create()): enough for rows of up to 5120 pixels; a wider one gets no padding.
+constexpr uint64_t PaddingBytes = 4 * GuestPage;
 IOBufferMemoryDescriptor *padding;
 uint64_t paddingAddress;
 Entry entries[MaxEntries]; // worker-owned scratch, never shared with another producer
@@ -77,12 +79,12 @@ IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32
     if (droidvm_virtio_display_blob) {
         bytes = described = (bytes + 4095) & ~4095ULL;
         if (bytes > memory->getLength()) { release(r); return kIOReturnBadArgument; }
-        // The host may import the blob as an image of these dimensions, and its driver can ask for more memory than stride x
-        // height: Turnip lays a LINEAR 1024x1366 image out over 1368 rows, and refused the 8 KiB smaller blob, so every frame
-        // took the host's CPU copy. A surface's last page is its own; offer all of it. The boot framebuffer's is not known to
-        // be, so it ends in the padding instead: it is shown again whenever the compositor blanks the panel (between two
-        // GFXBench tests), and each of those frames was a CPU copy that switched the host's window between its producers.
-        bytes = (bytes + GuestPage - 1) & ~(GuestPage - 1);
+        // The host may import the blob as an image of these dimensions, and its driver asks for more memory than stride x
+        // height: Turnip lays the last level of a LINEAR image out over rows to a multiple of 4, which its 16x4 blits may
+        // over-fetch (freedreno fd6_layout.c). It refused a 1024x1366 blob 8 KiB short of 1368 rows, and that frame took the
+        // host's CPU copy. The boot framebuffer was one of them: it is shown again whenever the compositor blanks the panel
+        // (between two GFXBench tests), and each such frame switched the host's window between its producers.
+        bytes = (stride * ((uint64_t(height) + 3) & ~3ULL) + 4095) & ~4095ULL;
     }
     uint32_t count = 0;
     for (uint64_t offset = 0; offset < described;) {
@@ -94,12 +96,13 @@ IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32
         entries[count++] = {pa, uint32_t(length), 0}; offset += length;
     }
     if (bytes > described) {
-        // A surface: the rest of the page the last segment ends in, where the descriptor stops short of it. With no room there
-        // (2 of the compositor's 3 framebuffers), and always for the boot framebuffer: the padding.
+        // A surface: the rest of the page the last segment ends in, which is all its own, where the descriptor stops short of
+        // it. With no room there (2 of the compositor's 3 framebuffers), and always for the boot framebuffer: the padding.
         Entry &last = entries[count - 1];
         const uint64_t end = last.address + last.length, pageEnd = (end + GuestPage - 1) & ~(GuestPage - 1);
         if (surface && pageEnd - end >= bytes - described) last.length += uint32_t(bytes - described);
-        else if (paddingAddress && count < MaxEntries) entries[count++] = {paddingAddress, uint32_t(bytes - described), 0};
+        else if (paddingAddress && count < MaxEntries && bytes - described <= PaddingBytes)
+            entries[count++] = {paddingAddress, uint32_t(bytes - described), 0};
         else bytes = described;
     }
     r.id = resourceId();
@@ -265,9 +268,9 @@ extern "C" void droidvm_virtio_gpu_display_start(void) {
     droidvm_virtio_display_blob = blob && ((DroidVMVirtioGpu::features() & 0x48) == 0x48);
     frameLock = IOLockAlloc(); if (!frameLock) { droidvm_virtio_display_state = 3; return; }
     padding = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-        IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), GuestPage, ~uint64_t(4095));
+        IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), PaddingBytes, ~uint64_t(4095));
     if (padding && padding->prepare() == kIOReturnSuccess) {
-        bzero(padding->getBytesNoCopy(), GuestPage);
+        bzero(padding->getBytesNoCopy(), PaddingBytes);
         paddingAddress = padding->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
     }
     droidvm_virtio_display_state = 1;
