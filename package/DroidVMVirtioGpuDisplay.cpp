@@ -79,8 +79,10 @@ IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32
         if (bytes > memory->getLength()) { release(r); return kIOReturnBadArgument; }
         // The host may import the blob as an image of these dimensions, and its driver can ask for more memory than stride x
         // height: Turnip lays a LINEAR 1024x1366 image out over 1368 rows, and refused the 8 KiB smaller blob, so every frame
-        // took the host's CPU copy. A surface's last page is its own; offer all of it.
-        if (surface) bytes = (bytes + GuestPage - 1) & ~(GuestPage - 1);
+        // took the host's CPU copy. A surface's last page is its own; offer all of it. The boot framebuffer's is not known to
+        // be, so it ends in the padding instead: it is shown again whenever the compositor blanks the panel (between two
+        // GFXBench tests), and each of those frames was a CPU copy that switched the host's window between its producers.
+        bytes = (bytes + GuestPage - 1) & ~(GuestPage - 1);
     }
     uint32_t count = 0;
     for (uint64_t offset = 0; offset < described;) {
@@ -92,11 +94,11 @@ IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32
         entries[count++] = {pa, uint32_t(length), 0}; offset += length;
     }
     if (bytes > described) {
-        // The rest of the page the last segment ends in, where the descriptor stops short of it; or, with no room there (2 of
-        // the compositor's 3 framebuffers), the padding.
+        // A surface: the rest of the page the last segment ends in, where the descriptor stops short of it. With no room there
+        // (2 of the compositor's 3 framebuffers), and always for the boot framebuffer: the padding.
         Entry &last = entries[count - 1];
         const uint64_t end = last.address + last.length, pageEnd = (end + GuestPage - 1) & ~(GuestPage - 1);
-        if (pageEnd - end >= bytes - described) last.length += uint32_t(bytes - described);
+        if (surface && pageEnd - end >= bytes - described) last.length += uint32_t(bytes - described);
         else if (paddingAddress && count < MaxEntries) entries[count++] = {paddingAddress, uint32_t(bytes - described), 0};
         else bytes = described;
     }
