@@ -103,6 +103,14 @@ IOReturn NativeAdrenoVm::sampleWord(uint64_t, uint32_t *cached, uint32_t *dram) 
     return kIOReturnUnsupported;
 }
 IOReturn NativeAdrenoVm::peekWords(uint64_t, uint32_t *, size_t) const {return kIOReturnBadArgument;}
+IOReturn NativeAdrenoVm::peekWordsUncached(uint64_t, uint32_t *, size_t) const {return kIOReturnBadArgument;}
+IOReturn NativeAdrenoVm::faultState(uint32_t out[4]) const
+{
+    if (!out) return kIOReturnBadArgument;
+    for (unsigned i = 0; i < 4; ++i) out[i] = 0;
+    return kIOReturnNotReady;
+}
+uint64_t NativeAdrenoVm::handleAt(uint64_t) const {return 0;}
 
 IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *, const NativeAdrenoRingCache *, void *, size_t, uint64_t, void *, size_t,
     uint64_t)
@@ -129,6 +137,19 @@ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence, const NativeAdrenoR
     uint32_t *observed)
 {
     return observeFence(fence, clock, timeout_us, observed);
+}
+IOReturn NativeAdrenoRing::stallState(uint32_t *out)
+{
+    if (!out) return kIOReturnBadArgument;
+    for (unsigned i = 0; i < NativeAdrenoRingStallWords; ++i) out[i] = 0;
+    return kIOReturnNotReady;
+}
+IOReturn NativeAdrenoRing::kick() {return kIOReturnNotReady;}
+IOReturn NativeAdrenoRing::drainBus(uint32_t *ack)
+{
+    if (!ack) return kIOReturnBadArgument;
+    ack[0] = ack[1] = 0;
+    return kIOReturnNotReady;
 }
 
 IOReturn NativeAdrenoTimer::attach(const NativeAdrenoTimeIo *, uint32_t) {return kIOReturnUnsupported;}
