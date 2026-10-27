@@ -18,6 +18,10 @@
 //                                       whose pages the GPU takes from the process; buffer), then ROUNDS copies between them in one
 //                                       command buffer by blit, by a draw that reads one into the other as CoreAnimation composites a
 //                                       layer, and by a 9-tap horizontal blur; GPU time (GPUStartTime..GPUEndTime), wall time, GB/s
+//   gfxprobe rotbench W H PASSES ROT [CLEAR]  CoreAnimation's framebuffer: a W x H framebuffer-only render target of rotation ROT
+//                                       (0-3) over an IOSurface of the extent it stores, and PASSES render passes into it in one
+//                                       command buffer, each loading it (CLEAR=1: clearing), drawing a full-frame triangle and storing:
+//                                       the GPU time per pass, against ROT 0 for what the turned copies cost
 //   gfxprobe sync PATH...               F_FULLFSYNC each file, then sync(): a file staged into the Data overlay (export.py put)
 //                                       reaches the store before the VM stops (vm.sh stop is no clean shutdown)
 //   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
@@ -167,6 +171,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <fcntl.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <pthread.h>
 #import <spawn.h>
@@ -2070,6 +2075,59 @@ int main(int argc, char **argv) {
                         }
                     }
                 printf("coherence round %u: %zu of %u words differ (%zu zero), status %ld\n", round, wrong, w * h, zero, (long)commands.status);
+            }
+        } else if (!strcmp(argv[1], "rotbench")) {
+            unsigned passes = (unsigned)strtoul(argv[4], NULL, 0), rotation = argc > 5 ? (unsigned)strtoul(argv[5], NULL, 0) : 0;
+            bool clear = argc > 6 && atoi(argv[6]);
+            unsigned sw = rotation % 2 ? h : w, sh = rotation % 2 ? w : h;
+            IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth: @(sw), (id)kIOSurfaceHeight: @(sh),
+                (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @((unsigned)'BGRA')});
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h
+                                                                                    mipmapped:NO];
+            d.usage = MTLTextureUsageRenderTarget;
+            // The SPI CoreAnimation sets on its framebuffer's texture (QuartzCore: setRotation:, framebufferOnly).
+            ((void (*)(id, SEL, NSUInteger))objc_msgSend)(d, sel_registerName("setRotation:"), rotation);
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(d, sel_registerName("setFramebufferOnly:"), YES);
+            id<MTLTexture> target = surface ? [device newTextureWithDescriptor:d iosurface:surface plane:0] : nil;
+            static const char *source =
+                "#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; };\n"
+                "vertex V vs(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V v; v.p = float4(q * 2 - 1, 0, 1); return v; }\n"
+                "fragment float4 fs(V v [[stage_in]]) { return float4(fract(v.p.x / 64), fract(v.p.y / 64), 0.5, 1); }\n";
+            NSError *error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:@(source) options:nil error:&error];
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.vertexFunction = [library newFunctionWithName:@"vs"];
+            pd.fragmentFunction = [library newFunctionWithName:@"fs"];
+            pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            id<MTLRenderPipelineState> pipeline = library ? [device newRenderPipelineStateWithDescriptor:pd error:&error] : nil;
+            id<MTLCommandQueue> queue = [device newCommandQueue];
+            if (!target || !pipeline || !queue) {
+                printf("rotbench: surface %p target %p pipeline %p: %s\n", surface, target, pipeline, error.description.UTF8String);
+                return 1;
+            }
+            // The first command buffer warms up (the twin image, pipelines); the second is timed.
+            for (int round = 0; round < 2; round++) {
+                id<MTLCommandBuffer> commands = [queue commandBuffer];
+                for (unsigned p = 0; p < (round ? passes : 1); p++) {
+                    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                    pass.colorAttachments[0].texture = target;
+                    pass.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
+                    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    id<MTLRenderCommandEncoder> draw = [commands renderCommandEncoderWithDescriptor:pass];
+                    [draw setRenderPipelineState:pipeline];
+                    [draw drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                    [draw endEncoding];
+                }
+                struct timespec begin, end;
+                clock_gettime(CLOCK_MONOTONIC, &begin);
+                [commands commit];
+                [commands waitUntilCompleted];
+                clock_gettime(CLOCK_MONOTONIC, &end);
+                const double wall = (end.tv_sec - begin.tv_sec) * 1e3 + (end.tv_nsec - begin.tv_nsec) / 1e6,
+                             gpu = (commands.GPUEndTime - commands.GPUStartTime) * 1e3;
+                if (round)
+                    printf("rotbench %ux%u rotation %u %s: %u passes, gpu %.2f ms (%.3f ms a pass), wall %.2f ms, status %ld\n", w, h,
+                           rotation, clear ? "clear" : "load", passes, gpu, gpu / passes, wall, (long)commands.status);
             }
         } else if (!strcmp(argv[1], "gpubw")) {
             unsigned rounds = (unsigned)strtoul(argv[4], NULL, 0);
