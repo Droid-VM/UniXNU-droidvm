@@ -306,7 +306,11 @@ def main():
     tree = node('device-tree', [
         ('model', b'iPad7,1\0' if args.ipad_identity else b'droidvm-first-boot\0'),
         *([('target-type', b'J120\0')] if args.ipad_identity else []),
-        ('compatible', b'droidvm,crosvm-gunyah\0'),
+        # The iPad's board name first: libMobileGestalt reads the first entry as the hardware model (HWModelStr), and CoreMotion and
+        # locationd know a device's motion sensors only by it (CLPlatformInfo::queryEmbeddedSystemHardware hashes it against its
+        # table; "droidvm,crosvm-gunyah" had none, so CMMotionManager reported no accelerometer or gyroscope). The audio server and
+        # MediaExperience key their per-board tables on it too (UniXNU 688fa88). The board's own string stays matchable after it.
+        ('compatible', (b'J120AP\0' if args.ipad_identity else b'') + b'droidvm,crosvm-gunyah\0'),
         ('#address-cells', struct.pack('<I', 2)),
         ('#size-cells', struct.pack('<I', 2)),
     ], [
@@ -356,7 +360,12 @@ def main():
                             ('artwork-scale-factor', struct.pack('<I', 2)),
                             ('artwork-display-gamut', args.display_gamut.encode() + b'\0'),
                             ('compatible-device-fallback', b'iPad6,7\0'),
-                            ('thin-bezel', struct.pack('<I', 1))] if args.ipad_identity else [])]),
+                            ('thin-bezel', struct.pack('<I', 1)),
+                            # MGGetProductType() looks this 20-byte id up in libMobileGestalt's product table (J120: 0x80ac7ae0);
+                            # without it the product type is 0 and every client that switches on it sees an unknown device.
+                            ('product-id', bytes.fromhex('e9fefef6e6f9d12a5ba1a2551866cbbd749f0ec3'))] if args.ipad_identity else [])],
+             # the audio server reads /product/audio (the original also sets supports-always-listening)
+             [node('audio', [('wireless-splitter', struct.pack('<I', 1))])] if args.ipad_identity else []),
         node('arm-io', [('device_type', b'arm-io\0'),
                         ('#address-cells', struct.pack('<I', 2)),
                         ('#size-cells', struct.pack('<I', 2)),
