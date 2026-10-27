@@ -24,6 +24,9 @@
 //                                       the GPU time per pass, against ROT 0 for what the turned copies cost; then every texel of
 //                                       the surface checked against where Metal stores the frame's texel (x, y) for ROT, and the
 //                                       texels that land as each other turn or mirror would put them, to name a wrong one
+//   gfxprobe cpu SECONDS [THREADS]      CPU time each process used over SECONDS (proc_pid_rusage), busiest first, as a share of one
+//                                       CPU; then the threads (PROC_PIDTHREADINFO, named where they have a name) of the THREADS
+//                                       (default 3) busiest processes: what the guest's vCPUs run during an animation
 //   gfxprobe sync PATH...               F_FULLFSYNC each file, then sync(): a file staged into the Data overlay (export.py put)
 //                                       reaches the store before the VM stops (vm.sh stop is no clean shutdown)
 //   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
@@ -173,6 +176,8 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <fcntl.h>
+#import <mach/mach_time.h>
+#import <sys/resource.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <pthread.h>
@@ -1785,6 +1790,87 @@ static int followOrientation(void) {
     }
 }
 
+// libproc, in libSystem on iOS though its header is not in the SDK (sys/proc_info.h: PROC_PIDTHREADINFO 5, PROC_PIDLISTTHREADS 6).
+extern int proc_listallpids(void *buffer, int size);
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int size);
+extern int proc_name(int pid, void *buffer, uint32_t size);
+extern int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);
+enum { PROC_PIDTHREADINFO = 5, PROC_PIDLISTTHREADS = 6 };
+struct proc_threadinfo {
+    uint64_t pth_user_time, pth_system_time;
+    int32_t pth_cpu_usage, pth_policy, pth_run_state, pth_flags, pth_sleep_time, pth_curpri, pth_priority, pth_maxpriority;
+    char pth_name[64];
+};
+
+// One process's CPU time in nanoseconds (user and system), or -1 where it is gone.
+static int64_t processTime(pid_t pid) {
+    struct rusage_info_v0 info;
+    if (proc_pid_rusage(pid, RUSAGE_INFO_V0, (rusage_info_t *)&info) != 0) return -1;
+    static mach_timebase_info_data_t base;
+    if (!base.denom) mach_timebase_info(&base);
+    return (int64_t)((info.ri_user_time + info.ri_system_time) * base.numer / base.denom);
+}
+
+// Each thread of `pid` with its CPU time in nanoseconds, keyed by thread id.
+static NSDictionary<NSNumber *, NSArray *> *threadTimes(pid_t pid) {
+    NSMutableDictionary *threads = [NSMutableDictionary dictionary];
+    uint64_t ids[1024];
+    int bytes = proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, ids, sizeof(ids));
+    for (int i = 0; bytes > 0 && i < bytes / (int)sizeof(uint64_t); i++) {
+        struct proc_threadinfo info;
+        if (proc_pidinfo(pid, PROC_PIDTHREADINFO, ids[i], &info, sizeof(info)) != sizeof(info)) continue;
+        threads[@(ids[i])] = @[@(info.pth_user_time + info.pth_system_time), @(info.pth_name)];
+    }
+    return threads;
+}
+
+static int cpuUse(double seconds, int threadProcesses) {
+    int pids[4096];
+    int count = proc_listallpids(pids, sizeof(pids)) ;
+    NSMutableDictionary *before = [NSMutableDictionary dictionary];
+    for (int i = 0; i < count; i++) {
+        int64_t t = processTime(pids[i]);
+        if (t >= 0) before[@(pids[i])] = @(t);
+    }
+    NSMutableDictionary *threadsBefore = [NSMutableDictionary dictionary];
+    for (NSNumber *pid in before) threadsBefore[pid] = threadTimes(pid.intValue);
+    usleep((useconds_t)(seconds * 1e6));
+    NSMutableArray *rows = [NSMutableArray array];
+    for (NSNumber *pid in before) {
+        int64_t t = processTime(pid.intValue);
+        if (t < 0) continue;
+        int64_t used = t - [before[pid] longLongValue];
+        if (used > 0) [rows addObject:@[@(used), pid]];
+    }
+    [rows sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) { return [b[0] compare:a[0]]; }];
+    double total = 0;
+    for (NSArray *row in rows) total += [row[0] doubleValue];
+    printf("cpu over %.1f s: %.0f%% of one CPU in all\n", seconds, 100 * total / (seconds * 1e9));
+    for (NSUInteger i = 0; i < rows.count && i < 15; i++) {
+        pid_t pid = [rows[i][1] intValue];
+        char name[256] = "";
+        proc_name(pid, name, sizeof(name));
+        printf("  %5.1f%%  %5d %s\n", 100 * [rows[i][0] doubleValue] / (seconds * 1e9), pid, name);
+    }
+    for (NSUInteger i = 0; i < rows.count && (int)i < threadProcesses; i++) {
+        NSNumber *pid = rows[i][1];
+        NSDictionary *was = threadsBefore[pid], *now = threadTimes(pid.intValue);
+        NSMutableArray *threads = [NSMutableArray array];
+        for (NSNumber *tid in now) {
+            int64_t used = [now[tid][0] longLongValue] - [was[tid][0] longLongValue];
+            if (used > 0) [threads addObject:@[@(used), tid, now[tid][1]]];
+        }
+        [threads sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) { return [b[0] compare:a[0]]; }];
+        char name[256] = "";
+        proc_name(pid.intValue, name, sizeof(name));
+        printf("threads of %d %s:\n", pid.intValue, name);
+        for (NSUInteger k = 0; k < threads.count && k < 8; k++)
+            printf("  %5.1f%%  %llu %s\n", 100 * [threads[k][0] doubleValue] / (seconds * 1e9),
+                   [threads[k][1] unsignedLongLongValue], [threads[k][2] UTF8String]);
+    }
+    return 0;
+}
+
 static int compileMetal(const char *sourcePath, const char *outPath, const char *options) {
     void *library = dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_NOW);
     void *(*create)(const char *) = library ? dlsym(library, "MTLCodeGenServiceCreate") : NULL;
@@ -1922,6 +2008,8 @@ int main(int argc, char **argv) {
             return setOrientation(strtol(argv[2], NULL, 0));
         if (argc >= 2 && !strcmp(argv[1], "orient-follow"))
             return followOrientation();
+        if (argc >= 3 && !strcmp(argv[1], "cpu"))
+            return cpuUse(atof(argv[2]), argc >= 4 ? atoi(argv[3]) : 3);
         if (argc >= 2 && !strcmp(argv[1], "tess"))
             return tessCheck();
         if (argc >= 2 && !strcmp(argv[1], "ci"))
