@@ -171,6 +171,7 @@
 // exported: its address is RenderBox's slide (from -[RBDrawable size]) plus its address in the iPadOS 17.7.11 (21H461) cache.
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreImage/CoreImage.h>
+#import <CoreMotion/CoreMotion.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
@@ -209,6 +210,9 @@ extern io_object_t IOServiceGetMatchingService(mach_port_t mainPort, CFDictionar
 extern kern_return_t IOServiceOpen(io_object_t service, task_port_t owningTask, uint32_t type, io_object_t *connect);
 extern kern_return_t IOServiceClose(io_object_t connect);
 extern kern_return_t IOObjectRelease(io_object_t object);
+extern kern_return_t IOServiceGetMatchingServices(mach_port_t mainPort, CFDictionaryRef matching, io_object_t *iterator);
+extern io_object_t IOIteratorNext(io_object_t iterator);
+extern CFTypeRef IORegistryEntryCreateCFProperty(io_object_t entry, CFStringRef key, CFAllocatorRef allocator, uint32_t options);
 
 // CoreGraphics' context over an IOSurface (private), as WebKit makes one for a layer's backing store (IOSurface::createPlatformContext).
 extern CGContextRef CGIOSurfaceContextCreate(IOSurfaceRef, size_t width, size_t height, size_t bitsPerComponent, size_t bitsPerPixel,
@@ -1722,6 +1726,51 @@ static int ciProbe(unsigned size, const char *dir) {
     return worst > 3;
 }
 
+// `gfxprobe motion [SECONDS]`: the motion sensors the stock way. First the HID event services on the Apple vendor page, which is
+// how locationd finds the accelerometer (usage 3) and the gyroscope (usage 9) (DroidVMMotionHid.inc in the kernel); then what
+// CoreMotion -- an app's CMMotionManager, which asks locationd -- reads from them twice a second: acceleration in g, rotation rate
+// in radians per second.
+static NSString *motionProperty(io_object_t service, CFStringRef key) {
+    CFTypeRef value = IORegistryEntryCreateCFProperty(service, key, kCFAllocatorDefault, 0);
+    return value ? [[(id)value autorelease] description] : @"-";
+}
+
+static int motionProbe(unsigned seconds) {
+    io_object_t iterator = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOHIDEventDriver"), &iterator) == KERN_SUCCESS) {
+        for (io_object_t service; (service = IOIteratorNext(iterator)); IOObjectRelease(service)) {
+            if (![motionProperty(service, CFSTR("PrimaryUsagePage")) isEqualToString:@"65280"]) continue;
+            printf("service: usage %s, product %s, built-in %s, transport %s, accel events %s, gyro events %s\n",
+                   motionProperty(service, CFSTR("PrimaryUsage")).UTF8String, motionProperty(service, CFSTR("Product")).UTF8String,
+                   motionProperty(service, CFSTR("Built-In")).UTF8String, motionProperty(service, CFSTR("Transport")).UTF8String,
+                   motionProperty(service, CFSTR("SupportsAccelEvents")).UTF8String,
+                   motionProperty(service, CFSTR("SupportsGyroEvents")).UTF8String);
+        }
+        IOObjectRelease(iterator);
+    }
+    CMMotionManager *manager = [[CMMotionManager alloc] init];
+    printf("CoreMotion: accelerometer %s, gyroscope %s, device motion %s\n", manager.accelerometerAvailable ? "available" : "absent",
+           manager.gyroAvailable ? "available" : "absent", manager.deviceMotionAvailable ? "available" : "absent");
+    manager.accelerometerUpdateInterval = 0.02;
+    manager.gyroUpdateInterval = 0.02;
+    [manager startAccelerometerUpdates];
+    [manager startGyroUpdates];
+    for (unsigned i = 0; i < seconds * 2; ++i) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false);
+        CMAccelerometerData *accel = manager.accelerometerData;
+        CMGyroData *gyro = manager.gyroData;
+        printf("%4.1f s  accel %s  gyro %s\n", (i + 1) / 2.0,
+               accel ? [NSString stringWithFormat:@"%+.3f %+.3f %+.3f g", accel.acceleration.x, accel.acceleration.y,
+                        accel.acceleration.z].UTF8String : "none",
+               gyro ? [NSString stringWithFormat:@"%+.3f %+.3f %+.3f rad/s", gyro.rotationRate.x, gyro.rotationRate.y,
+                       gyro.rotationRate.z].UTF8String : "none");
+    }
+    [manager stopAccelerometerUpdates];
+    [manager stopGyroUpdates];
+    [manager release];
+    return 0;
+}
+
 static int setOrientation(long orientation) {
     void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
     void (*set)(long) = bbs ? (void (*)(long))dlsym(bbs, "BKSHIDServicesSetDeviceOrientationForAutomation") : NULL;
@@ -2042,6 +2091,8 @@ int main(int argc, char **argv) {
             return setOrientation(strtol(argv[2], NULL, 0));
         if (argc >= 2 && !strcmp(argv[1], "orient-follow"))
             return followOrientation();
+        if (argc >= 2 && !strcmp(argv[1], "motion"))
+            return motionProbe(argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 5);
         if (argc >= 2 && !strcmp(argv[1], "display")) {
             dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_NOW);
             return displayInfo();
