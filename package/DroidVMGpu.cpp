@@ -145,6 +145,13 @@ IOReturn NativeAdrenoRing::stallState(uint32_t *out)
     return kIOReturnNotReady;
 }
 IOReturn NativeAdrenoRing::kick() {return kIOReturnNotReady;}
+IOReturn NativeAdrenoRing::ibBefore(uint32_t, uint64_t *iova, uint32_t *dwords) const
+{
+    if (!iova || !dwords) return kIOReturnBadArgument;
+    *iova = 0;
+    *dwords = 0;
+    return kIOReturnNotReady;
+}
 IOReturn NativeAdrenoRing::drainBus(uint32_t *ack)
 {
     if (!ack) return kIOReturnBadArgument;

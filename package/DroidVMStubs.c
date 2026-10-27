@@ -110,3 +110,9 @@ int native_ufs_block_authenticates(void *provider, const char *uuid, uint8_t *di
     (void)provider; (void)uuid; (void)digest;
     return -1;
 }
+
+// GopFramebuffer's direct scanout (sheng-dpu-scanout=2: the display hardware fetches the compositor's surface through sheng's UFS
+// display window) imports these weakly from sheng's UFS driver, which this board does not have; the kernel's static link still
+// needs a definition. The state's ready bit (31) stays clear, so the display never takes that path and keeps its copy.
+volatile uint32_t native_ufs_dpu_state = 0;
+uint32_t native_ufs_dpu_map(unsigned slot, const uint64_t *pages, unsigned count) {(void)slot; (void)pages; (void)count; return 0;}
