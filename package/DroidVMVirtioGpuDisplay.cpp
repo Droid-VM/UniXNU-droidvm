@@ -2,6 +2,7 @@
 // Scanout client of the shared virtio GPU transport. Retain and prepare each IOSurface's
 // memory until RESOURCE_UNREF completes; a timeout deliberately keeps the DMA pages pinned.
 #include "DroidVMVirtioGpu.h"
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOService.h>
 #include <kern/thread.h>
@@ -42,6 +43,10 @@ Resource resources[32], boot;
 uint64_t useClock;
 // The guest kernel's page (arm64 iOS): a surface's memory is whole pages of it.
 constexpr uint64_t GuestPage = 16384;
+// Zeroed memory that ends a surface's blob when the surface's own last page has no room left (it ends on a page boundary):
+// what the host's driver asks beyond stride x height, which its copy of the visible rows never reads.
+IOBufferMemoryDescriptor *padding;
+uint64_t paddingAddress;
 Entry entries[MaxEntries]; // worker-owned scratch, never shared with another producer
 IOLock *frameLock;
 Frame pending;
@@ -84,10 +89,12 @@ IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32
         entries[count++] = {pa, uint32_t(length), 0}; offset += length;
     }
     if (bytes > described) {
-        // The rest of the page the last segment ends in, where the descriptor stops short of it.
+        // The rest of the page the last segment ends in, where the descriptor stops short of it; or, with no room there (2 of
+        // the compositor's 3 framebuffers), the padding.
         Entry &last = entries[count - 1];
         const uint64_t end = last.address + last.length, pageEnd = (end + GuestPage - 1) & ~(GuestPage - 1);
         if (pageEnd - end >= bytes - described) last.length += uint32_t(bytes - described);
+        else if (paddingAddress && count < MaxEntries) entries[count++] = {paddingAddress, uint32_t(bytes - described), 0};
         else bytes = described;
     }
     r.id = resourceId();
@@ -226,6 +233,12 @@ extern "C" void droidvm_virtio_gpu_display_start(void) {
     unsigned blob = 1; PE_parse_boot_argn("droidvm-virtio-gpu-blob", &blob, sizeof blob);
     droidvm_virtio_display_blob = blob && ((DroidVMVirtioGpu::features() & 0x48) == 0x48);
     frameLock = IOLockAlloc(); if (!frameLock) { droidvm_virtio_display_state = 3; return; }
+    padding = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+        IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), GuestPage, ~uint64_t(4095));
+    if (padding && padding->prepare() == kIOReturnSuccess) {
+        bzero(padding->getBytesNoCopy(), GuestPage);
+        paddingAddress = padding->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    }
     droidvm_virtio_display_state = 1;
     thread_t thread;
     if (kernel_thread_start(worker, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
