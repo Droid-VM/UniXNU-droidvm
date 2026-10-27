@@ -13,6 +13,11 @@
 //                                       shader-cache directories can be read and written
 //   gfxprobe coherence W H ROUNDS [MODE] the CPU fills a BGRA surface with a new pattern each round and the GPU copies it to a buffer
 //                                       (a blit of a texture over the surface): the words the GPU did not see as the CPU left them
+//   gfxprobe gpubw W H ROUNDS [KIND...] the GPU's copy rate over each kind of memory: two W x H BGRA images of a KIND (private and
+//                                       shared Metal textures, the device's own pages; iosurface, iosurface-wc and ca, IOSurfaces
+//                                       whose pages the GPU takes from the process; buffer), then ROUNDS copies between them in one
+//                                       command buffer by blit, by a draw that reads one into the other as CoreAnimation composites a
+//                                       layer, and by a 9-tap horizontal blur; GPU time (GPUStartTime..GPUEndTime), wall time, GB/s
 //   gfxprobe sync PATH...               F_FULLFSYNC each file, then sync(): a file staged into the Data overlay (export.py put)
 //                                       reaches the store before the VM stops (vm.sh stop is no clean shutdown)
 //   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
@@ -2065,6 +2070,108 @@ int main(int argc, char **argv) {
                         }
                     }
                 printf("coherence round %u: %zu of %u words differ (%zu zero), status %ld\n", round, wrong, w * h, zero, (long)commands.status);
+            }
+        } else if (!strcmp(argv[1], "gpubw")) {
+            unsigned rounds = (unsigned)strtoul(argv[4], NULL, 0);
+            NSArray<NSString *> *kinds = @[@"private", @"shared", @"iosurface", @"iosurface-wc", @"ca", @"buffer"];
+            if (argc > 5) {
+                NSMutableArray *chosen = [NSMutableArray array];
+                for (int i = 5; i < argc; i++) [chosen addObject:@(argv[i])];
+                kinds = chosen;
+            }
+            static const char *source =
+                "#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; };\n"
+                "vertex V vs(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V v; v.p = float4(q * 2 - 1, 0, 1); return v; }\n"
+                "fragment float4 copy(V v [[stage_in]], texture2d<float> t [[texture(0)]]) { return t.read(uint2(v.p.xy)); }\n"
+                "fragment float4 blur(V v [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+                "  uint2 c = uint2(v.p.xy); uint w = t.get_width() - 1; float4 sum = 0;\n"
+                "  for (int d = -4; d <= 4; d++) sum += t.read(uint2(clamp(int(c.x) + d, 0, int(w)), c.y));\n"
+                "  return sum / 9; }\n";
+            NSError *error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:@(source) options:nil error:&error];
+            id<MTLCommandQueue> queue = [device newCommandQueue];
+            id<MTLRenderPipelineState> pipelines[2] = {nil, nil};
+            for (int i = 0; i < 2 && library; i++) {
+                MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+                d.vertexFunction = [library newFunctionWithName:@"vs"];
+                d.fragmentFunction = [library newFunctionWithName:i ? @"blur" : @"copy"];
+                d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                pipelines[i] = [device newRenderPipelineStateWithDescriptor:d error:&error];
+            }
+            if (!queue || !pipelines[0] || !pipelines[1]) {
+                printf("gpubw: library %p pipelines %p %p: %s\n", library, pipelines[0], pipelines[1], error.description.UTF8String);
+                return 1;
+            }
+            const double bytes = 2.0 * w * h * 4 * rounds; // each copy reads one image and writes the other
+            for (NSString *kind in kinds) {
+                id images[2] = {nil, nil};
+                for (int i = 0; i < 2; i++) {
+                    if ([kind isEqualToString:@"buffer"]) {
+                        images[i] = [device newBufferWithLength:(NSUInteger)w * h * 4 options:MTLResourceStorageModeShared];
+                        continue;
+                    }
+                    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w
+                                                                                                height:h mipmapped:NO];
+                    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+                    IOSurfaceRef surface = NULL;
+                    if ([kind isEqualToString:@"private"] || [kind isEqualToString:@"shared"]) {
+                        d.storageMode = [kind isEqualToString:@"private"] ? MTLStorageModePrivate : MTLStorageModeShared;
+                        images[i] = [device newTextureWithDescriptor:d];
+                        continue;
+                    } else if ([kind isEqualToString:@"ca"]) {
+                        surface = CAIOSurfaceCreateDefault(w, h, 'BGRA');
+                    } else {
+                        NSMutableDictionary *properties = [@{(id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h),
+                            (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @((unsigned)'BGRA')} mutableCopy];
+                        if ([kind isEqualToString:@"iosurface-wc"])
+                            properties[(id)kIOSurfaceCacheMode] = @0x400;
+                        surface = IOSurfaceCreate((CFDictionaryRef)properties);
+                    }
+                    // The surface stays alive for the process: a texture over it may not keep it.
+                    images[i] = surface ? [device newTextureWithDescriptor:d iosurface:surface plane:0] : nil;
+                }
+                if (!images[0] || !images[1]) {
+                    printf("gpubw %s: no images (%p %p)\n", kind.UTF8String, images[0], images[1]);
+                    continue;
+                }
+                const bool buffer = [kind isEqualToString:@"buffer"];
+                for (int op = 0; op < (buffer ? 1 : 3); op++) {
+                    // The first command buffer warms up (page mapping, pipeline upload); the second is timed.
+                    for (int pass = 0; pass < 2; pass++) {
+                        id<MTLCommandBuffer> commands = [queue commandBuffer];
+                        for (unsigned r = 0; r < (pass ? rounds : 1); r++) {
+                            id from = images[r & 1], to = images[!(r & 1)];
+                            if (op == 0) {
+                                id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+                                if (buffer)
+                                    [blit copyFromBuffer:from sourceOffset:0 toBuffer:to destinationOffset:0 size:(NSUInteger)w * h * 4];
+                                else
+                                    [blit copyFromTexture:from toTexture:to];
+                                [blit endEncoding];
+                                continue;
+                            }
+                            MTLRenderPassDescriptor *target = [MTLRenderPassDescriptor renderPassDescriptor];
+                            target.colorAttachments[0].texture = to;
+                            target.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                            target.colorAttachments[0].storeAction = MTLStoreActionStore;
+                            id<MTLRenderCommandEncoder> draw = [commands renderCommandEncoderWithDescriptor:target];
+                            [draw setRenderPipelineState:pipelines[op - 1]];
+                            [draw setFragmentTexture:from atIndex:0];
+                            [draw drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                            [draw endEncoding];
+                        }
+                        struct timespec begin, end;
+                        clock_gettime(CLOCK_MONOTONIC, &begin);
+                        [commands commit];
+                        [commands waitUntilCompleted];
+                        clock_gettime(CLOCK_MONOTONIC, &end);
+                        const double wall = (end.tv_sec - begin.tv_sec) * 1e3 + (end.tv_nsec - begin.tv_nsec) / 1e6, gpu = (commands.GPUEndTime - commands.GPUStartTime) * 1e3;
+                        if (pass)
+                            printf("gpubw %-12s %-5s %u x %ux%u: gpu %.2f ms, wall %.2f ms, %.2f GB/s, status %ld\n", kind.UTF8String,
+                                   op == 0 ? "blit" : op == 1 ? "draw" : "blur", rounds, w, h, gpu, wall,
+                                   bytes / ((gpu > 0 ? gpu : wall) * 1e6), (long)commands.status);
+                    }
+                }
             }
         } else if (!strcmp(argv[1], "plain")) {
             for (int i = 4; i < argc; i++) {

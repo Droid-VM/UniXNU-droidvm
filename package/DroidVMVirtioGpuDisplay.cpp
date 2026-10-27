@@ -26,16 +26,22 @@ DroidVMPresentSample droidvm_virtio_present_samples[64];
 namespace {
 using namespace DroidVMVirtioGpu;
 struct Rect { uint32_t x, y, width, height; };
+// used: when the resource was last shown (useClock), so the cache gives up the one shown longest ago.
 struct Resource {
     IOMemoryDescriptor *memory;
-    uint64_t stride;
+    uint64_t stride, used;
     uint32_t width, height, id;
     bool prepared, usable;
 };
 // work: the virtio GPU's fenced submissions made before the swap (droidvm_virtgpu_submitted). The frame is drawn once they have
 // finished.
 struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height; uint64_t work; };
-Resource resources[8], boot;
+// The compositor's surfaces: more than it keeps in flight, since during an animation it presents from a larger set than at rest
+// (8 entries were recreated on almost every frame of a page drag).
+Resource resources[32], boot;
+uint64_t useClock;
+// The guest kernel's page (arm64 iOS): a surface's memory is whole pages of it.
+constexpr uint64_t GuestPage = 16384;
 Entry entries[MaxEntries]; // worker-owned scratch, never shared with another producer
 IOLock *frameLock;
 Frame pending;
@@ -51,26 +57,38 @@ bool release(Resource &r) {
     if (r.prepared) r.memory->complete(kIODirectionOut);
     OSSafeReleaseNULL(r.memory); r = {}; return true;
 }
-IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height) {
+// surface: the memory is a compositor surface, whose last page is all its own (the boot framebuffer's is not known to be).
+IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height, bool surface = false) {
     if (!width || width > 16384 || !height || height > 16384 || stride < uint64_t(width) * 4 ||
         stride % 4 || stride > 65536 || memory->getLength() < stride * height) return kIOReturnBadArgument;
     r.memory = memory; memory->retain(); r.stride = stride; r.width = width; r.height = height;
     IOReturn status = memory->prepare(kIODirectionOut);
     if (status) { OSSafeReleaseNULL(r.memory); return status; }
     r.prepared = true;
-    uint64_t bytes = stride * height;
+    uint64_t bytes = stride * height, described = bytes;
     if (droidvm_virtio_display_blob) {
-        bytes = (bytes + 4095) & ~4095ULL;
+        bytes = described = (bytes + 4095) & ~4095ULL;
         if (bytes > memory->getLength()) { release(r); return kIOReturnBadArgument; }
+        // The host may import the blob as an image of these dimensions, and its driver can ask for more memory than stride x
+        // height: Turnip lays a LINEAR 1024x1366 image out over 1368 rows, and refused the 8 KiB smaller blob, so every frame
+        // took the host's CPU copy. A surface's last page is its own; offer all of it.
+        if (surface) bytes = (bytes + GuestPage - 1) & ~(GuestPage - 1);
     }
     uint32_t count = 0;
-    for (uint64_t offset = 0; offset < bytes;) {
+    for (uint64_t offset = 0; offset < described;) {
         IOByteCount length = 0;
         uint64_t pa = memory->getPhysicalSegment(offset, &length);
-        if (length > bytes - offset) length = bytes - offset;
+        if (length > described - offset) length = described - offset;
         if (!pa || !length || length > UINT32_MAX || count == MaxEntries ||
             (droidvm_virtio_display_blob && ((pa | length) & 4095))) { release(r); return kIOReturnBadArgument; }
         entries[count++] = {pa, uint32_t(length), 0}; offset += length;
+    }
+    if (bytes > described) {
+        // The rest of the page the last segment ends in, where the descriptor stops short of it.
+        Entry &last = entries[count - 1];
+        const uint64_t end = last.address + last.length, pageEnd = (end + GuestPage - 1) & ~(GuestPage - 1);
+        if (pageEnd - end >= bytes - described) last.length += uint32_t(bytes - described);
+        else bytes = described;
     }
     r.id = resourceId();
     Header reply = {};
@@ -124,14 +142,20 @@ IOReturn present(Resource &r) {
 }
 Resource *surface(const Frame &frame) {
     for (auto &r : resources) if (r.memory == frame.memory && r.usable && r.id && r.stride == frame.stride &&
-        r.width == frame.width && r.height == frame.height) return &r;
+        r.width == frame.width && r.height == frame.height) { r.used = ++useClock; return &r; }
     Resource *slot = nullptr;
     for (auto &r : resources) if (!r.memory) { slot = &r; break; }
-    if (!slot) for (auto &r : resources) if (r.id != activeResource) { if (release(r)) slot = &r; break; }
+    if (!slot) {
+        Resource *oldest = nullptr;
+        for (auto &r : resources) if (r.id != activeResource && (!oldest || r.used < oldest->used)) oldest = &r;
+        if (oldest && release(*oldest)) slot = oldest;
+    }
     if (!slot) return nullptr;
-    IOReturn status = create(*slot, frame.memory, frame.stride, frame.width, frame.height);
+    IOReturn status = create(*slot, frame.memory, frame.stride, frame.width, frame.height, true);
     droidvm_virtio_display_last_status = status;
-    return status ? nullptr : slot;
+    if (status) return nullptr;
+    slot->used = ++useClock;
+    return slot;
 }
 void worker(void *, wait_result_t) {
     PE_Video video = {};
