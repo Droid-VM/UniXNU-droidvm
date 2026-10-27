@@ -60,8 +60,10 @@ char PE_builtin_boot_args[] =
     // plugin retried com.apple.BTAudioHALPlugin.xpc about 110 times a second (95% of the unified log), and it needs only the
     // keychain. accessoryupdaterd updates the firmware of Apple accessories, which a VM has none of, and kept trustd checking
     // certificates (about 9 OCSP requests a second, trustd at 20-30% of a CPU); a disabled job's MachServices are not registered,
-    // so its clients get no answer at once rather than wait.
-    "droidvm-disable-jobs=watchdogd,identityservicesd,locationd,CommCenter,fairplayd.A2,accessoryupdaterd "
+    // so its clients get no answer at once rather than wait. locationd runs: CoreMotion asks it for the accelerometer and the
+    // gyroscope (an app's CMMotionManager, backboardd's device orientation), and the first-boot Setup that waited on it is
+    // skipped on this board.
+    "droidvm-disable-jobs=watchdogd,identityservicesd,CommCenter,fairplayd.A2,accessoryupdaterd "
     // Metal's 3D through the virtio GPU's DRM context (drm2kgsl on the host): turnip asks the kernel (DroidVMVirtioGpu3D.cpp,
     // DROIDVM_VIRTGPU_PARAM_DEFAULT_3D). DroidVMGpu.cpp publishes NativeAdreno, whose accelerator's user client serves the virtio
     // GPU's opens, and the accelerator.
