@@ -21,6 +21,9 @@ volatile uint32_t droidvm_virtio_present_wait = 1;
 volatile uint64_t droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us;
 // Swaps shown although the GPU work before them had not finished in 2 s (a torn frame rather than a stopped display).
 volatile uint64_t droidvm_virtio_present_late;
+// The scanout's refresh rate in Hz from the device's EDID (its first detailed timing), 0 without one: the VM's display setting
+// (crosvm's refresh-rate), which the display reports to the compositor (LegacyDisplayProbe.cpp, native_legacy_refresh_hz).
+volatile uint32_t droidvm_virtio_display_refresh_hz;
 struct DroidVMPresentSample { uint64_t number; uint32_t fence, retired, mode, status; uint64_t wait_us, flush_us; };
 DroidVMPresentSample droidvm_virtio_present_samples[64];
 }
@@ -124,6 +127,19 @@ IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32
     droidvm_virtio_display_resources = droidvm_virtio_display_resources + 1;
     r.usable = true;
     return kIOReturnSuccess;
+}
+// The refresh rate of scanout 0's mode: GET_EDID, then the first detailed timing descriptor's pixel clock (10 kHz units) over its
+// total pixels (active plus blanking, across and down). 0 where the device has no EDID or no timing.
+uint32_t refreshFromEdid() {
+    if (!(DroidVMVirtioGpu::features() & (1u << 1))) return 0;
+    struct { Header h; uint32_t scanout, padding; } cmd = {{0x10a, 0, 0, 0, 0, {}}, 0, 0};
+    struct { Header h; uint32_t size, padding; uint8_t edid[1024]; } reply = {};
+    if (command(&cmd, sizeof cmd, nullptr, 0, &reply, sizeof reply) || reply.h.type != 0x1104 || reply.size < 72) return 0;
+    const uint8_t *t = reply.edid + 54;
+    const uint64_t clock = uint64_t(t[0] | t[1] << 8) * 10000;
+    const uint32_t across = (t[2] | (t[4] >> 4) << 8) + (t[3] | (t[4] & 15) << 8);
+    const uint32_t down = (t[5] | (t[7] >> 4) << 8) + (t[6] | (t[7] & 15) << 8);
+    return clock && across && down ? uint32_t((clock + uint64_t(across) * down / 2) / (uint64_t(across) * down)) : 0;
 }
 IOReturn present(Resource &r) {
     IOReturn status;
@@ -230,6 +246,8 @@ extern "C" void droidvm_virtio_gpu_display_start(void) {
     if (started) return; started = true;
     if (!DroidVMVirtioGpu::start()) return;
     DroidVMVirtioGpu::selftest3D();
+    droidvm_virtio_display_refresh_hz = refreshFromEdid();
+    IOLog("virtio-gpu: scanout refresh %u Hz (EDID)\n", droidvm_virtio_display_refresh_hz);
     unsigned blob = 1; PE_parse_boot_argn("droidvm-virtio-gpu-blob", &blob, sizeof blob);
     droidvm_virtio_display_blob = blob && ((DroidVMVirtioGpu::features() & 0x48) == 0x48);
     frameLock = IOLockAlloc(); if (!frameLock) { droidvm_virtio_display_state = 3; return; }

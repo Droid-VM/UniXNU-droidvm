@@ -491,6 +491,16 @@ void native_legacy_display_probe(void) {
     native_legacy_stage=7;display->release();native_legacy_released=1;native_legacy_stage=8;
     native_legacy_display_checkpoint();
 }
+extern "C" volatile uint32_t droidvm_virtio_display_refresh_hz;
+// The panel's refresh rate for NativeLegacyDisplay (its tick and the refresh properties the render server paces by): boot-arg
+// sheng-vsync where given (sheng-vsync=0: no tick, the render server's own 1/60 s, for an A/B), else the virtio GPU scanout's mode, the VM's display
+// setting (crosvm's refresh-rate, read from the device's EDID when the display starts, before the framebuffer registers). A mode of
+// 60 Hz or less answers 0, as no boot-arg did: no tick, and the render server's own 1/60 s.
+extern "C" unsigned native_legacy_refresh_hz(void) {
+    unsigned hz=0;
+    if(PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz)))return hz;
+    return droidvm_virtio_display_refresh_hz>60?droidvm_virtio_display_refresh_hz:0;
+}
 void native_legacy_display_late_probe(void);
 extern void native_hid_input_probe(void);
 extern void native_keystore_probe(void);

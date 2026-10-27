@@ -130,7 +130,8 @@ bool start() {
     wr(0x70, 3);
     wr(0x14, 1); uint32_t high = rd(0x10);
     if (!(high & 1)) return fail("no VERSION_1");
-    wr(0x14, 0); uint32_t low = rd(0x10) & ((1u << 0) | (1u << 3) | (1u << 4) | (1u << 6));
+    // VIRGL, EDID (the scanout's mode: its refresh rate), RESOURCE_BLOB, CONTEXT_INIT, CREATE_GUEST_HANDLE.
+    wr(0x14, 0); uint32_t low = rd(0x10) & ((1u << 0) | (1u << 1) | (1u << 3) | (1u << 4) | (1u << 6));
     // ACCESS_PLATFORM is offered by pseudo-unprotected crosvm; DMA addresses remain GPAs.
     high &= 3;
     negotiated = (uint64_t(high) << 32) | low;
