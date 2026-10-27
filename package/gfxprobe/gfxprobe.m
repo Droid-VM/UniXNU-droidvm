@@ -21,7 +21,9 @@
 //   gfxprobe rotbench W H PASSES ROT [CLEAR]  CoreAnimation's framebuffer: a W x H framebuffer-only render target of rotation ROT
 //                                       (0-3) over an IOSurface of the extent it stores, and PASSES render passes into it in one
 //                                       command buffer, each loading it (CLEAR=1: clearing), drawing a full-frame triangle and storing:
-//                                       the GPU time per pass, against ROT 0 for what the turned copies cost
+//                                       the GPU time per pass, against ROT 0 for what the turned copies cost; then every texel of
+//                                       the surface checked against where Metal stores the frame's texel (x, y) for ROT, and the
+//                                       texels that land as each other turn or mirror would put them, to name a wrong one
 //   gfxprobe sync PATH...               F_FULLFSYNC each file, then sync(): a file staged into the Data overlay (export.py put)
 //                                       reaches the store before the VM stops (vm.sh stop is no clean shutdown)
 //   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
@@ -2092,7 +2094,8 @@ int main(int argc, char **argv) {
             static const char *source =
                 "#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; };\n"
                 "vertex V vs(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V v; v.p = float4(q * 2 - 1, 0, 1); return v; }\n"
-                "fragment float4 fs(V v [[stage_in]]) { return float4(fract(v.p.x / 64), fract(v.p.y / 64), 0.5, 1); }\n";
+                "fragment float4 fs(V v [[stage_in]]) { uint2 p = uint2(v.p.xy);\n"
+                "  return float4(float(p.x & 255), float(p.y & 255), float((p.x >> 8) | ((p.y >> 8) << 4)), 255) / 255; }\n";
             NSError *error = nil;
             id<MTLLibrary> library = [device newLibraryWithSource:@(source) options:nil error:&error];
             MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
@@ -2129,6 +2132,28 @@ int main(int argc, char **argv) {
                     printf("rotbench %ux%u rotation %u %s: %u passes, gpu %.2f ms (%.3f ms a pass), wall %.2f ms, status %ld\n", w, h,
                            rotation, clear ? "clear" : "load", passes, gpu, gpu / passes, wall, (long)commands.status);
             }
+            // Where each frame texel (x, y) lands in the surface: Metal's store for rotations 0 to 3 (rotated.rs), and the four
+            // mirrors (transpose, anti-transpose, horizontal, vertical) a wrong turn would make.
+            IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+            const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+            const size_t row = IOSurfaceGetBytesPerRow(surface);
+            static const char *names[8] = {"rot0", "rot1", "rot2", "rot3", "transpose", "anti-transpose", "hflip", "vflip"};
+            size_t hits[8] = {}, texels = (size_t)sw * sh;
+            for (unsigned py = 0; py < sh; py++)
+                for (unsigned px = 0; px < sw; px++) {
+                    const uint8_t *t = base + py * row + px * 4; // BGRA: B G R A
+                    unsigned x = t[2] | (t[0] & 15) << 8, y = t[1] | (t[0] >> 4) << 8;
+                    const unsigned map[8][2] = {{x, y}, {h - 1 - y, x}, {w - 1 - x, h - 1 - y}, {y, w - 1 - x},
+                                                {y, x}, {h - 1 - y, w - 1 - x}, {w - 1 - x, y}, {x, h - 1 - y}};
+                    for (int k = 0; k < 8; k++)
+                        hits[k] += map[k][0] == px && map[k][1] == py;
+                }
+            IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+            printf("rotbench check: %zu of %zu texels where Metal stores rotation %u;", hits[rotation & 3], texels, rotation);
+            for (int k = 0; k < 8; k++)
+                if (hits[k] && k != (int)(rotation & 3))
+                    printf(" %s %zu", names[k], hits[k]);
+            printf("\n");
         } else if (!strcmp(argv[1], "gpubw")) {
             unsigned rounds = (unsigned)strtoul(argv[4], NULL, 0);
             NSArray<NSString *> *kinds = @[@"private", @"shared", @"iosurface", @"iosurface-wc", @"ca", @"buffer"];
