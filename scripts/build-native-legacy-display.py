@@ -405,6 +405,8 @@ for anchor,replacement in (
          '        if(!touchOnly)native_keyboard_set_sink(nullptr,nullptr);\n')):
     require(hid_text.count(anchor)==1,'NativeHidInput.cpp no longer has exactly one '+anchor.strip())
     hid_text=hid_text.replace(anchor,replacement)
+# The board's motion sensors as HID devices, in the same translation unit so the same late initializer registers their metaclass.
+hid_text+='\n'+(ROOT/'kits/droidvm/DroidVMMotionHid.inc').read_text()
 # the same file name: the late static initializer is named after it (__GLOBAL__sub_I_NativeHidInput.cpp)
 hid_staged=hid_dir/'droidvm'/'NativeHidInput.cpp';hid_staged.parent.mkdir(exist_ok=True);hid_staged.write_text(hid_text)
 hid_command=json.loads((hid_dir/'compile-command.json').read_text())

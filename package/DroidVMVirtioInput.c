@@ -498,6 +498,14 @@ static void droidvm_input_worker(void *parameter, wait_result_t result) {
     }
 }
 
+static bool droidvm_motion_found;
+
+// Whether the VM has motion sensors. HidInputProbe.cpp publishes the accelerometer and gyroscope HID services (DroidVMMotionHid.inc)
+// only then; it runs after droidvm_input_start, which finds the devices before it returns.
+bool droidvm_motion_present(void) {
+    return droidvm_motion_found;
+}
+
 // Called once from the late board probe (DroidVMStubs.c native_touch_probe).
 void droidvm_input_start(void) {
     uint32_t enabled = 1;
@@ -544,7 +552,10 @@ void droidvm_input_start(void) {
         }
         printf("droidvm input %s: %s, %s\n", path, droidvm_input_names[d->index], d->kind == KIND_TOUCH ? "touch" :
                d->kind == KIND_POINTER ? "pointer" : d->kind == KIND_MOTION ? "motion sensors" : "keyboard");
-        if (d->kind == KIND_MOTION) droidvm_motion_register();
+        if (d->kind == KIND_MOTION) {
+            droidvm_motion_register();
+            droidvm_motion_found = true;
+        }
         droidvm_input_count++;
     }
     droidvm_input_started = droidvm_input_count;
