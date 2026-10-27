@@ -83,6 +83,8 @@ public:
     bool start(IOService *provider) override {
         loop = IOWorkLoop::workLoop();
         if (!loop) return false;
+        // IOHIDEventDriver's personalities carry HIDDefaultBehavior, and IOHIDFamily's matching wants the device to have it too.
+        if (!setProperty("HIDDefaultBehavior", true)) return false;
         setProperty("Built-In", true);
         if (!IOHIDDevice::start(provider)) return false;
         timer = IOTimerEventSource::timerEventSource(this, tick);
