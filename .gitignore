@@ -6,3 +6,5 @@ tools/rig/__pycache__/
 
 # Python bytecode produced by local build helpers.
 __pycache__/
+tools/rig/unixnu-vm.config.json
+tools/rig/unique-chip-id.txt

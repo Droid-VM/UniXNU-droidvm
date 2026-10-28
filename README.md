@@ -9,8 +9,31 @@ payload is a FAT disk attached to the VM, with `UniXNU.efi`, `DarwinBoot.efi`, t
 
 ## Build
 
+On the build Mac, with the UniXNU fork (Droid-VM/UniXNU, branch `wip/droidvm`) checked out beside this repository:
+
 ```sh
-cd UniXNU          # branch droidvm: the bootstrap-pass fix for a build from scratch
+git clone --recurse-submodules -b wip/droidvm https://github.com/Droid-VM/UniXNU
+git clone -b wip/hackintosh https://github.com/Droid-VM/UniXNU-droidvm
+cd UniXNU-droidvm
+python3 scripts/build-droidvm-all.py --unique-chip-id <16 hex digits>
+```
+
+`scripts/build-droidvm-all.py` runs every step from a fresh checkout to a bootable release, each once (a stamp in
+`out/droidvm/build-all/`; `--from STEP` or `--only STEP,...` runs steps again, `--list` shows them): the IPSW members, the
+signed OS and SystemOS root policies, the Data seed, the reference kernel the storage and display audits read, the kernel,
+UniXNU.efi and DarwinBoot.efi, the owner tools, the Metal plugin (Mesa's Turnip and metal2vulkan from their pins), the
+owner trust bundle, the payload and the boot disk. The release is `out/droidvm/release/`: `droidvm-disk.img`, `os.img`,
+`systemos.img`, `kernel.macho` and `release.json`. `--ipsw-cache DIR` takes the IPSW members another checkout extracted
+(`out/ipsw/<build>`) instead of downloading the 8 GiB of volumes again. macOS refuses disk image attachments on an external
+volume to a process started over ssh, so the images the build attaches live in `/tmp/droidvm-build-$USER`.
+
+`tools/rig/fresh-deploy.sh` (from the rig, `tools/rig/README.md`) replaces the phone's UniXNU VM with a new one from that
+release; `--build` runs the build first.
+
+The kernel alone, as UniXNU builds it (it needs the inputs the steps above make):
+
+```sh
+cd UniXNU
 ./unixnu defconfig droidvm_defconfig -D ../UniXNU-droidvm
 ./unixnu fetch
 ./unixnu ipsw fetch

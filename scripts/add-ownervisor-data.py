@@ -90,6 +90,14 @@ def main():
             if gfxprobe.is_file():
                 shutil.copyfile(gfxprobe, bin_dir / 'gfxprobe')
                 os.chmod(bin_dir / 'gfxprobe', 0o755)
+            # The rest of the debug shell (plans/UNIXNUSETTING.md): applebox (Apple's coreutils, build-droidvm-applebox.py), ipatool
+            # (the .ipa installer), debugserver (the remote debug stub) and lsdiag (LaunchServices questions). Optional, each
+            # staged when it has been built; trusted like the others through build/owner-trust-extra.
+            for name in ('applebox', 'ipatool', 'debugserver', 'lsdiag'):
+                tool = ROOT / 'build' / name / name
+                if tool.is_file():
+                    shutil.copyfile(tool, bin_dir / name)
+                    os.chmod(bin_dir / name, 0o755)
             # The managed services. ownervisor creates run/log/state/control at startup; the seed carries the
             # definitions and the enable markers so they autostart from the first boot.
             # 'autostart' (a staging flag, stripped from the json) decides whether an enable marker is written. adrenoprobe is
