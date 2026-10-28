@@ -105,6 +105,8 @@ title = "DroidVM: iPadOS 17.7.11, CPU-rendered desktop"
 # the guest as /arm-io/virtio-gpu drm-host-pool); without it the window is 0x13fa00000. There is no simple framebuffer to take off its
 # top any more (virtio-gpu scans out of guest memory); a VM that has one again (screens.simplefb, 6 MiB at 1366x1024) needs 6 MiB less,
 # or the panic region lands inside the framebuffer
+# With [payload.adt] --dynamic, DarwinBoot takes the RAM from the firmware's FDT at boot and this size is only the placeholder of
+# the ADT it completes.
 dram_size = "0x13f200000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 # The original static/System trust caches, and the owner trust bundle built around them with the Adreno Metal plugin's CDHashes
@@ -143,15 +145,14 @@ packed_data_ramdisk = true
 ipad_identity = true
 unique_chip_id = "required"
 chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
-# The third crosvm --virtio-mmio-block (tools/rig/make-data-store.sh) is the store disk, not a NativeVirtioBlock image;
-# --virtio-mmio-input puts the app's five input devices (mouse, multi-touch, absolute mouse, keyboard, and the motion sensors
-# its "motion_sensor" adds last) after the disks, and --virtio-mmio-net the --net device after them (/arm-io/net,
-# package/DroidVMVirtioNet.c).
+# --dynamic: DarwinBoot completes the tree at boot from the firmware's FDT (drivers/DarwinBoot FdtAdt.c): the RAM, and an /arm-io node
+# for every virtio-mmio device crosvm offers, by the device ID it reports -- the read-only OS and SystemOS disks, the third
+# --virtio-mmio-block as the Data store (tools/rig/make-data-store.sh), the app's input devices (--virtio-mmio-input), the net device
+# (--virtio-mmio-net), the display (--virtio-mmio-gpu, with its drm-host-pool), the sound card (--virtio-mmio-snd), the media
+# devices (--virtio-mmio-media, with their media-host-pool) and the goldfish battery. So the payload boots a VM with any of them, and
+# a new crosvm device or pool needs no new ADT; package/crosvm-gunyah.dtb gives only the CPUs, the GIC and the PSCI conduit.
 # --display-gamut sRGB: the display chain scans out 8-bit sRGB (BGRX), and with the panel's P3 every app and WebKit drew its layers
 # into wide-color surfaces ('w30r', 'b3a8') that CoreGraphics fills only through the GPU -- which WebKit's sandboxed GPU process
 # cannot map -- so Safari's pages stayed black; sRGB keeps them on 8-bit BGRA surfaces CoreGraphics draws on the CPU too.
-# --virtio-gpu-mmio: the display (--virtio-mmio-gpu, last), with 8 MiB of RAM DarwinBoot keeps for its BLT-only boot screen.
-# package/crosvm-gunyah.dtb is this VM's own FDT, which names that window.
-tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000,0x0a007000",
-             "--net-mmio", "0x0a008000", "--virtio-gpu-mmio", "0x0a009000", "--boot-video-mib", "8",
-             "--reclaim-memory", "--display-gamut", "sRGB"]
+# --boot-video-mib: 8 MiB of RAM DarwinBoot keeps for its BLT-only boot screen.
+tool_args = ["--dynamic", "--boot-video-mib", "8", "--reclaim-memory", "--display-gamut", "sRGB"]
