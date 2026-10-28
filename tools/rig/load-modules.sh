@@ -7,7 +7,11 @@ set -euo pipefail
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}
 A="adb -s $PHONE"
 $A shell "su -c '
-M=/data/data/cn.classfun.droidvm/usr/lib/modules/\$(ls /data/data/cn.classfun.droidvm/usr/lib/modules | grep -E \"^android\" | head -1)
+base=/data/data/cn.classfun.droidvm/usr/lib/modules
+# Pick the module set matching the running kernel (uname -r like 6.12.23-android16-...), not the first dir
+# alphabetically -- this phone ships android14-6.1, android15-6.6 and android16-6.12 and head -1 would take the wrong one.
+rel=\$(uname -r); av=\$(echo \$rel | grep -oE android[0-9]+); kv=\$(echo \$rel | grep -oE \"^[0-9]+[.][0-9]+\")
+M=\$base/\$av-\$kv; [ -d \$M ] || M=\$base/\$(ls \$base | grep -E \"^android\" | head -1)
 uid=\$(stat -c %u /data/data/cn.classfun.droidvm)
 for ko in udmabuf gh-unmovable gunyah-host-share gunyah-kvcalloc nproc-guard; do
   name=\$(echo \$ko | tr - _)
