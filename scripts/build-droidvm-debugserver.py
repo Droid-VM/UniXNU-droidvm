@@ -19,7 +19,7 @@ Built WITHOUT WITH_LOCKDOWN/WITH_FBS/WITH_BKS (the upstream "non-UI" variant), s
 Foundation, CoreFoundation, Security and libcompression. The two parallel entry points debugserver.cpp and libdebugserver.cpp
 share global state, so the common objects are archived (like CMake's lldbDebugserverCommon) and the standalone main linked
 against the archive, leaving the unused libdebugserver.cpp object unpulled. Ad-hoc 4 KiB-signed with the curated debug
-entitlement set (package/applebox/debug-entitlements.plist -- com.apple.private.cs.debugger, thread-set-state,
+entitlement set (package/debug-entitlements.plist -- com.apple.private.cs.debugger, thread-set-state,
 system-task-ports*, set-exception-port, network server/client, ...) and trusted through the owner module
 (build/owner-trust-extra/debugserver.json, category 3) like lsdiag/applebox. Staged with
   export.py put build/debugserver/debugserver /private/var/ngpu/bin/debugserver 0755
@@ -48,7 +48,7 @@ SPARSE = ['/lldb/tools/debugserver/',
 
 FORK = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else sys.exit(__doc__)
 HERE = Path(__file__).resolve().parents[1]
-PLIST = HERE / 'package/applebox/debug-entitlements.plist'
+PLIST = HERE / 'package/debug-entitlements.plist'
 if not PLIST.is_file():
     sys.exit(f'debug entitlements plist not found: {PLIST}')
 OUT = FORK / 'build/debugserver'

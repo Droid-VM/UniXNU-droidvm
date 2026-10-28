@@ -22,3 +22,12 @@ git = "https://github.com/UniXNU/ShengHidInput.git"
 ref = "main"
 commit = "5f3a37cec0c3fc4234b10726b25489a55f0d77ef"
 steps = ["kernel"]
+
+# applebox, the debug shell's coreutils (Apple's open-source command-line tools as one multicall binary), in its own repository;
+# scripts/build-droidvm-applebox.py builds it from kits/applebox with this board's debug entitlements and trusts it.
+[[source]]
+name = "applebox"
+kind = "kit"
+git = "https://github.com/Droid-VM/applebox.git"
+ref = "main"
+commit = "2307bb9a14d949c8a0056bf2f339822a5f978505"
