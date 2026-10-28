@@ -13,7 +13,7 @@ extern kmod_info_t g_kernel_kmod_info;
 extern "C" void native_hid_static_init(void) __asm__("__GLOBAL__sub_I_NativeHidInput.cpp");
 extern "C" IOService *native_hid_input_allocate(void);
 extern "C" IOService *native_hid_touch_allocate(void);
-extern "C" IOService *droidvm_motion_hid_allocate(bool gyroscope);
+extern "C" IOService *droidvm_motion_hid_allocate(unsigned kind);
 extern "C" bool droidvm_motion_present(void);
 extern "C" {
 extern kern_return_t OSKextLoadKextWithIdentifier(const char *);
@@ -192,10 +192,10 @@ void native_hid_input_probe(void) {
                         bool touchStarted=touch && touch->metaCast("IOHIDDevice") && touch->init() && touch->attach(resource) && touch->start(resource);
                         if(!touchStarted && touch){touch->detach(resource);OSSafeReleaseNULL(touch);}
                     }
-                    // DroidVM: the accelerometer and the gyroscope, as the services locationd and backboardd look for
-                    // (DroidVMMotionHid.inc), when the VM has motion sensors (DroidVMVirtioInput.c).
-                    for(unsigned gyro=0;started && gyro<2 && droidvm_motion_present();++gyro) {
-                        IOService *motion=droidvm_motion_hid_allocate(gyro==1);
+                    // DroidVM: the accelerometer, the gyroscope and the device orientation, as the services locationd and
+                    // backboardd look for (DroidVMMotionHid.inc), when the VM has motion sensors (DroidVMVirtioInput.c).
+                    for(unsigned kind=0;started && kind<3 && droidvm_motion_present();++kind) {
+                        IOService *motion=droidvm_motion_hid_allocate(kind);
                         bool motionStarted=motion && motion->metaCast("IOHIDDevice") && motion->init() && motion->attach(resource) && motion->start(resource);
                         if(!motionStarted && motion){motion->detach(resource);OSSafeReleaseNULL(motion);}
                     }
