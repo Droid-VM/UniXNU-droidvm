@@ -18,6 +18,8 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
     --virtio-mmio-input (package/DroidVMVirtioInput.c), compatible "droidvm,virtio-input"
   - /arm-io/virtio-gpu: --virtio-gpu-mmio, the virtio GPU (package/DroidVMVirtioGpu*.cpp). Its drm-host-pool
     property carries the absolute GPA and size of the FDT's pre-shared drm2kgsl_host pool.
+  - /arm-io/virtio-snd: --snd-mmio, the sound card of crosvm --virtio-mmio-snd (package/DroidVMVirtioSnd.c),
+    compatible "droidvm,virtio-snd"
   - /chosen/darwinboot-video-memory: --boot-video-mib reserves ordinary RAM below the panic
     region for a BLT-only GOP handoff. It needs no crosvm simplefb device or framebuffer MMIO.
   - /chosen darwinboot-memory-limit (--reclaim-memory): DarwinBoot also gives the kernel the RAM after its window that the
@@ -216,6 +218,8 @@ def main():
                         help='Base of the FDT virtio-mmio window of the virtio-net device (/arm-io/net)')
     parser.add_argument('--virtio-gpu-mmio', type=lambda value: int(value, 0), default=None,
                         help='Base of the standard virtio-gpu window (/arm-io/virtio-gpu)')
+    parser.add_argument('--snd-mmio', type=lambda value: int(value, 0), default=None,
+                        help='Base of the FDT virtio-mmio window of the virtio-snd card (/arm-io/virtio-snd)')
     parser.add_argument('--boot-video-mib', type=int, default=0,
                         help='Reserve ordinary RAM for the BLT-only GOP boot framebuffer (requires --reclaim-memory)')
     parser.add_argument('--reclaim-memory', action='store_true',
@@ -281,7 +285,7 @@ def main():
     except ValueError:
         parser.error('--input-mmio takes comma-separated addresses')
     virtio_mmio = [window for window in vm['virtio_mmio']
-                   if window[0] not in (args.data_store_mmio, args.net_mmio, args.virtio_gpu_mmio)
+                   if window[0] not in (args.data_store_mmio, args.net_mmio, args.virtio_gpu_mmio, args.snd_mmio)
                    and window[0] not in input_bases]
     data_store = [window for window in vm['virtio_mmio'] if window[0] == args.data_store_mmio]
     if args.data_store_mmio is not None and not data_store:
@@ -297,6 +301,10 @@ def main():
     if args.virtio_gpu_mmio is not None and (not virtio_gpu or args.virtio_gpu_mmio in input_bases or
                                            args.virtio_gpu_mmio in (args.data_store_mmio, args.net_mmio)):
         parser.error(f'--virtio-gpu-mmio {args.virtio_gpu_mmio:#x} must be a virtio-mmio window of the FDT of its own')
+    snd = [window for window in vm['virtio_mmio'] if window[0] == args.snd_mmio]
+    if args.snd_mmio is not None and (not snd or args.snd_mmio in input_bases or
+                                      args.snd_mmio in (args.data_store_mmio, args.net_mmio, args.virtio_gpu_mmio)):
+        parser.error(f'--snd-mmio {args.snd_mmio:#x} must be a virtio-mmio window of the FDT of its own')
 
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
                                    ('reg', struct.pack('<I', reg)),
@@ -393,7 +401,11 @@ def main():
                                     ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
                                     ('dma-coherent', b''),
                                     *[('drm-host-pool', struct.pack('<QQ', *pool)) for pool in vm['drm_host_pool']]])
-                for address, size in virtio_gpu]]),
+                for address, size in virtio_gpu],
+              *[node('virtio-snd', [('compatible', b'droidvm,virtio-snd\0'),
+                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                    ('dma-coherent', b'')])
+                for address, size in snd]]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
