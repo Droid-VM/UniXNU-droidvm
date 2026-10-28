@@ -13,7 +13,10 @@
 //   - the device orientation {0x20, 0x8a}, which backboardd's CoreMotion matches for the interface orientation: one bit per
 //     orientation on the Apple motion page (usages 0x64 + UIDeviceOrientation, as the stock IOHIDEventDriver parses them), and
 //     IOHIDEventDriver sends an orientation event for the bit that turns on. The orientation is the one DroidVMVirtioInput.c
-//     derives from gravity, the decision the iPad's sensor processor makes itself.
+//     derives from gravity, the decision the iPad's sensor processor makes itself. CoreMotion takes the sample's time from the
+//     event's first child, a vendor event {0xff15, 2} with an 8-byte timestamp (the sensor processor's time sync), and skips a
+//     sample whose time is not after the last one ("Skipping stale orientation (3 @ 0)"); IOHIDEventDriver attaches such a child
+//     from a field on that page under an Apple vendor Message collection {0xff00, 0x23}, so each report carries the time.
 // IOHIDFamily attaches IOHIDEventDriver to an interface by its usage pairs, and the one personality that takes a motion sensor
 // ("HID Sensor") names {0xff0c, 3}: each descriptor ends with an empty application collection carrying that pair.
 // The values come from the virtio motion device (droidvm_motion): the gravity vector, 256 per g, and the angular velocity, 16 per
@@ -73,14 +76,14 @@ class DroidVMMotionHid : public IOHIDDevice {
             if (orientation < 0 || orientation > 6) return;
             if (orientation == self->lastOrientation && now - self->orientationSentAt < period) return;
             if (orientation == self->lastOrientation) {
-                uint8_t none = 0;
+                struct __attribute__((packed)) { uint8_t bits; uint64_t time; } none = {0, now};
                 IOBufferMemoryDescriptor *clear = IOBufferMemoryDescriptor::withBytes(&none, sizeof(none), kIODirectionNone);
                 if (clear) self->handleReport(clear, 0, 0);
                 OSSafeReleaseNULL(clear);
             }
             self->lastOrientation = orientation;
             self->orientationSentAt = now;
-            uint8_t report = (uint8_t)(1u << orientation);
+            struct __attribute__((packed)) { uint8_t bits; uint64_t time; } report = {(uint8_t)(1u << orientation), now + 1};
             buffer = IOBufferMemoryDescriptor::withBytes(&report, sizeof(report), kIODirectionNone);
         } else {
             int32_t report[3];
@@ -107,10 +110,14 @@ public:
     IOReturn newReportDescriptor(IOMemoryDescriptor **out) const override {
         static const unsigned char accelerometer[] = DROIDVM_MOTION_VECTOR(0x03, 0x73, 0x53);
         static const unsigned char gyro[] = DROIDVM_MOTION_VECTOR(0x09, 0x76, 0x57);
-        // Sensor page, device orientation; seven one-bit fields on the Apple motion page (usages 0x64-0x6a) and a padding bit.
+        // Sensor page, device orientation: seven one-bit fields on the Apple motion page (usages 0x64-0x6a), a padding bit, and
+        // in a vendor Message collection the time stamp, eight bytes on page 0xff15 (usage 2).
         static const unsigned char orientation[] = {0x05, 0x20, 0x09, 0x8a, 0xa1, 0x01,
                                                     0x06, 0x0c, 0xff, 0x19, 0x64, 0x29, 0x6a, 0x15, 0x00, 0x25, 0x01,
-                                                    0x75, 0x01, 0x95, 0x07, 0x81, 0x02, 0x95, 0x01, 0x81, 0x03, 0xc0,
+                                                    0x75, 0x01, 0x95, 0x07, 0x81, 0x02, 0x95, 0x01, 0x81, 0x03,
+                                                    0x06, 0x00, 0xff, 0x09, 0x23, 0xa1, 0x00,
+                                                    0x06, 0x15, 0xff, 0x09, 0x02, 0x15, 0x00, 0x26, 0xff, 0x00,
+                                                    0x75, 0x08, 0x95, 0x08, 0x81, 0x02, 0xc0, 0xc0,
                                                     0x06, 0x0c, 0xff, 0x09, 0x03, 0xa1, 0x01, 0xc0};
         if (!out) return kIOReturnBadArgument;
         *out = kind == DROIDVM_MOTION_GYROSCOPE ? IOBufferMemoryDescriptor::withBytes(gyro, sizeof(gyro), kIODirectionNone)
