@@ -9,17 +9,32 @@
 // live in a writable owner-Data dir and are swap-safe (a changed binary just fails to exec). A brand-new
 // binary cannot be trusted at runtime; adding a service that runs an already-trusted binary needs no reseed.
 //
-// Layout under $OWNERVISOR_ROOT (default /private/var/ngpu/ownervisor), all in the writable Data volume:
+// Layout under $OWNERVISOR_ROOT (default /private/var/ngpu/ownervisor), all in the writable Data volume. Owned by root:
+// the root and run/ are 0711 (an app reaches run/app.sock but lists nothing), tmp/ 01770 root:mobile, the rest 0700, set
+// again at every start (the seed writes them 0755 with no fixed owner). The host's export.py goes through the kernel, so
+// the modes do not stop it.
 //   services.d/<name>.json   service definition  {exec:[...], uid, keepalive, throttle, env:{...}}
 //   enabled/<name>           marker: present => autostart at boot (systemd-style enable/disable)
 //   bin/                     the trusted service binaries the seed ships
-//   run/ctl.sock             control socket (ownerctl, local or over ssh)
+//   run/ctl.sock             control socket, root only (0600): ownerctl, local or over ssh
+//   run/app.sock             control socket for apps (0660 root:mobile), see "App clients" below
+//   auth/app-clients         the CDHashes app.sock serves, 40 hex digits per line, '#' starts a comment
 //   control/<id>.req|.rep    file control spool: the host drops a .req (export.py put), reads the .rep
 //   log/<name>.log           each service's stdout+stderr
 //   state/status.json        the live table, refreshed each tick (host reads it with export.py cat)
+//   tmp/                     writable by clients (sticky): files an app hands ownervisor. The clients own what is in it, so
+//                            ownervisor opens a file there with O_NOFOLLOW and checks its owner, and never writes there
 //
 // Control verbs (socket line-JSON or a .req file): list, status, start, stop, restart, enable, disable,
-// add, remove, reload. enable/disable only change boot autostart; "now":true also starts/stops at once.
+// add, remove, reload, run. enable/disable only change boot autostart; "now":true also starts/stops at once.
+//
+// App clients: UniXNUSetting, ownervisor's in-app GUI, runs as mobile and talks to ownervisor over run/app.sock. A
+// connection is served only when the peer's main executable is valid (CS_VALID) and its CDHash is in auth/app-clients,
+// both read through the peer's audit token (LOCAL_PEERTOKEN, csops_audittoken: the kernel matches the pid and its
+// version, so a reused pid cannot pass). Not an entitlement: AMFI grants any entitlement to any binary the trust cache
+// lists, so every trusted app could claim it. Not a path: the CDHash binds the content. app.sock serves the service verbs
+// only (list, status, start, stop, restart, enable, disable); add, remove, reload and run (any command as root) stay on
+// ctl.sock and the spool.
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
 #import <mach/task_special_ports.h>
@@ -36,6 +51,14 @@
 #include <unistd.h>
 
 extern char **environ;
+
+// libsystem_kernel; the iphoneos SDK has no <System/sys/codesign.h>
+extern int csops_audittoken(pid_t pid, unsigned int ops, void *useraddr, size_t usersize, audit_token_t *token);
+#define CS_OPS_STATUS 0
+#define CS_OPS_CDHASH 5
+#define CS_VALID      0x00000001
+
+#define MOBILE_GID 501
 
 static NSString *gRoot;
 static NSMutableDictionary *gServices;   // name -> Service
@@ -65,8 +88,15 @@ static NSString *P(NSString *sub) { return [gRoot stringByAppendingPathComponent
 
 static void ensureDirs(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *d in @[@"services.d", @"enabled", @"bin", @"run", @"control", @"log", @"state"])
+    [fm createDirectoryAtPath:gRoot withIntermediateDirectories:YES attributes:nil error:nil];
+    chown(gRoot.fileSystemRepresentation, 0, 0);
+    chmod(gRoot.fileSystemRepresentation, 0711);
+    for (NSString *d in @[@"services.d", @"enabled", @"bin", @"run", @"control", @"log", @"state", @"auth", @"tmp"]) {
         [fm createDirectoryAtPath:P(d) withIntermediateDirectories:YES attributes:nil error:nil];
+        BOOL shared = [d isEqual:@"tmp"];
+        chown(P(d).fileSystemRepresentation, 0, shared ? MOBILE_GID : 0);
+        chmod(P(d).fileSystemRepresentation, shared ? 01770 : [d isEqual:@"run"] ? 0711 : 0700);
+    }
 }
 
 static BOOL isEnabled(NSString *name) {
@@ -310,9 +340,13 @@ static NSDictionary *handle(NSDictionary *req) {
     return @{@"ok": @NO, @"error": @"unknown cmd"};
 }
 
-static NSDictionary *handleBytes(NSData *data) {
+// app: the request came over app.sock, which serves the service verbs only.
+static NSDictionary *handleBytes(NSData *data, BOOL app) {
     id j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     if (![j isKindOfClass:NSDictionary.class]) return @{@"ok": @NO, @"error": @"bad request json"};
+    static NSSet *appVerbs;
+    if (!appVerbs) appVerbs = [NSSet setWithArray:@[@"list", @"status", @"start", @"stop", @"restart", @"enable", @"disable"]];
+    if (app && ![appVerbs containsObject:j[@"cmd"] ?: @""]) return @{@"ok": @NO, @"error": @"cmd not served on app.sock"};
     return handle(j);
 }
 
@@ -323,7 +357,7 @@ static void pollControlSpool(void) {
         if (![f.pathExtension isEqual:@"req"]) continue;
         NSString *reqp = [P(@"control") stringByAppendingPathComponent:f];
         NSData *data = [NSData dataWithContentsOfFile:reqp];
-        NSDictionary *rep = data ? handleBytes(data) : @{@"ok": @NO, @"error": @"empty"};
+        NSDictionary *rep = data ? handleBytes(data, NO) : @{@"ok": @NO, @"error": @"empty"};
         NSString *base = f.stringByDeletingPathExtension;
         NSString *tmp = [P(@"control") stringByAppendingPathComponent:[base stringByAppendingPathExtension:@"tmp"]];
         NSString *repp = [P(@"control") stringByAppendingPathComponent:[base stringByAppendingPathExtension:@"rep"]];
@@ -333,29 +367,79 @@ static void pollControlSpool(void) {
     }
 }
 
-// ---- socket ----
-static int listenSocket(void) {
-    const char *sp = [P(@"run/ctl.sock") fileSystemRepresentation];
+// ---- sockets ----
+// Bind run/<name> with its mode and group; the umask keeps the socket closed to others until chmod gives it its mode.
+static int listenSocket(NSString *name, mode_t mode, gid_t gid) {
+    const char *sp = [P([@"run" stringByAppendingPathComponent:name]) fileSystemRepresentation];
     unlink(sp);
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un a = {0};
     a.sun_family = AF_UNIX;
     strlcpy(a.sun_path, sp, sizeof(a.sun_path));
-    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(fd, 8) < 0) { close(fd); return -1; }
+    mode_t mask = umask(077);
+    int bound = bind(fd, (struct sockaddr *)&a, sizeof(a));
+    umask(mask);
+    if (bound < 0 || chown(sp, 0, gid) < 0 || chmod(sp, mode) < 0 || listen(fd, 8) < 0) { close(fd); return -1; }
     return fd;
 }
 
-static void serveClient(int cfd) {
-    NSMutableData *in = [NSMutableData data];
-    char buf[4096];
-    for (;;) {
-        ssize_t n = read(cfd, buf, sizeof(buf));
-        if (n <= 0) break;
-        [in appendBytes:buf length:n];
-        if (memchr(buf, '\n', n)) break;             // one line is one request
+// The CDHashes auth/app-clients lets in; read for every app connection, so the host changes it without a restart.
+static NSSet<NSString *> *appClients(void) {
+    NSString *text = [NSString stringWithContentsOfFile:P(@"auth/app-clients") encoding:NSUTF8StringEncoding error:nil];
+    NSMutableSet *set = [NSMutableSet set];
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        NSString *h = [[line componentsSeparatedByString:@"#"].firstObject
+                       stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet].lowercaseString;
+        if (h.length == 40) [set addObject:h];
     }
-    NSDictionary *rep = in.length ? handleBytes(in) : @{@"ok": @NO, @"error": @"empty"};
+    return set;
+}
+
+// Whether an app.sock peer is served (see "App clients" above). *who says who it is, for the log.
+static BOOL appPeerAllowed(int cfd, NSString **who) {
+    audit_token_t token;
+    socklen_t len = sizeof(token);
+    if (getsockopt(cfd, SOL_LOCAL, LOCAL_PEERTOKEN, &token, &len) < 0) {
+        *who = [NSString stringWithFormat:@"(no peer token: %s)", strerror(errno)];
+        return NO;
+    }
+    pid_t pid = (pid_t)token.val[5];   // audit_token_to_pid(); val[1] is the euid
+    uint32_t flags = 0;
+    uint8_t cdhash[20];
+    if (csops_audittoken(pid, CS_OPS_STATUS, &flags, sizeof(flags), &token) < 0 ||
+        csops_audittoken(pid, CS_OPS_CDHASH, cdhash, sizeof(cdhash), &token) < 0) {
+        *who = [NSString stringWithFormat:@"pid %d (csops: %s)", pid, strerror(errno)];
+        return NO;
+    }
+    NSMutableString *hex = [NSMutableString string];
+    for (int i = 0; i < 20; i++) [hex appendFormat:@"%02x", cdhash[i]];
+    *who = [NSString stringWithFormat:@"pid %d euid %u cdhash %@ flags 0x%x", pid, token.val[1], hex, flags];
+    return (flags & CS_VALID) && [appClients() containsObject:hex];
+}
+
+static void serveClient(int cfd, BOOL app) {
+    // the loop is one thread: a client that connects and then sends nothing (or never reads) must not hold it
+    struct timeval tv = {2, 0};
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    NSDictionary *rep = nil;
+    NSString *who = nil;
+    if (app && !appPeerAllowed(cfd, &who)) {
+        NSLog(@"ownervisor: app.sock refused %@", who);
+        rep = @{@"ok": @NO, @"error": @"not an authorized client"};
+    }
+    if (!rep) {
+        NSMutableData *in = [NSMutableData data];
+        char buf[4096];
+        while (in.length < 64 * 1024) {
+            ssize_t n = read(cfd, buf, sizeof(buf));
+            if (n <= 0) break;
+            [in appendBytes:buf length:n];
+            if (memchr(buf, '\n', n)) break;         // one line is one request
+        }
+        rep = in.length ? handleBytes(in, app) : @{@"ok": @NO, @"error": @"empty"};
+    }
     NSMutableData *out = [jsonData(rep) mutableCopy];
     [out appendBytes:"\n" length:1];
     write(cfd, out.bytes, out.length);
@@ -437,17 +521,20 @@ int main(int argc, char **argv) {
         loadServices();
         for (NSString *n in gServices) if (isEnabled(n)) startService(gServices[n]);
 
-        int lfd = listenSocket();
+        int lfd = listenSocket(@"ctl.sock", 0600, 0);
         if (lfd < 0) NSLog(@"ownervisor: control socket failed: %s", strerror(errno));
+        int afd = listenSocket(@"app.sock", 0660, MOBILE_GID);   // UniXNUSetting runs as mobile
+        if (afd < 0) NSLog(@"ownervisor: app socket failed: %s", strerror(errno));
 
         // SIGCHLD must NOT be SIG_IGN: that makes the kernel auto-reap and never deliver the signal,
         // so EVFILT_SIGNAL never fires. An empty handler leaves the child reapable and the event firing.
         signal(SIGCHLD, noopHandler);
         signal(SIGPIPE, SIG_IGN);
         gKq = kqueue();
-        struct kevent ev[3];
+        struct kevent ev[4];
         int nev = 0;
         if (lfd >= 0) EV_SET(&ev[nev++], lfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+        if (afd >= 0) EV_SET(&ev[nev++], afd, EVFILT_READ, EV_ADD, 0, 0, NULL);
         EV_SET(&ev[nev++], SIGCHLD, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
         EV_SET(&ev[nev++], 1, EVFILT_TIMER, EV_ADD, 0, 1000, NULL);   // 1 s
         kevent(gKq, ev, nev, NULL, 0, NULL);
@@ -457,9 +544,9 @@ int main(int argc, char **argv) {
             struct kevent out;
             int n = kevent(gKq, NULL, 0, &out, 1, NULL);
             if (n <= 0) continue;
-            if (out.filter == EVFILT_READ && (int)out.ident == lfd) {
-                int cfd = accept(lfd, NULL, NULL);
-                if (cfd >= 0) @autoreleasepool { serveClient(cfd); }
+            if (out.filter == EVFILT_READ && ((int)out.ident == lfd || (int)out.ident == afd)) {
+                int cfd = accept((int)out.ident, NULL, NULL);
+                if (cfd >= 0) @autoreleasepool { serveClient(cfd, (int)out.ident == afd); }
             } else if (out.filter == EVFILT_SIGNAL) {
                 reapChildren();
             } else if (out.filter == EVFILT_TIMER) {

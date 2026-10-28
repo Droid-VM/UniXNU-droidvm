@@ -106,6 +106,17 @@ def main():
                 # address on 2222; the login shell is zsh. Needs the rig's key at /private/var/ngpu/ssh/authorized_keys.
                 services['dropbear'] = {'exec': [
                     '/private/var/ngpu/bin/dropbear', '-F', '-E', '-R', '-p', '2222'], 'keepalive': True, 'throttle': 5}
+            # serial-shell: a getty-style login shell on the console (zsh with stdin/stdout/stderr on /dev/console). Defined
+            # but NOT autostarted: on this board XNU has no serial console wired to an app-visible UART, so /dev/console is a
+            # dead/sink line -- output is discarded and no input arrives (verified by screenshot + marker test; cf. the
+            # silent-panics behaviour). To make it work, wire XNU's console to the NS16550 the app shows as serial1: add an
+            # 8250/16550 serial node to the ADT (make-droidvm-adt.py) at the matching crosvm UART base + a `serial=` boot-arg,
+            # then enable this service. Kept here so it is ready once the console is wired.
+            if (bin_dir / 'zsh').is_file():
+                services['serial-shell'] = {'exec': ['/private/var/ngpu/bin/zsh', '-c',
+                    'exec </dev/console >/dev/console 2>&1; exec /private/var/ngpu/bin/zsh -l'],
+                    'uid': 0, 'keepalive': True, 'throttle': 5, 'autostart': False,
+                    'env': {'PATH': '/private/var/ngpu/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'TERM': 'vt100', 'HOME': '/var/root'}}
             # No orientd: backboardd takes the device orientation from CoreMotion and the kernel's motion HID services
             # (package/DroidVMMotionHid.inc) since 2026-10-28; `gfxprobe orient-follow` stays for debugging by hand.
             svc_dir, en_dir = mount / 'ngpu/ownervisor/services.d', mount / 'ngpu/ownervisor/enabled'

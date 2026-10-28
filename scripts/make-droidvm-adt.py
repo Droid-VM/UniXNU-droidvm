@@ -190,9 +190,18 @@ def describe(fdt):
     battery = [pair for path, props in fdt.items()
                if 'google,goldfish-battery' in strings_of(props.get('compatible', b''))
                for pair in reg_pairs(props['reg'])]
+    # The SBSA UART (crosvm pl011@6000, FDT stdout-path): XNU's VMAPPLE_UART path is a PL011 driver and finds it by the ADT
+    # node named "uart0" (soc_base + reg). It gives XNU a working serial console on this crosvm VM -- BCM2837's own PI3 mini-UART
+    # (the board default) is not emulated by crosvm, so without this XNU's console is silent. REQUIRES the kernel built with
+    # VMAPPLE_UART defined for this board (not yet; see plans/UNIXNUSETTING.md). Inert otherwise -- an unused ADT node.
+    pl011 = [reg_pairs(props['reg'])[0] for path, props in fdt.items()
+             if 'arm,pl011' in strings_of(props.get('compatible', b''))]
+    sbsa_uart = pl011[0] if pl011 else None
+    if sbsa_uart and not (ARMIO_BASE <= sbsa_uart[0] < sbsa_uart[0] + sbsa_uart[1] <= ARMIO_BASE + ARMIO_SIZE):
+        raise SystemExit(f'pl011 window {sbsa_uart[0]:#x}+{sbsa_uart[1]:#x} lies outside the arm-io window')
     return dict(cpu_regs=[reg for reg, _ in cpus], gic=(dist, dist_size, redist, redist_size),
                 psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size,
-                virtio_mmio=virtio, drm_host_pool=drm_host, media_host_pool=media_host, battery=battery)
+                virtio_mmio=virtio, drm_host_pool=drm_host, media_host_pool=media_host, battery=battery, sbsa_uart=sbsa_uart)
 
 
 def main():
@@ -452,7 +461,11 @@ def main():
                   for index, (address, size) in enumerate(media)],
                 *[node('battery', [('compatible', b'google,goldfish-battery\0'),
                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size))])
-                  for address, size in (vm['battery'] if args.battery else [])]
+                  for address, size in (vm['battery'] if args.battery else [])],
+                # XNU's VMAPPLE_UART (PL011) console: found by name "uart0", mapped at soc_base + reg (soc_base = ARMIO_BASE).
+                *([node('uart0', [('compatible', b'arm,pl011\0'),
+                                  ('reg', struct.pack('<QQ', vm['sbsa_uart'][0] - ARMIO_BASE, vm['sbsa_uart'][1]))])]
+                  if vm.get('sbsa_uart') else [])
               ])]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)

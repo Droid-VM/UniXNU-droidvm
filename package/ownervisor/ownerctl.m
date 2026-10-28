@@ -6,6 +6,7 @@
 //   ownerctl [--sock PATH] status|start|stop|restart|enable|disable|remove NAME [--now]
 //   ownerctl [--sock PATH] add NAME --def '{"exec":["/private/var/ngpu/ownervisor/bin/foo"],"keepalive":true}'
 //   ownerctl [--sock PATH] reload
+//   ownerctl --app ...    the same over run/app.sock, which serves only a listed CDHash and only the service verbs
 #import <Foundation/Foundation.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -20,6 +21,7 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++) {
             NSString *a = @(argv[i]);
             if ([a isEqual:@"--sock"] && i + 1 < argc) sock = @(argv[++i]);
+            else if ([a isEqual:@"--app"]) sock = @"/private/var/ngpu/ownervisor/run/app.sock";
             else if ([a isEqual:@"--def"] && i + 1 < argc) defJSON = @(argv[++i]);
             else if ([a isEqual:@"--now"]) now = YES;
             else [rest addObject:a];
