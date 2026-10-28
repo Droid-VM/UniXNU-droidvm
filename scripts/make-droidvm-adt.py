@@ -20,6 +20,8 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
     property carries the absolute GPA and size of the FDT's pre-shared drm2kgsl_host pool.
   - /arm-io/virtio-snd: --snd-mmio, the sound card of crosvm --virtio-mmio-snd (package/DroidVMVirtioSnd.c),
     compatible "droidvm,virtio-snd"
+  - /arm-io/battery: --battery, crosvm's goldfish battery (--battery type=goldfish, package/DroidVMBattery.cpp),
+    compatible "google,goldfish-battery"
   - /chosen/darwinboot-video-memory: --boot-video-mib reserves ordinary RAM below the panic
     region for a BLT-only GOP handoff. It needs no crosvm simplefb device or framebuffer MMIO.
   - /chosen darwinboot-memory-limit (--reclaim-memory): DarwinBoot also gives the kernel the RAM after its window that the
@@ -171,9 +173,12 @@ def describe(fdt):
     for address, size in virtio:
         if not ARMIO_BASE <= address < address + size <= ARMIO_BASE + ARMIO_SIZE:
             raise SystemExit(f'virtio-mmio window {address:#x}+{size:#x} lies outside the arm-io window')
+    battery = [pair for path, props in fdt.items()
+               if 'google,goldfish-battery' in strings_of(props.get('compatible', b''))
+               for pair in reg_pairs(props['reg'])]
     return dict(cpu_regs=[reg for reg, _ in cpus], gic=(dist, dist_size, redist, redist_size),
                 psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size,
-                virtio_mmio=virtio, drm_host_pool=drm_host)
+                virtio_mmio=virtio, drm_host_pool=drm_host, battery=battery)
 
 
 def main():
@@ -220,6 +225,8 @@ def main():
                         help='Base of the standard virtio-gpu window (/arm-io/virtio-gpu)')
     parser.add_argument('--snd-mmio', type=lambda value: int(value, 0), default=None,
                         help='Base of the FDT virtio-mmio window of the virtio-snd card (/arm-io/virtio-snd)')
+    parser.add_argument('--battery', action='store_true',
+                        help='Emit /arm-io/battery from the FDT goldfish-battery node (crosvm --battery type=goldfish)')
     parser.add_argument('--boot-video-mib', type=int, default=0,
                         help='Reserve ordinary RAM for the BLT-only GOP boot framebuffer (requires --reclaim-memory)')
     parser.add_argument('--reclaim-memory', action='store_true',
@@ -405,7 +412,10 @@ def main():
               *[node('virtio-snd', [('compatible', b'droidvm,virtio-snd\0'),
                                     ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
                                     ('dma-coherent', b'')])
-                for address, size in snd]]),
+                for address, size in snd],
+              *[node('battery', [('compatible', b'google,goldfish-battery\0'),
+                                 ('reg', struct.pack('<QQ', address - ARMIO_BASE, size))])
+                for address, size in (vm['battery'] if args.battery else [])]]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
