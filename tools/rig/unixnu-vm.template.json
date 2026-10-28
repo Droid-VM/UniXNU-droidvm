@@ -1,0 +1,182 @@
+{
+ "config": {
+  "gpu_drm2kgsl_pool_mb": 0,
+  "usb": false,
+  "gpu_provider": "drm2kgsl",
+  "shared_dirs": [],
+  "gpu_cgroup_path": "/dev/cpuset/gpuworker",
+  "vpu_enabled": false,
+  "gpu_cgroup_enabled": true,
+  "motion_sensor": true,
+  "xhci_next": 1,
+  "environment_variables": [],
+  "cpu_affinity": "0=2:1=3:2=4:3=5",
+  "gpu_rt_prio": "",
+  "protected_vm": "pseudo_unprotected",
+  "gunyah_dynamic_share": false,
+  "gpu_pool_blob_max_kb": 4096,
+  "native_display_enabled": true,
+  "pmu": true,
+  "display_blit_provider": "TURNIP",
+  "swiotlb_mb": 256,
+  "gpu_udmabuf": true,
+  "id": "@VM_ID@",
+  "vnc_enabled": false,
+  "peripherals": [],
+  "rng": true,
+  "gpu_mode": "native",
+  "gpu_host_pool_mb": 64,
+  "name": "UniXNU (DroidVM)",
+  "vpu_guest_pool_mb": 128,
+  "serial_ports": [
+   {
+    "console": false,
+    "num": 1,
+    "backend": "app_console",
+    "fixed": true,
+    "hardware": "serial"
+   },
+   {
+    "console": false,
+    "num": 2,
+    "backend": "sink",
+    "fixed": true,
+    "hardware": "serial"
+   },
+   {
+    "console": false,
+    "num": 3,
+    "backend": "sink",
+    "fixed": true,
+    "hardware": "serial"
+   },
+   {
+    "console": false,
+    "num": 4,
+    "backend": "sink",
+    "fixed": true,
+    "hardware": "serial"
+   },
+   {
+    "console": true,
+    "num": 1,
+    "usb_slot": 0,
+    "backend": "app_console",
+    "hardware": "sbsa"
+   }
+  ],
+  "gpu_guest_pool_mb": 0,
+  "gpu_guest_step_mb": 0,
+  "extra_options": [
+   "--dump-device-tree-blob",
+   "/data/local/tmp/unixnu-fdt.dtb",
+   "--virtio-mmio-block",
+   "@MEDIA_DIR@/os.img,ro=true",
+   "--virtio-mmio-block",
+   "@MEDIA_DIR@/systemos.img,ro=true",
+   "--virtio-mmio-block",
+   "@MEDIA_DIR@/data-store.img",
+   "--virtio-mmio-input",
+   "--virtio-mmio-net",
+   "--virtio-mmio-gpu",
+   "--pre-alloc",
+   "drm-host-mb=8,media-host-mb=64",
+   "--virtio-snd",
+   "backend=aaudio,capture=true,num_output_devices=1,num_input_devices=1,uid=@APP_UID@",
+   "--virtio-mmio-snd",
+   "--battery",
+   "type=goldfish",
+   "--virtio-media",
+   "kind=decoder,uid=@APP_UID@",
+   "--virtio-mmio-media"
+  ],
+  "cpu_topology_auto": true,
+  "disks": [
+   {
+    "path": "@DIR@/droidvm-disk.img",
+    "bus": "virtio",
+    "readonly": true
+   }
+  ],
+  "motion_sensor_correct": true,
+  "gpu_backend": "gpu_virglrenderer",
+  "gpu_vram_quota_mb": 2048,
+  "vpu_host_pool_mb": 256,
+  "display_enabled": true,
+  "networks": [
+   {
+    "network_id": "@NETWORK_ID@",
+    "mac_address": "02:00:00:aa:bb:01"
+   }
+  ],
+  "gpu_venus_pool_mb": 256,
+  "gpu_dynamic_vram": false,
+  "cpu_count": 4,
+  "display_backend": "simplefb",
+  "auto_up": false,
+  "screens": {
+   "simplefb": {
+    "transport_cap": "gpu",
+    "exporter": "native",
+    "width": 1024,
+    "poll_hz": 60,
+    "vnc": {
+     "port": -1,
+     "host": "",
+     "password_auth": false
+    },
+    "enabled": false,
+    "input_enabled": true,
+    "height": 1366
+   },
+   "gpu-0": {
+    "dpi_v": 160,
+    "transport_cap": "gpu",
+    "exporter": "native",
+    "dpi_h": 160,
+    "width": 1024,
+    "refresh_rate": 120,
+    "enabled": true,
+    "input_enabled": true,
+    "height": 1366
+   }
+  },
+  "prepare_lend_mthp": "single",
+  "hypervisor": "gunyah",
+  "gpu_api": "drm2kgsl",
+  "backend": "crosvm",
+  "smt": true,
+  "boot": {
+   "protocol": "uefi",
+   "uefi": {
+    "vars_enabled": false,
+    "vars": "",
+    "firmware": "@DIR@/edk2-virtio-gpu.fd"
+   },
+   "linux": {
+    "image": {
+     "disk": 0,
+     "wait": 2,
+     "cmdline": "",
+     "vdafix": true
+    },
+    "cmdline": "",
+    "kernel": "",
+    "source": "manual",
+    "initrd": ""
+   }
+  },
+  "cpu_capacity": "",
+  "balloon": false,
+  "gpu_cgroup_cpus": "7",
+  "virtio_transport": "pci",
+  "strace": false,
+  "sandbox": false,
+  "gpu_vram_folio_threshold_kb": 1024,
+  "cpu_clusters": "",
+  "gpu_guest_prealloc_mb": 0,
+  "hugepages": true,
+  "memory_mb": 5120,
+  "gpu_guest_max_grants": 0
+ }
+}

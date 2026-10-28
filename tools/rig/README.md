@@ -19,6 +19,7 @@ the environment wins):
 | `DATA_SEED` | `payload-redeploy.sh`: the Data seed in the tree's `build/droidvm-data` (default `data-12g-skip-ov.dbr`; another seed starts Data again) |
 | `GUEST_IP`, `GUEST_KEY` | `guest-ssh.sh`: the guest's IPv4 (`health.py`) and the ssh key (default `out/ssh/id_ed25519`) |
 | `CROSVM_BIN` | `crosvm-deploy.sh`: the crosvm build to install (the meta repo's `crosvm_out/crosvm`) |
+| `EDK2_FD`, `IPSW_CACHE` | `fresh-deploy.sh`: the edk2-gunyah firmware with the virtio-gpu GOP (the meta repo's `edk2-gunyah/edk2-gunyah.fd`), and `--ipsw-cache` for its `--build` |
 | `UNIFIEDLOG`, `LOG_BASE` | `guest-newlogs.sh`: mandiant/macos-UnifiedLogs' `unifiedlog_iterator`, and a full mirror made by `logarchive.py` (default `out/guest.logarchive`) |
 
 | Tool | Use |
@@ -69,6 +70,7 @@ the environment wins):
 | `payload-redeploy.sh [--keep-trust] [TOOL...]` | Check the Mac's source (`mac-sync-check.sh`), remake the owner trust bundle and pin it in board.toml (here and on the Mac), build the payload around `DATA_SEED`, make the boot disk and compare it with the running one (what changes, boot-args added and removed; a new DarwinBoot, UEFI loader or Data seed needs `ALLOW_CHANGE`), keep the running one as `out/droidvm-disk.prev.img`, deploy, restart, put the ssh key, stage owner tools |
 | `plugin-redeploy.sh` | Build the Metal plugin on the Mac from `FORK`, keep the running plugin trusted, stage the new one into the guest's Data, flush it, `payload-redeploy.sh`, and check it survived the reboot |
 | `crosvm-deploy.sh` | Install `CROSVM_BIN` as the app's crosvm (VM stopped), keeping a backup and the old binary's owner, mode and SELinux label; guest and crosvm must agree on the droidvm-gpu wire version |
+| `fresh-deploy.sh [--build] [--yes]` | Replace the phone's UniXNU VM with a new one from the release `scripts/build-droidvm-all.py` made in `BUILD_OUT/release` (`--build` runs it first): stop the old VM, delete it from the daemon and the app's `vms.json` (a copy is kept beside it) with everything in its directory, push the release's OS and SystemOS disks, `EDK2_FD` and the boot disk (`deploy.sh`), make an empty Data store, install `CROSVM_BIN` when it differs, write the new VM (`unixnu-vm.template.json`: a new id, the app's br-wifi network and uid) into `vms.json`, `unixnu-vm.config.json` and `VM=` of `rig.env`, boot it (`vm.sh start`) and put the ssh key |
 | `daemon-recover.sh` | Restart droidvmd the way the app does and recreate the VM from its saved config (`unixnu-vm.config.json`, rig-local); change a running daemon's copy with `vm_modify` |
 | `vmguard2.sh [SPINS]`, `guard-start.sh` (on the phone, as root) | Guard the host against a guest vCPU that holds its core: SIGSTOP crosvm when a started secondary never sleeps, or when every one spins SPINS samples. `guard-start.sh` runs it detached, logging to `/data/local/tmp/vmguard.log`. `vmguard.sh` is the earlier sampler |
 | `killvm.sh` (on the phone) | SIGKILL a stopped UniXNU crosvm after the guard froze it |

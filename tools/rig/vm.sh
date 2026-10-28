@@ -83,7 +83,8 @@ stop() {
   pid=$(crosvm_pid)
   [ -n "$pid" ] || return 0
   # The control socket is run/<VM name>.sock (CrosvmBackendInstance); the app's crosvm needs its own libraries.
-  name=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['config']['name'])" "$RIG/unixnu-vm.config.json")
+  name=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['config']['name'])" "$RIG/unixnu-vm.config.json" 2>/dev/null ||
+         echo "UniXNU (DroidVM)")
   $A shell "su -c 'LD_LIBRARY_PATH=$APP_USR/lib $APP_USR/bin/crosvm stop \"$RUN/$name.sock\"'" >/dev/null 2>&1
   echo "stop $(date +%s)" > "$RIG_OUT/vm-request"
   for i in $(seq 1 "$STOP_WAIT"); do
