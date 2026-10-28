@@ -28,9 +28,11 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
   - /chosen darwinboot-fdt (--dynamic): DarwinBoot completes the tree at boot from the firmware's FDT (DarwinBoot FdtAdt.c):
     bit 0 the RAM (/chosen dram-base and dram-size from /memory, and /pram, darwinboot-memory-limit, darwinboot-video-memory and
     kern.maxvnodes recomputed from its end), bit 1 the devices (the /arm-io nodes below of every virtio-mmio window, by the
-    device ID it reports, with the pools, and the battery). The tree then leaves those nodes out, and the window arguments
-    (--data-store-mmio, --input-mmio, --net-mmio, --virtio-gpu-mmio, --snd-mmio, --media-mmio, --battery) are not needed; the
-    RAM values written here are placeholders of the same size.
+    device ID it reports, with the pools, and the battery), bit 2 the CPUs (/cpus from the FDT's, by MPIDR, the first the boot
+    CPU, and /arm-io/intc's GICv3 windows and /psci's conduit in place: crosvm moves the redistributors with the vCPU count).
+    The tree then leaves those nodes out -- /cpus holds cpu0 alone, the template of the others, and /psci is always there --
+    and the window arguments (--data-store-mmio, --input-mmio, --net-mmio, --virtio-gpu-mmio, --snd-mmio, --media-mmio,
+    --battery) and --cpu-regs are not needed; the RAM, CPU and GIC values written here are placeholders of the same size.
   - /chosen/darwinboot-video-memory: --boot-video-mib reserves ordinary RAM below the panic
     region for a BLT-only GOP handoff. It needs no crosvm simplefb device or framebuffer MMIO.
   - /chosen darwinboot-memory-limit (--reclaim-memory): DarwinBoot also gives the kernel the RAM after its window that the
@@ -355,7 +357,7 @@ def main():
                                    ('reg', struct.pack('<I', reg)),
                                    ('device_type', b'cpu\0'), ('compatible', b'arm,armv8\0'),
                                    ('timebase-frequency', struct.pack('<I', args.timebase))])
-            for index, reg in enumerate(cpu_regs)]
+            for index, reg in enumerate(cpu_regs[:1] if args.dynamic else cpu_regs)]
     tree = node('device-tree', [
         ('model', b'iPad7,1\0' if args.ipad_identity else b'droidvm-first-boot\0'),
         *([('target-type', b'J120\0')] if args.ipad_identity else []),
@@ -371,7 +373,7 @@ def main():
                         *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]
                           if args.unique_chip_id is not None else []),
                         ('osenvironment', b'main\0'),
-                        *([('darwinboot-fdt', struct.pack('<I', 3))] if args.dynamic else []),
+                        *([('darwinboot-fdt', struct.pack('<I', 7))] if args.dynamic else []),
                         *([('certificate-production-status', struct.pack('<I', 0)), ('effective-production-status-ap', struct.pack('<I', 0)),
                            ('certificate-security-mode', struct.pack('<I', 1)), ('effective-security-mode-sep', struct.pack('<I', 1))]
                           if args.ipad_identity else []),
@@ -394,7 +396,8 @@ def main():
                                  ([('TrustCache', bytes(16))] if args.trust_cache else [])),
               node('manifest-properties')]),
         node('cpus', children=cpus),
-        *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', psci_method.encode() + b'\0')])] if len(cpus) > 1 else []),
+        *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', psci_method.encode() + b'\0')])]
+          if len(cpus) > 1 or args.dynamic else []),
         # The guest really runs under a hypervisor: XNU publishes this as kern.hv_vmm_present.
         *([node('pram', [('reg', struct.pack('<QQ', *panic_region))])] if panic_region else []),
         # kern.maxvnodes: the vnode limit XNU sizes from memory, (bytes / 64 KiB) + 1024, over the memory the kernel manages. Without it
@@ -470,7 +473,8 @@ def main():
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
-    print(f'droidvm ADT: {len(tree)} bytes, {len(cpu_regs)} cpu, gic {dist:#x}/{redist:#x}+{redist_size:#x}, '
+    cpu_count = 'FDT' if args.dynamic else len(cpu_regs)
+    print(f'droidvm ADT: {len(tree)} bytes, {cpu_count} cpu, gic {dist:#x}/{redist:#x}+{redist_size:#x}, '
           f'psci {psci_method}, dram {dram_base:#x}+{args.dram_size:#x}, timebase {args.timebase}, '
           f'panic {"none" if not panic_region else f"{panic_region[0]:#x}+{panic_region[1]:#x}"}, '
           f'virtio-mmio {[hex(a) for a, _ in virtio_mmio]}, data store {hex(data_store[0][0]) if data_store else "none"}, '

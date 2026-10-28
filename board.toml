@@ -139,7 +139,8 @@ dram_base = "0x80600000"             # the shim's RAM window; crosvm's own FDT l
 # also gets the RAM after it that the firmware frees at ExitBootServices, up to the panic region at the top of guest RAM. The
 # window alone had to fit one free run of the firmware's map, which left the kernel 2.75 GiB of the 5 GiB VM (the run above 4 GiB).
 owned_memory_size = "0x20000000"
-cpu_regs = "0,1,2,3"                 # the VM's 4 vCPUs (crosvm MPIDRs); ArmCpu starts the secondaries with PSCI CPU_ON (sheng-smp=1)
+cpu_regs = "0,1,2,3"                 # crosvm MPIDRs; ArmCpu starts the secondaries with PSCI CPU_ON (sheng-smp=1). With --dynamic only
+                                     # the boot CPU is written: DarwinBoot adds one per vCPU the VM has
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the original OS volume
 packed_data_ramdisk = true
 ipad_identity = true
@@ -149,8 +150,9 @@ chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
 # for every virtio-mmio device crosvm offers, by the device ID it reports -- the read-only OS and SystemOS disks, the third
 # --virtio-mmio-block as the Data store (tools/rig/make-data-store.sh), the app's input devices (--virtio-mmio-input), the net device
 # (--virtio-mmio-net), the display (--virtio-mmio-gpu, with its drm-host-pool), the sound card (--virtio-mmio-snd), the media
-# devices (--virtio-mmio-media, with their media-host-pool) and the goldfish battery. So the payload boots a VM with any of them, and
-# a new crosvm device or pool needs no new ADT; package/crosvm-gunyah.dtb gives only the CPUs, the GIC and the PSCI conduit.
+# devices (--virtio-mmio-media, with their media-host-pool) and the goldfish battery; and the CPUs, the GICv3 windows and the PSCI
+# conduit, by the vCPU count. So the payload boots a VM with any of them and any number of vCPUs (ArmCpu starts up to eight), and a
+# new crosvm device or pool needs no new ADT; package/crosvm-gunyah.dtb gives only placeholders of the right size.
 # --display-gamut sRGB: the display chain scans out 8-bit sRGB (BGRX), and with the panel's P3 every app and WebKit drew its layers
 # into wide-color surfaces ('w30r', 'b3a8') that CoreGraphics fills only through the GPU -- which WebKit's sandboxed GPU process
 # cannot map -- so Safari's pages stayed black; sRGB keeps them on 8-bit BGRA surfaces CoreGraphics draws on the CPU too.
