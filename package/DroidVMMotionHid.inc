@@ -32,6 +32,7 @@ class DroidVMMotionHid : public IOHIDDevice {
     unsigned kind = DROIDVM_MOTION_ACCELEROMETER;
     uint32_t lastSeq = 0;
     int32_t lastOrientation = -1;
+    uint64_t orientationSentAt = 0;
 
     // The vector sensors: three signed 32-bit fields, logical and physical range +-1000000, unit exponent -3, so
     // IOHIDEventDriver's exponent scaling gives the value in thousandths as the event's IOFixed: milli-g (accelerometer),
@@ -65,9 +66,20 @@ class DroidVMMotionHid : public IOHIDDevice {
         self->lastSeq = before;
         IOBufferMemoryDescriptor *buffer = nullptr;
         if (self->kind == DROIDVM_MOTION_ORIENTATION) {
-            // Only a change: the event goes out when a bit turns on.
-            if (orientation == self->lastOrientation || orientation < 0 || orientation > 6) return;
+            // The event goes out when a bit turns on: on a change, and every 2 s again (all bits off, then the bit), because a
+            // client that opens the service later -- backboardd, well after this device's first report -- hears only events.
+            uint64_t now = mach_absolute_time(), period = 0;
+            nanoseconds_to_absolutetime(2000000000ULL, &period);
+            if (orientation < 0 || orientation > 6) return;
+            if (orientation == self->lastOrientation && now - self->orientationSentAt < period) return;
+            if (orientation == self->lastOrientation) {
+                uint8_t none = 0;
+                IOBufferMemoryDescriptor *clear = IOBufferMemoryDescriptor::withBytes(&none, sizeof(none), kIODirectionNone);
+                if (clear) self->handleReport(clear, 0, 0);
+                OSSafeReleaseNULL(clear);
+            }
             self->lastOrientation = orientation;
+            self->orientationSentAt = now;
             uint8_t report = (uint8_t)(1u << orientation);
             buffer = IOBufferMemoryDescriptor::withBytes(&report, sizeof(report), kIODirectionNone);
         } else {
