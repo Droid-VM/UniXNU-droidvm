@@ -25,6 +25,12 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
     pre-shared media_host pool (--pre-alloc media-host-mb), where the devices' MMAP buffers live.
   - /arm-io/battery: --battery, crosvm's goldfish battery (--battery type=goldfish, package/DroidVMBattery.cpp),
     compatible "google,goldfish-battery"
+  - /chosen darwinboot-fdt (--dynamic): DarwinBoot completes the tree at boot from the firmware's FDT (DarwinBoot FdtAdt.c):
+    bit 0 the RAM (/chosen dram-base and dram-size from /memory, and /pram, darwinboot-memory-limit, darwinboot-video-memory and
+    kern.maxvnodes recomputed from its end), bit 1 the devices (the /arm-io nodes below of every virtio-mmio window, by the
+    device ID it reports, with the pools, and the battery). The tree then leaves those nodes out, and the window arguments
+    (--data-store-mmio, --input-mmio, --net-mmio, --virtio-gpu-mmio, --snd-mmio, --media-mmio, --battery) are not needed; the
+    RAM values written here are placeholders of the same size.
   - /chosen/darwinboot-video-memory: --boot-video-mib reserves ordinary RAM below the panic
     region for a BLT-only GOP handoff. It needs no crosvm simplefb device or framebuffer MMIO.
   - /chosen darwinboot-memory-limit (--reclaim-memory): DarwinBoot also gives the kernel the RAM after its window that the
@@ -235,6 +241,8 @@ def main():
                         help='Base of the FDT virtio-mmio window of the virtio-snd card (/arm-io/virtio-snd)')
     parser.add_argument('--media-mmio', default='',
                         help='Comma-separated bases of the FDT virtio-mmio windows of the virtio-media devices (/arm-io/virtio-media-N)')
+    parser.add_argument('--dynamic', action='store_true',
+                        help='/chosen darwinboot-fdt: DarwinBoot fills in the RAM and the /arm-io devices from the firmware FDT at boot')
     parser.add_argument('--battery', action='store_true',
                         help='Emit /arm-io/battery from the FDT goldfish-battery node (crosvm --battery type=goldfish)')
     parser.add_argument('--boot-video-mib', type=int, default=0,
@@ -354,6 +362,7 @@ def main():
                         *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]
                           if args.unique_chip_id is not None else []),
                         ('osenvironment', b'main\0'),
+                        *([('darwinboot-fdt', struct.pack('<I', 3))] if args.dynamic else []),
                         *([('certificate-production-status', struct.pack('<I', 0)), ('effective-production-status-ap', struct.pack('<I', 0)),
                            ('certificate-security-mode', struct.pack('<I', 1)), ('effective-security-mode-sep', struct.pack('<I', 1))]
                           if args.ipad_identity else []),
@@ -409,40 +418,42 @@ def main():
              [node('intc', [('compatible', b'arm,gic-v3\0'),
                             ('reg', struct.pack('<4Q', dist - ARMIO_BASE, dist_size, redist - ARMIO_BASE, redist_size)),
                             ('redistributor-stride', struct.pack('<Q', GIC_REDIST_STRIDE))]),
-              *[node('virtio-mmio-%d' % index, [('compatible', b'virtio,mmio\0'),
-                                                 ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
-                                                 ('dma-coherent', b'')])
-                for index, (address, size) in enumerate(virtio_mmio)],
-              *[node('data-store', [('compatible', b'droidvm,data-store\0'),
-                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
-                                    ('dma-coherent', b'')])
-                for address, size in data_store],
-              *[node('input-%d' % index, [('compatible', b'droidvm,virtio-input\0'),
-                                           ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
-                                           ('dma-coherent', b'')])
-                for index, (address, size) in enumerate(inputs)],
-              *[node('net', [('compatible', b'droidvm,net\0'),
-                             ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
-                             ('dma-coherent', b'')])
-                for address, size in net],
-              *[node('virtio-gpu', [('compatible', b'droidvm,virtio-gpu\0'),
-                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
-                                    ('dma-coherent', b''),
-                                    *[('drm-host-pool', struct.pack('<QQ', *pool)) for pool in vm['drm_host_pool']]])
-                for address, size in virtio_gpu],
-              *[node('virtio-snd', [('compatible', b'droidvm,virtio-snd\0'),
-                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
-                                    ('dma-coherent', b'')])
-                for address, size in snd],
-              *[node('virtio-media-%d' % index, [('compatible', b'droidvm,virtio-media\0'),
-                                                  ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
-                                                  ('dma-coherent', b''),
-                                                  *[('media-host-pool', struct.pack('<QQ', *pool))
-                                                    for pool in vm['media_host_pool']]])
-                for index, (address, size) in enumerate(media)],
-              *[node('battery', [('compatible', b'google,goldfish-battery\0'),
-                                 ('reg', struct.pack('<QQ', address - ARMIO_BASE, size))])
-                for address, size in (vm['battery'] if args.battery else [])]]),
+              *([] if args.dynamic else [
+                *[node('virtio-mmio-%d' % index, [('compatible', b'virtio,mmio\0'),
+                                                   ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                                   ('dma-coherent', b'')])
+                  for index, (address, size) in enumerate(virtio_mmio)],
+                *[node('data-store', [('compatible', b'droidvm,data-store\0'),
+                                      ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                      ('dma-coherent', b'')])
+                  for address, size in data_store],
+                *[node('input-%d' % index, [('compatible', b'droidvm,virtio-input\0'),
+                                             ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                             ('dma-coherent', b'')])
+                  for index, (address, size) in enumerate(inputs)],
+                *[node('net', [('compatible', b'droidvm,net\0'),
+                               ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                               ('dma-coherent', b'')])
+                  for address, size in net],
+                *[node('virtio-gpu', [('compatible', b'droidvm,virtio-gpu\0'),
+                                      ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                      ('dma-coherent', b''),
+                                      *[('drm-host-pool', struct.pack('<QQ', *pool)) for pool in vm['drm_host_pool']]])
+                  for address, size in virtio_gpu],
+                *[node('virtio-snd', [('compatible', b'droidvm,virtio-snd\0'),
+                                      ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                      ('dma-coherent', b'')])
+                  for address, size in snd],
+                *[node('virtio-media-%d' % index, [('compatible', b'droidvm,virtio-media\0'),
+                                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                                    ('dma-coherent', b''),
+                                                    *[('media-host-pool', struct.pack('<QQ', *pool))
+                                                      for pool in vm['media_host_pool']]])
+                  for index, (address, size) in enumerate(media)],
+                *[node('battery', [('compatible', b'google,goldfish-battery\0'),
+                                   ('reg', struct.pack('<QQ', address - ARMIO_BASE, size))])
+                  for address, size in (vm['battery'] if args.battery else [])]
+              ])]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(tree)
