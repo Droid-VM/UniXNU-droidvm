@@ -313,6 +313,9 @@ run([str(net_source) if arg==str(process_source) else str(net_obj) if arg==str(p
 snd_source=ROOT/'kits/droidvm/DroidVMVirtioSnd.c'
 snd_obj=OUT/'DroidVMVirtioSnd.o'
 run([str(snd_source) if arg==str(process_source) else str(snd_obj) if arg==str(process_obj) else arg for arg in process_cmd],cwd=pr['directory'])
+media_source=ROOT/'kits/droidvm/DroidVMVirtioMedia.c'
+media_obj=OUT/'DroidVMVirtioMedia.o'
+run([str(media_source) if arg==str(process_source) else str(media_obj) if arg==str(process_obj) else arg for arg in process_cmd],cwd=pr['directory'])
 # Above the transport, an IOEthernetController from Apple's IONetworkingFamily, which configd needs to name and configure an
 # interface (IONetworkStack, IONetworkInterface) and which the kernel otherwise lacks. Tag 177 is the macOS 14.6 / Darwin 23
 # release (Info.plist 3.4, the version the stock iOS 17 kernelcache carries), fetched at its pinned commit. It and the classes
@@ -488,12 +491,12 @@ run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func',
 require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/'NativeKeyStoreEvents.o').read_bytes()))==
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned event-service instructions unchanged by late init staging')
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDisplayProbe.o',hid_obj,keystore_obj,process_obj,trace_obj,
-     hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',keyevents_late,stub_obj,policy_obj,clock_obj,export_obj,store_obj,input_obj,motion_obj,bootargs_obj,net_obj,netif_obj,snd_obj,
+     hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o',keyevents_late,stub_obj,policy_obj,clock_obj,export_obj,store_obj,input_obj,motion_obj,bootargs_obj,net_obj,netif_obj,snd_obj,media_obj,
      audio_late,battery_late,ethernet_late,*ionet_objects,*gpu_objects,*virtio_gpu_objects])
 sources=[ROOT/'drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
          ROOT/'drivers/GopFramebuffer/NativeLegacyRequest.h',source,hid_source,keystore_source,process_source,trace_source,ROOT/'kits/droidvm/BootUiTraceCore.h',ROOT/'kits/droidvm/BootUiTraceDetails.h',
          ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',
-         ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',stub_source,policy_source,clock_source,export_source,store_source,input_source,motion_source,bootargs_source,net_source,netif_source,snd_source,audio_source,battery_source,
+         ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',stub_source,policy_source,clock_source,export_source,store_source,input_source,motion_source,bootargs_source,net_source,netif_source,snd_source,media_source,audio_source,battery_source,
          ethernet_source,*ionet_sources,*gpu_sources,*virtio_gpu_sources,ROOT/'kits/droidvm/DroidVMVirtioGpu.h']
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'

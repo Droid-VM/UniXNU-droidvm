@@ -20,6 +20,9 @@ guest started with the same VM settings. Nothing is assumed about the host SoC.
     property carries the absolute GPA and size of the FDT's pre-shared drm2kgsl_host pool.
   - /arm-io/virtio-snd: --snd-mmio, the sound card of crosvm --virtio-mmio-snd (package/DroidVMVirtioSnd.c),
     compatible "droidvm,virtio-snd"
+  - /arm-io/virtio-media-N: --media-mmio, the media devices of crosvm --virtio-mmio-media (package/DroidVMVirtioMedia.c),
+    compatible "droidvm,virtio-media". Their media-host-pool property carries the absolute GPA and size of the FDT's
+    pre-shared media_host pool (--pre-alloc media-host-mb), where the devices' MMAP buffers live.
   - /arm-io/battery: --battery, crosvm's goldfish battery (--battery type=goldfish, package/DroidVMBattery.cpp),
     compatible "google,goldfish-battery"
   - /chosen/darwinboot-video-memory: --boot-video-mib reserves ordinary RAM below the panic
@@ -170,6 +173,11 @@ def describe(fdt):
                 for pair in reg_pairs(props['reg'])]
     if len(drm_host) > 1:
         raise SystemExit('FDT has more than one drm2kgsl_host pool')
+    media_host = [pair for path, props in fdt.items()
+                  if path.startswith('/reserved-memory/media_host@')
+                  for pair in reg_pairs(props['reg'])]
+    if len(media_host) > 1:
+        raise SystemExit('FDT has more than one media_host pool')
     for address, size in virtio:
         if not ARMIO_BASE <= address < address + size <= ARMIO_BASE + ARMIO_SIZE:
             raise SystemExit(f'virtio-mmio window {address:#x}+{size:#x} lies outside the arm-io window')
@@ -178,7 +186,7 @@ def describe(fdt):
                for pair in reg_pairs(props['reg'])]
     return dict(cpu_regs=[reg for reg, _ in cpus], gic=(dist, dist_size, redist, redist_size),
                 psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size,
-                virtio_mmio=virtio, drm_host_pool=drm_host, battery=battery)
+                virtio_mmio=virtio, drm_host_pool=drm_host, media_host_pool=media_host, battery=battery)
 
 
 def main():
@@ -225,6 +233,8 @@ def main():
                         help='Base of the standard virtio-gpu window (/arm-io/virtio-gpu)')
     parser.add_argument('--snd-mmio', type=lambda value: int(value, 0), default=None,
                         help='Base of the FDT virtio-mmio window of the virtio-snd card (/arm-io/virtio-snd)')
+    parser.add_argument('--media-mmio', default='',
+                        help='Comma-separated bases of the FDT virtio-mmio windows of the virtio-media devices (/arm-io/virtio-media-N)')
     parser.add_argument('--battery', action='store_true',
                         help='Emit /arm-io/battery from the FDT goldfish-battery node (crosvm --battery type=goldfish)')
     parser.add_argument('--boot-video-mib', type=int, default=0,
@@ -291,9 +301,13 @@ def main():
         input_bases = [int(value, 0) for value in args.input_mmio.split(',') if value]
     except ValueError:
         parser.error('--input-mmio takes comma-separated addresses')
+    try:
+        media_bases = [int(value, 0) for value in args.media_mmio.split(',') if value]
+    except ValueError:
+        parser.error('--media-mmio takes comma-separated addresses')
     virtio_mmio = [window for window in vm['virtio_mmio']
                    if window[0] not in (args.data_store_mmio, args.net_mmio, args.virtio_gpu_mmio, args.snd_mmio)
-                   and window[0] not in input_bases]
+                   and window[0] not in input_bases and window[0] not in media_bases]
     data_store = [window for window in vm['virtio_mmio'] if window[0] == args.data_store_mmio]
     if args.data_store_mmio is not None and not data_store:
         parser.error(f'the FDT has no virtio-mmio window at {args.data_store_mmio:#x} for --data-store-mmio')
@@ -308,6 +322,13 @@ def main():
     if args.virtio_gpu_mmio is not None and (not virtio_gpu or args.virtio_gpu_mmio in input_bases or
                                            args.virtio_gpu_mmio in (args.data_store_mmio, args.net_mmio)):
         parser.error(f'--virtio-gpu-mmio {args.virtio_gpu_mmio:#x} must be a virtio-mmio window of the FDT of its own')
+    media = [window for base in media_bases for window in vm['virtio_mmio'] if window[0] == base]
+    taken = (args.data_store_mmio, args.net_mmio, args.virtio_gpu_mmio, args.snd_mmio)
+    if len(media) != len(media_bases) or len(set(media_bases)) != len(media_bases) or \
+            any(base in input_bases or base in taken for base in media_bases):
+        parser.error('each --media-mmio address must be a virtio-mmio window of the FDT of its own')
+    if media and not vm['media_host_pool']:
+        parser.error('--media-mmio needs the FDT media_host pool (crosvm --pre-alloc media-host-mb)')
     snd = [window for window in vm['virtio_mmio'] if window[0] == args.snd_mmio]
     if args.snd_mmio is not None and (not snd or args.snd_mmio in input_bases or
                                       args.snd_mmio in (args.data_store_mmio, args.net_mmio, args.virtio_gpu_mmio)):
@@ -413,6 +434,12 @@ def main():
                                     ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
                                     ('dma-coherent', b'')])
                 for address, size in snd],
+              *[node('virtio-media-%d' % index, [('compatible', b'droidvm,virtio-media\0'),
+                                                  ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                                  ('dma-coherent', b''),
+                                                  *[('media-host-pool', struct.pack('<QQ', *pool))
+                                                    for pool in vm['media_host_pool']]])
+                for index, (address, size) in enumerate(media)],
               *[node('battery', [('compatible', b'google,goldfish-battery\0'),
                                  ('reg', struct.pack('<QQ', address - ARMIO_BASE, size))])
                 for address, size in (vm['battery'] if args.battery else [])]]),
