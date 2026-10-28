@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build toybox for the guest: one trusted multicall binary with ~137 coreutils applets and a shell, so the run verb
-(package/ownervisor) has real tools on an otherwise bare iPadOS (/bin holds only df and ps).
+(ownervisor, kits/ownervisor) has real tools on an otherwise bare iPadOS (/bin holds only df and ps).
 
   build-droidvm-toybox.py TREE_ROOT
 

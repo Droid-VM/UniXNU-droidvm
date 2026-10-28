@@ -275,7 +275,7 @@ static int mount_app_cryptex(proc_t p, uint64_t scratch) {
  return 0;
 }
 
-// owner-service-manager=1: start the owner service manager (package/ownervisor) once at boot, from this hook. The launchd
+// owner-service-manager=1: start the owner service manager (github.com/Droid-VM/ownervisor, kits/ownervisor) once at boot, from this hook. The launchd
 // overlay the GPU addon mounts does not actually launch an owner binary: launchd takes its jobs from the signed compiled cache
 // (/System/Library/xpc/launchd.plist) and ignores the on-disk plist's ProgramArguments, and a brand-new label is never
 // enumerated. This hook already runs as root with a user scratch page and calls BSD syscalls directly (mount above), so it

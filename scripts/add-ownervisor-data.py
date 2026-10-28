@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Stage ownervisor (the owner service manager) into a copy of a packed Data seed that already carries the GPU plugin.
+"""Stage the debug shell (ownervisor, its shell and its services) into a copy of a packed Data seed that already carries the
+GPU plugin.
 
   add-ownervisor-data.py BASE.dbr OUTPUT.dbr
 
@@ -9,9 +10,12 @@ is never enumerated, so the kernel posix_spawns the manager itself. The GPU prob
 /private/var/ngpu/bin/adrenoprobed as its first managed service (keepalive false, one shot), then the owner debug services.
 
 Baked under /private/var/ngpu (the writable Data volume):
-  bin/ownervisor bin/ownerctl bin/ownertest     the trusted binaries (build/droidvm-ownervisor, build-droidvm-ownervisor.py)
-  ownervisor/services.d/adrenoprobe.json         exec adrenoprobed once (GPU probe), enabled
-  ownervisor/services.d/selftest.json            exec ownertest (proves owner->owner spawn under AMFI), enabled
+  bin/                       the debug shell (build/debug-shell/bin: ownervisor, ownerctl, ownertest, applebox, dropbear,
+                             dropbearkey, zsh, debugserver, libimobiledevice and its tool links) and the board's toybox, gfxprobe,
+                             ipatool, lsdiag
+  ssh/                       dropbear's keys (0700)
+  ownervisor/services.d/     the debug shell's services (dropbear, selftest, serial-shell) and the board's adrenoprobe
+  ownervisor/enabled/        the debug shell's boot services (dropbear, selftest)
 BASE is not modified and the volume UUID is unchanged."""
 import json
 import os
@@ -26,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'drivers/DarwinBoot/Test'))
 import packed_ramdisk
 
-OV = ROOT / 'build/droidvm-ownervisor'
+SHELL = ROOT / 'build/debug-shell'
 
 
 def main():
@@ -35,9 +39,8 @@ def main():
     base, output = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
     if output.exists():
         sys.exit('Refuse to overwrite ' + str(output))
-    for name in ('ownervisor', 'ownerctl', 'ownertest'):
-        if not (OV / name).is_file():
-            sys.exit('Build ownervisor first: python3 scripts/build-droidvm-ownervisor.py')
+    if not (SHELL / 'debug-shell.json').is_file():
+        sys.exit('Build the debug shell first: python3 scripts/build-droidvm-ownervisor.py TREE_ROOT')
     blob = base.read_bytes()
     logical, extents = packed_ramdisk.regions(blob)
     with tempfile.TemporaryDirectory(prefix='data-seed-', dir=str(ROOT / 'build')) as td:
@@ -57,105 +60,60 @@ def main():
             bin_dir, daemon_dir = mount / 'ngpu/bin', mount / 'ngpu/daemons'
             if not bin_dir.is_dir() or not (bin_dir / 'adrenoprobed').is_file():
                 sys.exit('BASE has no ngpu/bin/adrenoprobed; stage the GPU plugin first (add-gpu-plugin-data.py)')
-            for name in ('ownervisor', 'ownerctl', 'ownertest'):
-                shutil.copyfile(OV / name, bin_dir / name)
-                os.chmod(bin_dir / name, 0o755)
-            # toybox: ~137 coreutils applets + a shell in one trusted multicall binary (scripts/build-droidvm-toybox.py),
-            # so the run verb has real tools on an otherwise bare iPadOS (/bin holds only df and ps). Called as
-            # `toybox <applet> ...`; no symlinks needed. Optional -- staged only when it has been built.
-            toybox = ROOT / 'build/toybox/toybox'
-            if toybox.is_file():
-                shutil.copyfile(toybox, bin_dir / 'toybox')
-                os.chmod(bin_dir / 'toybox', 0o755)
-            # zsh: Apple's own shell (apple-oss-distributions/zsh, scripts/build-droidvm-zsh.py), a real interactive shell for
-            # the run verb and, later, the ssh login shell. Static modules, so the one binary needs no module dir. Optional.
-            zsh = ROOT / 'build/zsh/zsh'
-            if zsh.is_file():
-                shutil.copyfile(zsh, bin_dir / 'zsh')
-                os.chmod(bin_dir / 'zsh', 0o755)
-            # dropbear: a pubkey-only ssh server (scripts/build-droidvm-dropbear.py), patched to use zsh as the login shell and
-            # to read authorized_keys from /private/var/ngpu/ssh (export.py put writes there; the home /var/root is not writable
-            # by the rig). The ssh dir is 0700 root so checkfileperm accepts the keys. Optional.
-            dropbear = ROOT / 'build/dropbear'
-            if (dropbear / 'dropbear').is_file():
-                for b in ('dropbear', 'dropbearkey'):
-                    shutil.copyfile(dropbear / b, bin_dir / b)
-                    os.chmod(bin_dir / b, 0o755)
-                ssh_dir = mount / 'ngpu/ssh'
-                ssh_dir.mkdir(parents=True, exist_ok=True)
-                os.chmod(ssh_dir, 0o700)
-            # gfxprobe: the GPU and display probes (scripts/build-droidvm-gfxprobe.py), whose orient-follow keeps backboardd's
-            # device orientation where the guest's motion sensors say, by hand only (no service runs it). Optional.
-            gfxprobe = ROOT / 'build/gfxprobe/gfxprobe'
-            if gfxprobe.is_file():
-                shutil.copyfile(gfxprobe, bin_dir / 'gfxprobe')
-                os.chmod(bin_dir / 'gfxprobe', 0o755)
-            # The rest of the debug shell (plans/UNIXNUSETTING.md): applebox (Apple's coreutils, build-droidvm-applebox.py), ipatool
-            # (the .ipa installer), debugserver (the remote debug stub) and lsdiag (LaunchServices questions). Optional, each
-            # staged when it has been built; trusted like the others through build/owner-trust-extra.
-            for name in ('applebox', 'ipatool', 'debugserver', 'lsdiag'):
+            # The debug shell (github.com/Droid-VM/ownervisor, scripts/build-droidvm-ownervisor.py): ownervisor, ownerctl and
+            # ownertest, the shell -- applebox, dropbear, zsh, debugserver, libimobiledevice with a link per tool -- and its
+            # built-in services (dropbear = ssh on port 2222, selftest, serial-shell defined but not started: on this board
+            # /dev/console is a sink until XNU's console is wired to a UART the app shows), laid out as they go in.
+            for entry in sorted((SHELL / 'bin').iterdir()):
+                target = bin_dir / entry.name
+                target.unlink(missing_ok=True)
+                if entry.is_symlink():
+                    os.symlink(os.readlink(entry), target)
+                else:
+                    shutil.copyfile(entry, target)
+                    os.chmod(target, 0o755)
+            # dropbear reads authorized_keys and its host keys from /private/var/ngpu/ssh (export.py put writes there; the home
+            # /var/root is not writable by the rig): 0700 root, so checkfileperm accepts the keys.
+            ssh_dir = mount / 'ngpu/ssh'
+            ssh_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(ssh_dir, 0o700)
+            # The board's own tools beside the shell, each staged when it has been built: toybox (~137 coreutils applets and a
+            # shell, scripts/build-droidvm-toybox.py), gfxprobe (the GPU and display probes; its orient-follow keeps backboardd's
+            # device orientation where the motion sensors say, by hand only), ipatool (the .ipa installer) and lsdiag
+            # (LaunchServices questions).
+            for name in ('toybox', 'gfxprobe', 'ipatool', 'lsdiag'):
                 tool = ROOT / 'build' / name / name
                 if tool.is_file():
                     shutil.copyfile(tool, bin_dir / name)
                     os.chmod(bin_dir / name, 0o755)
-            # libimobiledevice (build-droidvm-libimobiledevice.py): one multicall binary for its tools, iproxy, inetcat and
-            # plistutil, each name a link to it (it runs the tool argv[0] names). Optional.
-            limd = ROOT / 'build/libimobiledevice/libimobiledevice'
-            if limd.is_file():
-                shutil.copyfile(limd, bin_dir / 'libimobiledevice')
-                os.chmod(bin_dir / 'libimobiledevice', 0o755)
-                for name in json.loads((ROOT / 'build/owner-trust-extra/libimobiledevice.json').read_text())['commands']:
-                    (bin_dir / name).unlink(missing_ok=True)
-                    os.symlink('libimobiledevice', bin_dir / name)
-            # The managed services. ownervisor creates run/log/state/control at startup; the seed carries the
-            # definitions and the enable markers so they autostart from the first boot.
-            # 'autostart' (a staging flag, stripped from the json) decides whether an enable marker is written. adrenoprobe is
-            # defined but NOT autostarted: it opens AGXDeviceUserClient and submits a GPU self-test that can fault (the known CP
-            # register-load AHB fault), and running it at boot, racing the real render clients, left the shared GPU state bad and
-            # every app's rendering black. Keep it for a manual `ownerctl start adrenoprobe` diagnostic, not at boot.
-            services = {
-                'adrenoprobe': {'exec': ['/private/var/ngpu/bin/adrenoprobed'], 'keepalive': False, 'uid': 0, 'autostart': False},
-                'selftest': {'exec': ['/private/var/ngpu/bin/ownertest', 'boot'], 'keepalive': True, 'throttle': 10},
-            }
-            if (dropbear / 'dropbear').is_file():
-                # Foreground (-F) so ownervisor supervises it; log to stderr (-E); generate the host key on first need (-R;
-                # the default path is /private/var/ngpu/ssh, patched in build-droidvm-dropbear.py). pubkey only. Binds every
-                # address on 2222; the login shell is zsh. Needs the rig's key at /private/var/ngpu/ssh/authorized_keys.
-                services['dropbear'] = {'exec': [
-                    '/private/var/ngpu/bin/dropbear', '-F', '-E', '-R', '-p', '2222'], 'keepalive': True, 'throttle': 5}
-            # serial-shell: a getty-style login shell on the console (zsh with stdin/stdout/stderr on /dev/console). Defined
-            # but NOT autostarted: on this board XNU has no serial console wired to an app-visible UART, so /dev/console is a
-            # dead/sink line -- output is discarded and no input arrives (verified by screenshot + marker test; cf. the
-            # silent-panics behaviour). To make it work, wire XNU's console to the NS16550 the app shows as serial1: add an
-            # 8250/16550 serial node to the ADT (make-droidvm-adt.py) at the matching crosvm UART base + a `serial=` boot-arg,
-            # then enable this service. Kept here so it is ready once the console is wired.
-            if (bin_dir / 'zsh').is_file():
-                services['serial-shell'] = {'exec': ['/private/var/ngpu/bin/zsh', '-c',
-                    'exec </dev/console >/dev/console 2>&1; exec /private/var/ngpu/bin/zsh -l'],
-                    'uid': 0, 'keepalive': True, 'throttle': 5, 'autostart': False,
-                    'env': {'PATH': '/private/var/ngpu/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'TERM': 'vt100', 'HOME': '/var/root'}}
-            # No orientd: backboardd takes the device orientation from CoreMotion and the kernel's motion HID services
-            # (package/DroidVMMotionHid.inc) since 2026-10-28; `gfxprobe orient-follow` stays for debugging by hand.
+            # The services: the debug shell's built-in ones (services.d and enabled markers as its build laid them out) and the
+            # board's GPU probe. adrenoprobe is defined but NOT started at boot: it opens AGXDeviceUserClient and submits a GPU
+            # self-test that can fault (the known CP register-load AHB fault), and running it at boot, racing the real render
+            # clients, left the shared GPU state bad and every app's rendering black. Keep it for a manual `ownerctl start
+            # adrenoprobe` diagnostic. ownervisor creates run/log/state/control at startup.
             svc_dir, en_dir = mount / 'ngpu/ownervisor/services.d', mount / 'ngpu/ownervisor/enabled'
             for d in (mount / 'ngpu/ownervisor', svc_dir, en_dir):
                 d.mkdir(parents=True, exist_ok=True)
                 os.chmod(d, 0o755)
-            for name, spec in services.items():
-                autostart = spec.pop('autostart', True)
-                (svc_dir / (name + '.json')).write_text(json.dumps(spec, indent=2) + '\n')
-                os.chmod(svc_dir / (name + '.json'), 0o644)
-                if autostart:
-                    (en_dir / name).write_text('')
-                    os.chmod(en_dir / name, 0o644)
+            for definition in sorted((SHELL / 'services.d').glob('*.json')):
+                shutil.copyfile(definition, svc_dir / definition.name)
+            for marker in sorted((SHELL / 'enabled').iterdir()):
+                (en_dir / marker.name).write_text('')
+            (svc_dir / 'adrenoprobe.json').write_text(json.dumps(
+                {'exec': ['/private/var/ngpu/bin/adrenoprobed'], 'keepalive': False, 'uid': 0}, indent=2) + '\n')
+            for path in list(svc_dir.iterdir()) + list(en_dir.iterdir()):
+                os.chmod(path, 0o644)
+            # No orientd: backboardd takes the device orientation from CoreMotion and the kernel's motion HID services
+            # (package/DroidVMMotionHid.inc) since 2026-10-28; `gfxprobe orient-follow` stays for debugging by hand.
             print('staged ngpu/bin:', sorted(p.name for p in bin_dir.iterdir()))
-            print('staged services:', sorted(services))
+            print('staged services:', sorted(p.stem for p in svc_dir.iterdir()), 'at boot:', sorted(p.name for p in en_dir.iterdir()))
         finally:
             subprocess.run(['hdiutil', 'detach', device], check=True)
         if raw.read_bytes()[32:36] != b'NXSB':
             sys.exit('The edited image is no APFS container any more')
         metadata = packed_ramdisk.pack(raw, output)
     report = dict(base_sha256=packed_ramdisk.inspect(base)[0]['sha256'], output=metadata,
-                  ownervisor=json.loads((ROOT / 'build/owner-trust-extra/ownervisor.json').read_text()))
+                  debug_shell=json.loads((SHELL / 'debug-shell.json').read_text()))
     output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print('ownervisor seed:', output)
 

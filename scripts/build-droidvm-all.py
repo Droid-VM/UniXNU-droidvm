@@ -19,10 +19,10 @@ Steps, in order:
              owner-root drivers, built in out-reference/ from a copy of this repository (only the archives such a kernel links)
   kernel     unixnu build kernel
   package    unixnu build package (UniXNU.efi) and DarwinBoot.efi
-  tools      the owner tools (ownervisor, toybox, zsh, dropbear, gfxprobe, lsdiag, applebox, ipatool, debugserver,
-             libimobiledevice)
+  tools      the debug shell (ownervisor with applebox, dropbear, zsh, debugserver, libimobiledevice and its services, from
+             github.com/Droid-VM/ownervisor) and the board's own tools (toybox, gfxprobe, lsdiag, ipatool)
   plugin     the Metal plugin (AdrenoMetal frontend, metal2vulkan, Turnip)
-  data       the plugin and the owner tools staged into the Data seed, grown to --data-gib
+  data       the plugin, the debug shell and the owner tools staged into the Data seed, grown to --data-gib
   trust      the owner trust bundle (plugin, tools, the original modules)
   payload    unixnu build payload around that trust and seed, then the boot disk
   images     os.img and systemos.img, release.json
@@ -43,8 +43,9 @@ from pathlib import Path
 DEVICE = Path(__file__).resolve().parents[1]
 STEPS = ['setup', 'volumes', 'policies', 'data-base', 'reference', 'kernel', 'package', 'tools', 'plugin', 'data', 'trust',
          'payload', 'images']
-# The owner tools, in build order: each writes build/<name>/... and build/owner-trust-extra/<name>.json.
-TOOLS = ['ownervisor', 'toybox', 'zsh', 'dropbear', 'gfxprobe', 'lsdiag', 'applebox', 'ipatool', 'debugserver', 'libimobiledevice']
+# The owner tools, in build order: each writes build/<name>/... and build/owner-trust-extra/<name>.json. ownervisor is the
+# debug shell (github.com/Droid-VM/ownervisor): the manager, applebox, dropbear, zsh, debugserver, libimobiledevice, services.
+TOOLS = ['ownervisor', 'toybox', 'gfxprobe', 'lsdiag', 'ipatool']
 # What a member of the IPSW is called (board.toml [ipsw.sha256] pins both).
 OS_DMG, SYSTEMOS_DMG = '044-76040-038.dmg', '044-76034-038.dmg'
 OS_IMAGE_SHA256 = 'e5634d04a8ac35f024845f583394e0a35deb26a04cb0c00286a8674e25a9a4f2'   # the raw OS disk, 6077580800 bytes
@@ -126,6 +127,12 @@ class Build:
         return run(['python3', self.tree / 'scripts' / name, *arguments], cwd=self.tree, env=self.env,
                    logfile=logfile or self.logs / (Path(name).stem + '.log'), check=check)
 
+    def sync_sources(self):
+        """Every git source at the commit feeds.toml pins (UniXNU's and this repository's; all are pinned). For this board's
+        format the local unixnu.lock (not in git) would win over a pin, so a bumped pin -- a new ownervisor, say -- reached an
+        existing checkout only with --update; a clone already at its pin is not contacted."""
+        self.unixnu_cmd('fetch', '--update', logfile=self.logs / 'fetch.log')
+
     # setup ---------------------------------------------------------------------------------------------------------------
     def step_setup(self):
         if self.args.ipsw_cache:
@@ -134,7 +141,7 @@ class Build:
                 if source.is_file() and not source.name.endswith('.partial') and not (self.ipsw / source.name).exists():
                     clone(source, self.ipsw / source.name)
         self.unixnu_cmd('defconfig', self.board['kernel']['defconfig'], '-D', DEVICE)
-        self.unixnu_cmd('fetch', logfile=self.logs / 'fetch.log')
+        self.sync_sources()
         self.unixnu_cmd('ipsw', 'fetch', logfile=self.logs / 'ipsw-fetch.log')
         # The root disks and the policies over them need the OS and SystemOS volumes too (about 9 GiB).
         self.unixnu_cmd('ipsw', 'fetch', 'OS', 'Cryptex1,SystemOS', logfile=self.logs / 'ipsw-fetch-volumes.log')
@@ -516,6 +523,7 @@ class Build:
         forced = set(self.args.only.split(',')) if self.args.only else (
             set(STEPS[STEPS.index(self.args.from_step):]) if self.args.from_step else set())
         if self.stamp('setup').is_file() and 'setup' not in wanted:
+            self.sync_sources()
             # The tree holds copies of the scripts (UniXNU's with this repository's over them), made when unixnu assembles it:
             # assemble it again, or a step would run the scripts as an earlier run left them.
             self.unixnu_cmd('tree', logfile=self.logs / 'tree.log')
