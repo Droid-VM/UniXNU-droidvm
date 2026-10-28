@@ -3,9 +3,10 @@
 # VM is stopped and deleted with everything in its directory (images, Data store and their copies), and a new VM with a new id
 # gets the release's boot disk, OS and SystemOS disks, the firmware, an empty Data store and the VM config of
 # unixnu-vm.template.json, then boots.
-#   fresh-deploy.sh [--build] [--yes]
-#     --build   run build-droidvm-all.py on the Mac first (BUILD_REPO; IPSW_CACHE passes --ipsw-cache)
-#     --yes     do not ask before deleting the old VM
+#   fresh-deploy.sh [--build] [--yes] [--keep-files]
+#     --build        run build-droidvm-all.py on the Mac first (BUILD_REPO; IPSW_CACHE passes --ipsw-cache)
+#     --yes          do not ask before deleting the old VM
+#     --keep-files   keep the VM directory as an earlier run left it: only the VM is made again (and booted)
 # Needs PHONE, DVMIPC, BUILD_HOST, BUILD_OUT (out/droidvm of the release's checkout), BUILD_REPO (the device repository there),
 # EDK2_FD (the edk2-gunyah firmware with the virtio-gpu GOP: the meta repo's edk2-gunyah/edk2-gunyah.fd) and unique-chip-id.txt
 # beside this script; CROSVM_BIN, when set, replaces the app's crosvm (the VM's sound, battery and media devices need the
@@ -27,9 +28,9 @@ APP=cn.classfun.droidvm
 FILES=/data/user/0/$APP/files
 RUN=/data/data/$APP/run
 O=$RIG/out
-BUILD=0; YES=0
+BUILD=0; YES=0; KEEP=0
 for arg in "$@"; do
-  case "$arg" in --build) BUILD=1 ;; --yes) YES=1 ;; *) sed -n '2,15p' "$0"; exit 2 ;; esac
+  case "$arg" in --build) BUILD=1 ;; --yes) YES=1 ;; --keep-files) KEEP=1 ;; *) sed -n '2,16p' "$0"; exit 2 ;; esac
 done
 mkdir -p "$O/release"
 [ -f "$FD" ] || { echo "no firmware $FD"; exit 1; }
@@ -77,7 +78,8 @@ print(' '.join(dict.fromkeys(ids)))" "$O/vms.json.before" "$O/vm_list.before" "$
 echo "VMs named \"$NAME\": ${OLD:-none}"
 $A shell "su -c 'ls -la $DIR 2>/dev/null'" || true
 if [ $YES = 0 ]; then
-  read -r -p "delete them and everything in $DIR? [y/N] " answer
+  [ $KEEP = 1 ] && what="delete them" || what="delete them and everything in $DIR"
+  read -r -p "$what? [y/N] " answer
   [ "$answer" = y ] || exit 1
 fi
 if [ -n "$(adb -s "$PHONE" shell "su -c 'for p in \$(pidof crosvm); do tr \"\\0\" \" \" < /proc/\$p/cmdline | grep -q UniXNU && echo \$p; done'" | tr -dc 0-9)" ]; then
@@ -87,10 +89,11 @@ for id in $OLD; do ipc vm_delete "{\"vm_id\":\"$id\"}" | grep -E '"(success|exis
 # The app keeps its own copy of vms.json in memory and writes it back: stop it before the file changes.
 $A shell "am force-stop $APP"
 $A shell "su -c 'cp $FILES/vms.json $FILES/vms.json.bak-fresh-$(date +%Y%m%d-%H%M%S)'"
+
+if [ $KEEP = 0 ]; then
+echo "== the new VM's files"
 $A shell "su -c 'rm -rf $MEDIA'"
 $A shell "mkdir -p $DIR"               # through the shared storage, which gives it the owner the app's other VM directories have
-
-echo "== the new VM's files"
 for f in os.img systemos.img; do $A push "$O/release/$f" "$DIR/$f" | tail -1; done
 $A push "$FD" "$DIR/edk2-virtio-gpu.fd" | tail -1
 "$RIG/deploy.sh"                       # the release's boot disk (payload/droidvm-disk.img), with the early probes, and kernel.nm
@@ -103,13 +106,14 @@ if [ -n "${CROSVM_BIN:-}" ]; then
     echo "crosvm: the app has CROSVM_BIN already"
   fi
 fi
+fi
 
 echo "== the new VM"
 NET=$(adb -s "$PHONE" shell "su -c 'cat $FILES/networks.json'" | python3 -c "
 import json, sys
 nets = [n for n in json.load(sys.stdin)['networks'] if n.get('bridge_name') == 'br-wifi' or n.get('name') == 'br-wifi']
 sys.exit('no br-wifi network in the app') if not nets else print(nets[0]['id'])")
-UID_=$($A shell "dumpsys package $APP" | grep -m1 -oE 'userId=[0-9]+' | cut -d= -f2)
+UID_=$($A shell "su -c 'stat -c %u /data/data/$APP'" | tr -dc 0-9)     # the app's uid: the sound and media helpers run as it
 ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
 python3 - "$RIG/unixnu-vm.template.json" "$RIG/unixnu-vm.config.json" "$ID" "$NET" "$UID_" "$DIR" "$MEDIA" <<'PY'
 import json, sys
