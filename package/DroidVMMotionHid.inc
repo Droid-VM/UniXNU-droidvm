@@ -35,7 +35,7 @@ class DroidVMMotionHid : public IOHIDDevice {
     unsigned kind = DROIDVM_MOTION_ACCELEROMETER;
     uint32_t lastSeq = 0;
     int32_t lastOrientation = -1;
-    uint64_t orientationSentAt = 0;
+    uint64_t orientationSentAt = 0, orientationChangedAt = 0;
 
     // The vector sensors: three signed 32-bit fields, logical and physical range +-1000000, unit exponent -3, so
     // IOHIDEventDriver's exponent scaling gives the value in thousandths as the event's IOFixed: milli-g (accelerometer),
@@ -69,11 +69,15 @@ class DroidVMMotionHid : public IOHIDDevice {
         self->lastSeq = before;
         IOBufferMemoryDescriptor *buffer = nullptr;
         if (self->kind == DROIDVM_MOTION_ORIENTATION) {
-            // The event goes out when a bit turns on: on a change, and every 2 s again (all bits off, then the bit), because a
-            // client that opens the service later -- backboardd, well after this device's first report -- hears only events.
-            uint64_t now = mach_absolute_time(), period = 0;
-            nanoseconds_to_absolutetime(2000000000ULL, &period);
+            // The event goes out when a bit turns on: on a change, and again later (all bits off, then the bit), because a
+            // client that opens the service after the report -- backboardd at boot, or restarted -- hears only events. Every
+            // 2 s for 2 minutes after a change (boot included), then every 30 s: each one is a backboardd log line and an
+            // event to SpringBoard.
+            uint64_t now = mach_absolute_time(), period = 0, settled = 0;
+            nanoseconds_to_absolutetime(120000000000ULL, &settled);
             if (orientation < 0 || orientation > 6) return;
+            if (orientation != self->lastOrientation) self->orientationChangedAt = now;
+            nanoseconds_to_absolutetime(now - self->orientationChangedAt < settled ? 2000000000ULL : 30000000000ULL, &period);
             if (orientation == self->lastOrientation && now - self->orientationSentAt < period) return;
             if (orientation == self->lastOrientation) {
                 struct __attribute__((packed)) { uint8_t bits; uint64_t time; } none = {0, now};

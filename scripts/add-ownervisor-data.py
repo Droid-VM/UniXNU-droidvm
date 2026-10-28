@@ -12,7 +12,6 @@ Baked under /private/var/ngpu (the writable Data volume):
   bin/ownervisor bin/ownerctl bin/ownertest     the trusted binaries (build/droidvm-ownervisor, build-droidvm-ownervisor.py)
   ownervisor/services.d/adrenoprobe.json         exec adrenoprobed once (GPU probe), enabled
   ownervisor/services.d/selftest.json            exec ownertest (proves owner->owner spawn under AMFI), enabled
-  ownervisor/services.d/orientd.json             exec gfxprobe orient-follow (motion sensors -> device orientation), enabled
 BASE is not modified and the volume UUID is unchanged."""
 import json
 import os
@@ -86,7 +85,7 @@ def main():
                 ssh_dir.mkdir(parents=True, exist_ok=True)
                 os.chmod(ssh_dir, 0o700)
             # gfxprobe: the GPU and display probes (scripts/build-droidvm-gfxprobe.py), whose orient-follow keeps backboardd's
-            # device orientation where the guest's motion sensors say (the orientd service below). Optional.
+            # device orientation where the guest's motion sensors say, by hand only (no service runs it). Optional.
             gfxprobe = ROOT / 'build/gfxprobe/gfxprobe'
             if gfxprobe.is_file():
                 shutil.copyfile(gfxprobe, bin_dir / 'gfxprobe')
@@ -107,10 +106,8 @@ def main():
                 # address on 2222; the login shell is zsh. Needs the rig's key at /private/var/ngpu/ssh/authorized_keys.
                 services['dropbear'] = {'exec': [
                     '/private/var/ngpu/bin/dropbear', '-F', '-E', '-R', '-p', '2222'], 'keepalive': True, 'throttle': 5}
-            if gfxprobe.is_file():
-                # A VM without motion sensors has no kern.droidvm_motion; orient-follow then waits for it quietly.
-                services['orientd'] = {'exec': ['/private/var/ngpu/bin/gfxprobe', 'orient-follow'], 'keepalive': True,
-                                       'throttle': 5}
+            # No orientd: backboardd takes the device orientation from CoreMotion and the kernel's motion HID services
+            # (package/DroidVMMotionHid.inc) since 2026-10-28; `gfxprobe orient-follow` stays for debugging by hand.
             svc_dir, en_dir = mount / 'ngpu/ownervisor/services.d', mount / 'ngpu/ownervisor/enabled'
             for d in (mount / 'ngpu/ownervisor', svc_dir, en_dir):
                 d.mkdir(parents=True, exist_ok=True)
