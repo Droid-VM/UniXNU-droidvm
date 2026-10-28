@@ -98,6 +98,15 @@ def main():
                 if tool.is_file():
                     shutil.copyfile(tool, bin_dir / name)
                     os.chmod(bin_dir / name, 0o755)
+            # libimobiledevice (build-droidvm-libimobiledevice.py): one multicall binary for its tools, iproxy, inetcat and
+            # plistutil, each name a link to it (it runs the tool argv[0] names). Optional.
+            limd = ROOT / 'build/libimobiledevice/libimobiledevice'
+            if limd.is_file():
+                shutil.copyfile(limd, bin_dir / 'libimobiledevice')
+                os.chmod(bin_dir / 'libimobiledevice', 0o755)
+                for name in json.loads((ROOT / 'build/owner-trust-extra/libimobiledevice.json').read_text())['commands']:
+                    (bin_dir / name).unlink(missing_ok=True)
+                    os.symlink('libimobiledevice', bin_dir / name)
             # The managed services. ownervisor creates run/log/state/control at startup; the seed carries the
             # definitions and the enable markers so they autostart from the first boot.
             # 'autostart' (a staging flag, stripped from the json) decides whether an enable marker is written. adrenoprobe is

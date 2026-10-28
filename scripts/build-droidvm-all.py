@@ -19,7 +19,8 @@ Steps, in order:
              owner-root drivers, built in out-reference/ from a copy of this repository (only the archives such a kernel links)
   kernel     unixnu build kernel
   package    unixnu build package (UniXNU.efi) and DarwinBoot.efi
-  tools      the owner tools (ownervisor, toybox, zsh, dropbear, gfxprobe, lsdiag, applebox, ipatool, debugserver)
+  tools      the owner tools (ownervisor, toybox, zsh, dropbear, gfxprobe, lsdiag, applebox, ipatool, debugserver,
+             libimobiledevice)
   plugin     the Metal plugin (AdrenoMetal frontend, metal2vulkan, Turnip)
   data       the plugin and the owner tools staged into the Data seed, grown to --data-gib
   trust      the owner trust bundle (plugin, tools, the original modules)
@@ -43,7 +44,7 @@ DEVICE = Path(__file__).resolve().parents[1]
 STEPS = ['setup', 'volumes', 'policies', 'data-base', 'reference', 'kernel', 'package', 'tools', 'plugin', 'data', 'trust',
          'payload', 'images']
 # The owner tools, in build order: each writes build/<name>/... and build/owner-trust-extra/<name>.json.
-TOOLS = ['ownervisor', 'toybox', 'zsh', 'dropbear', 'gfxprobe', 'lsdiag', 'applebox', 'ipatool', 'debugserver']
+TOOLS = ['ownervisor', 'toybox', 'zsh', 'dropbear', 'gfxprobe', 'lsdiag', 'applebox', 'ipatool', 'debugserver', 'libimobiledevice']
 # What a member of the IPSW is called (board.toml [ipsw.sha256] pins both).
 OS_DMG, SYSTEMOS_DMG = '044-76040-038.dmg', '044-76034-038.dmg'
 OS_IMAGE_SHA256 = 'e5634d04a8ac35f024845f583394e0a35deb26a04cb0c00286a8674e25a9a4f2'   # the raw OS disk, 6077580800 bytes
@@ -220,7 +221,11 @@ class Build:
 
     def seed_chain(self, base, chain):
         """Make each seed of CHAIN ([(name, [script, args...])]) from the one before; '{base}' and '{out}' place the two
-        seeds in the arguments, which are otherwise BASE OUTPUT after them. Returns the last one."""
+        seeds in the arguments, which are otherwise BASE OUTPUT after them. Returns the last one. The step runs because its
+        inputs changed (a tool, the plugin, a seed script), so every seed of the chain is made again."""
+        for name, _ in chain:
+            (self.data / name).unlink(missing_ok=True)
+            (self.data / name).with_suffix('.json').unlink(missing_ok=True)
         for name, command in chain:
             output = self.data / name
             if not output.is_file():
@@ -510,6 +515,10 @@ class Build:
             wanted = STEPS[start:end]
         forced = set(self.args.only.split(',')) if self.args.only else (
             set(STEPS[STEPS.index(self.args.from_step):]) if self.args.from_step else set())
+        if self.stamp('setup').is_file() and 'setup' not in wanted:
+            # The tree holds copies of the scripts (UniXNU's with this repository's over them), made when unixnu assembles it:
+            # assemble it again, or a step would run the scripts as an earlier run left them.
+            self.unixnu_cmd('tree', logfile=self.logs / 'tree.log')
         for step in wanted:
             if step not in STEPS:
                 sys.exit(f'unknown step {step}; steps: {" ".join(STEPS)}')
