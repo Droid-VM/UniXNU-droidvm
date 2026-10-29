@@ -46,6 +46,9 @@ archives = [
   # build sheng's whole GPU driver); their checkouts are linked into the tree first.
   "link-droidvm-gpu-sources.py",
   "build-droidvm-gpu.py",
+  # Touch, keyboard and motion sensors (scripts/build-droidvm-hid-input.py): NativeHidInput under the original IOHIDDevice of the
+  # fileset, fed by the app's virtio-input devices; its objects ride in the display archive as well.
+  "build-droidvm-hid-input.py",
   "build-droidvm-legacy-display.py",
 ]
 
@@ -100,6 +103,10 @@ kernel_args = [
   "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1",
   "offline-key-events=1",
+  # The HID device (HidInputProbe.cpp) with the Home button and touch, as package/DroidVMBootArgs.c.
+  "offline-hid-input=1",
+  "offline-hid-home=1",
+  "sheng-touch-hid=1",
   "sheng-aks=1",
   "sheng-aks-sls=3",
   # The host's file mailbox (tools/rig export.py, crashes.py), answered by the droidvm-monitor worker.

@@ -52,7 +52,11 @@ constexpr uint64_t GuestPage = 16384;
 constexpr uint64_t PaddingBytes = 4 * GuestPage;
 IOBufferMemoryDescriptor *padding;
 uint64_t paddingAddress;
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+Entry *entries;            // worker-owned scratch, allocated when the display starts (the native __DATA of a fileset has no room)
+#else
 Entry entries[MaxEntries]; // worker-owned scratch, never shared with another producer
+#endif
 IOLock *frameLock;
 Frame pending;
 bool started, compositor, bootDirty;
@@ -267,6 +271,9 @@ extern "C" void droidvm_virtio_gpu_display_start(void) {
     unsigned blob = 1; PE_parse_boot_argn("droidvm-virtio-gpu-blob", &blob, sizeof blob);
     droidvm_virtio_display_blob = blob && ((DroidVMVirtioGpu::features() & 0x48) == 0x48);
     frameLock = IOLockAlloc(); if (!frameLock) { droidvm_virtio_display_state = 3; return; }
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+    entries = IONew(Entry, MaxEntries); if (!entries) { droidvm_virtio_display_state = 3; return; }
+#endif
     padding = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
         IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), PaddingBytes, ~uint64_t(4095));
     if (padding && padding->prepare() == kIOReturnSuccess) {

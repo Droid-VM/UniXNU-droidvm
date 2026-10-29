@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // DroidVM: the motion sensors as the stock iPad has them, so CoreMotion and backboardd read them the stock way.
 //
-// Appended by scripts/build-native-legacy-display.py to its staged NativeHidInput.cpp: the same IOHIDDevice ABI
-// (OriginalHidDeviceABI.h), and the translation unit whose late static initializer HidInputProbe.cpp runs, so this class's
-// metaclass is registered with NativeHidInput's.
+// Appended by scripts/build-native-legacy-display.py (ipados27/scripts/build-droidvm-hid-input.py on iPadOS 27) to its staged
+// NativeHidInput.cpp: the same IOHIDDevice ABI (OriginalHidDeviceABI.h, or the public header), and the translation unit whose
+// late static initializer HidInputProbe.cpp runs, so this class's metaclass is registered with NativeHidInput's.
 //
 // Three devices, as the iPad's sensor processor publishes them, each found by its primary usage pair (the descriptor's first
 // application collection):
@@ -27,6 +27,13 @@ extern struct droidvm_motion droidvm_motion;
 }
 
 enum { DROIDVM_MOTION_ACCELEROMETER, DROIDVM_MOTION_GYROSCOPE, DROIDVM_MOTION_ORIENTATION };
+// An input report: the public IOHIDDevice header (NATIVE_HID_SOURCE_API, iPadOS 27) types it IOHIDReportType, the iPadOS 17
+// generated ABI header an unsigned.
+#if defined(NATIVE_HID_SOURCE_API) && NATIVE_HID_SOURCE_API
+#define DROIDVM_MOTION_INPUT_REPORT kIOHIDReportTypeInput
+#else
+#define DROIDVM_MOTION_INPUT_REPORT 0
+#endif
 
 class DroidVMMotionHid : public IOHIDDevice {
     OSDeclareDefaultStructors(DroidVMMotionHid)
@@ -82,7 +89,7 @@ class DroidVMMotionHid : public IOHIDDevice {
             if (orientation == self->lastOrientation) {
                 struct __attribute__((packed)) { uint8_t bits; uint64_t time; } none = {0, now};
                 IOBufferMemoryDescriptor *clear = IOBufferMemoryDescriptor::withBytes(&none, sizeof(none), kIODirectionNone);
-                if (clear) self->handleReport(clear, 0, 0);
+                if (clear) self->handleReport(clear, DROIDVM_MOTION_INPUT_REPORT, 0);
                 OSSafeReleaseNULL(clear);
             }
             self->lastOrientation = orientation;
@@ -98,7 +105,7 @@ class DroidVMMotionHid : public IOHIDDevice {
             }
             buffer = IOBufferMemoryDescriptor::withBytes(report, sizeof(report), kIODirectionNone);
         }
-        if (buffer) self->handleReport(buffer, 0, 0);
+        if (buffer) self->handleReport(buffer, DROIDVM_MOTION_INPUT_REPORT, 0);
         OSSafeReleaseNULL(buffer);
     }
 

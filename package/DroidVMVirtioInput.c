@@ -26,6 +26,9 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
+#if DROIDVM_INPUT_DYNAMIC
+#include <vm/vm_kern_xnu.h>
+#endif
 
 extern void IOSleep(unsigned milliseconds);
 
@@ -59,8 +62,32 @@ struct droidvm_input_event { uint16_t type, code; int32_t value; };
 _Static_assert(sizeof(struct droidvm_input_desc) == 16 && sizeof(struct droidvm_input_event) == 8, "VirtIO wire layout");
 
 // One page per queue: descriptors at 0, the driver ring at 1024, the device ring at 2048 (64 entries fit).
+#if DROIDVM_INPUT_DYNAMIC
+// A board whose kernel data has no room for them (the iPadOS 27 fileset: the native __DATA must fit the original kernel's slot)
+// takes each device's two queue pages and its event page from the kernel map when the device starts; each lies in one page, so
+// each page's own physical address is all the device needs.
+extern uint64_t kvtophys(vm_offset_t va);
+static uint8_t *droidvm_input_pages[DROIDVM_INPUT_DEVICES];
+static bool input_pages(unsigned index) {
+    vm_offset_t address = 0;
+    if (droidvm_input_pages[index]) return true;
+    if (kmem_alloc(kernel_map, &address, 3 * 4096, KMA_KOBJECT | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
+        return false;
+    droidvm_input_pages[index] = (uint8_t *)address;
+    return true;
+}
+static uint64_t input_physical(const void *address) { return kvtophys((vm_offset_t)address); }
+#define DROIDVM_INPUT_QUEUE(index, queue) (droidvm_input_pages[index] + (queue) * 4096)
+#define DROIDVM_INPUT_BUFFER(index) ((struct droidvm_input_event *)(droidvm_input_pages[index] + 2 * 4096))
+#else
 static uint8_t droidvm_input_queues[DROIDVM_INPUT_DEVICES][2][4096] __attribute__((aligned(4096)));
 static struct droidvm_input_event droidvm_input_buffers[DROIDVM_INPUT_DEVICES][DROIDVM_INPUT_BUFFERS] __attribute__((aligned(4096)));
+static bool input_pages(unsigned index) { (void)index; return true; }
+static uint64_t input_physical(const void *address) { return ml_static_vtop((vm_offset_t)address); }
+#define DROIDVM_INPUT_QUEUE(index, queue) droidvm_input_queues[index][queue]
+#define DROIDVM_INPUT_BUFFER(index) droidvm_input_buffers[index]
+#endif
+_Static_assert(DROIDVM_INPUT_BUFFERS * sizeof(struct droidvm_input_event) <= 4096, "one page of event buffers");
 
 struct droidvm_input {
     uintptr_t registers;
@@ -156,7 +183,7 @@ static bool input_queue(struct droidvm_input *d, unsigned queue, uint16_t size, 
     if (input_read32(d, 0x44) || input_read32(d, 0x34) < size) return false;
     memset(page, 0, 4096);
     *(volatile uint16_t *)(page + 1024) = 1;   // VIRTQ_AVAIL_F_NO_INTERRUPT: this driver polls
-    uint64_t physical = ml_static_vtop((vm_offset_t)page);
+    uint64_t physical = input_physical(page);
     input_barrier();
     input_write32(d, 0x38, size);
     input_write64(d, 0x80, physical);
@@ -179,13 +206,14 @@ static const char *input_start(struct droidvm_input *d) {
     input_write32(d, 0x20, 1);
     input_write32(d, 0x70, 11);
     if (!(input_read32(d, 0x70) & 8)) return "features refused";
-    uint8_t *events = droidvm_input_queues[d->index][0], *status = droidvm_input_queues[d->index][1];
+    if (!input_pages(d->index)) return "no queue pages";
+    uint8_t *events = DROIDVM_INPUT_QUEUE(d->index, 0), *status = DROIDVM_INPUT_QUEUE(d->index, 1);
     d->size = DROIDVM_INPUT_BUFFERS;
     if (!input_queue(d, 0, d->size, events)) return "event queue";
     if (!input_queue(d, 1, 8, status)) return "status queue";   // crosvm wants both; nothing is ever sent on it
     struct droidvm_input_desc *descriptors = (struct droidvm_input_desc *)events;
     volatile uint16_t *available = (volatile uint16_t *)(events + 1024);
-    uint64_t buffers = ml_static_vtop((vm_offset_t)droidvm_input_buffers[d->index]);
+    uint64_t buffers = input_physical(DROIDVM_INPUT_BUFFER(d->index));
     for (uint16_t i = 0; i < d->size; ++i) {
         descriptors[i] = (struct droidvm_input_desc){buffers + i * sizeof(struct droidvm_input_event),
                                                      sizeof(struct droidvm_input_event), 2, 0};
@@ -459,7 +487,7 @@ static bool input_event(struct droidvm_input *d, const struct droidvm_input_even
 
 // Takes what the device wrote, frame by frame, and gives the buffers back.
 static void input_poll(struct droidvm_input *d) {
-    uint8_t *page = droidvm_input_queues[d->index][0];
+    uint8_t *page = DROIDVM_INPUT_QUEUE(d->index, 0);
     volatile uint16_t *available = (volatile uint16_t *)(page + 1024);
     volatile uint16_t *used = (volatile uint16_t *)(page + 2048);
     const volatile uint32_t *ring = (const volatile uint32_t *)(page + 2052);
@@ -469,7 +497,7 @@ static void input_poll(struct droidvm_input *d) {
         input_barrier();
         uint32_t id = ring[(d->used % d->size) * 2];
         if (id < d->size) {
-            if (input_event(d, &droidvm_input_buffers[d->index][id])) {
+            if (input_event(d, &DROIDVM_INPUT_BUFFER(d->index)[id])) {
                 droidvm_input_frames = droidvm_input_frames + 1;
                 if (d->kind == KIND_KEYBOARD) keyboard_publish(d);
                 else if (d->kind == KIND_MOTION) motion_publish(d);

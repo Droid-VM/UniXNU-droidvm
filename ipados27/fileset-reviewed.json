@@ -245,6 +245,21 @@
       "original": "0xfffffe000b5920cc",
       "native_symbol": "_panic_with_options",
       "evidence": "panic_trap_to_debugger(str, &args, reason, ctx, mask & ~0x200, NULL, return address, NULL) with four fixed arguments (reason, ctx, mask, str): panic_with_options of osfmk/kern/debug.c, between the paired Assert and panic_with_options_and_initiator (panic_with_data has five)."
+    },
+    {
+      "original": "0xfffffe000b430ab8",
+      "native_symbol": "__ZN9IOService12Start_InvokeE5IORPCP15OSMetaClassBasePFiS2_PS_E",
+      "evidence": "An IIG *_Invoke: checks the IORPC message (2 descriptors, at least 0x6c bytes, reply 0x3c), casts its object argument to IOService (IOService::gMetaClass) and carries the method's 64-bit message ID f293d6e6dd766fab in its constants, which is IOService::Start's in the native kernel's generated IOService.iig code. IOHIDFamily and IOStorageFamily import it (their Dispatch); called when NativeHidInput started."
+    },
+    {
+      "original": "0xfffffe000b430bd4",
+      "native_symbol": "__ZN9IOService11Stop_InvokeE5IORPCP15OSMetaClassBasePFiS2_PS_E",
+      "evidence": "The same IIG Invoke shape with an IOService argument and message ID a59f451c0415e798, IOService::Stop's (Stop_async's handler returns void and has no reply status; it is a shorter body)."
+    },
+    {
+      "original": "0xfffffe000b431200",
+      "native_symbol": "__ZN9IOService20SetProperties_InvokeE5IORPCP15OSMetaClassBasePFiS2_P12OSDictionaryE",
+      "evidence": "The same IIG Invoke shape with an OSDictionary argument (OSDictionary::gMetaClass) and message ID 62916f15ea53a7d8, IOService::SetProperties's; the only Invoke of the generated code that casts to OSDictionary. Imported by IOHIDFamily."
     }
   ],
   "data": [
