@@ -11,7 +11,7 @@ saved pairing (out/.../kernel/kernel.map.json), which the next prelink reuses wh
     unixnu build prelink -D <repo>/ipados27       (emits again with these pairings)
 
 Upstream's own reviewed identities (kits/XnuPrelink/fixtures) cover what sheng's kernel needed; these are the ones this kernel's
-boot reached unpaired.
+boot reached unpaired, and (under "data") the kernel data the kexts reference that it left unpaired.
 """
 import argparse
 import json
@@ -37,19 +37,25 @@ def main():
     if reviewed['kernelcache_sha256'] != pairing['inputs']['kernelcache_sha256']:
         raise SystemExit('the reviewed pairings are for another kernelcache')
     taken = {entry['native']: original for original, entry in pairing['functions'].items()}
-    for record in reviewed['functions']:
+    for record in reviewed['functions'] + reviewed.get('data', []):
         if not record.get('evidence'):
             raise SystemExit(f'{record["original"]}: a reviewed pairing needs its evidence')
         if record['native_symbol'] not in names:
             raise SystemExit(f'{record["native_symbol"]}: not in this kernel')
+    for record in reviewed['functions']:
         address = hex(names[record['native_symbol']])
         other = taken.get(address)
         if other and other != record['original']:
             print(f'note: {record["native_symbol"]} was also paired with {other}')
         pairing['functions'][record['original']] = {'native': address, 'name': record['native_symbol'], 'addend': 0,
                                                      'how': 'reviewed'}
+    # Data the kexts reference that the matcher left unpaired: the emitter keeps such a reference at the original address plus the
+    # collection slide, which lands in some native object (kernel.json "missing"), so each is named here too.
+    for record in reviewed.get('data', []):
+        pairing['data'][record['original']] = {'native': hex(names[record['native_symbol']]), 'name': record['native_symbol'],
+                                                'how': 'reviewed', 'sections': record.get('sections', ['?', '?'])}
     args.map.write_text(json.dumps(pairing, indent=2) + '\n')
-    print(f'{len(reviewed["functions"])} reviewed pairings in {args.map}')
+    print(f'{len(reviewed["functions"])} reviewed function and {len(reviewed.get("data", []))} data pairings in {args.map}')
 
 
 if __name__ == '__main__':

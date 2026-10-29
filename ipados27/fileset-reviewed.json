@@ -246,5 +246,43 @@
       "native_symbol": "_panic_with_options",
       "evidence": "panic_trap_to_debugger(str, &args, reason, ctx, mask & ~0x200, NULL, return address, NULL) with four fixed arguments (reason, ctx, mask, str): panic_with_options of osfmk/kern/debug.c, between the paired Assert and panic_with_options_and_initiator (panic_with_data has five)."
     }
+  ],
+  "data": [
+    {
+      "original": "0xfffffe000b8910b0",
+      "native_symbol": "_vnop_getnamedstream_desc",
+      "sections": [
+        "__DATA,__data",
+        "__DATA,__data"
+      ],
+      "evidence": "A struct vnodeop_desc whose vdesc_name is \"vnop_getnamedstream\"; vnode_getnamedstream reads it (a_desc and vdesc_offset). APFS's vnode operation table names it: left unpaired, the entry pointed into native zone data and vfs_fsadd faulted on it (\"Ignoring reference ... to disabled operation .\", then a data abort)."
+    },
+    {
+      "original": "0xfffffe000b8910f0",
+      "native_symbol": "_vnop_makenamedstream_desc",
+      "sections": [
+        "__DATA,__data",
+        "__DATA,__data"
+      ],
+      "evidence": "The struct vnodeop_desc named \"vnop_makenamedstream\", next to vnop_getnamedstream's; in APFS's vnode operation table."
+    },
+    {
+      "original": "0xfffffe000b891130",
+      "native_symbol": "_vnop_removenamedstream_desc",
+      "sections": [
+        "__DATA,__data",
+        "__DATA,__data"
+      ],
+      "evidence": "The struct vnodeop_desc named \"vnop_removenamedstream\", next to vnop_makenamedstream's; in APFS's vnode operation table."
+    },
+    {
+      "original": "0xfffffe000b8bda38",
+      "native_symbol": "_audio_active",
+      "sections": [
+        "__DATA,__common",
+        "__DATA,__common"
+      ],
+      "evidence": "The arg1 of the sandbox's sysctl OID \"audio_active\" (\"Audio active\", format I): a 32-bit kernel global that the EXC_RESOURCE path reads as `disable_exc_resource_during_audio && audio_active && task->task_jetsam_realtime_audio` (osfmk/kern/task.c, exported in Private.exports)."
+    }
   ]
 }
