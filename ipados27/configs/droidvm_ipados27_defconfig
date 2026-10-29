@@ -2,8 +2,8 @@
 # The configuration fragments of the arm64e and iPadOS 27 profiles come first (board.toml [kernel] config_fragments); this file
 # holds what the board adds or changes.
 #
-# Bring-up step 1: the kernel with the board's XNU changes, its CPU and device tree drivers and no storage, owner chain or display
-# (those of the iPadOS 17 board, configs/droidvm_defconfig one level up, come over one at a time).
+# The kernel with the board's XNU changes, its CPU and device tree drivers, and the disks with the owner chain of the iPadOS 17
+# board (configs/droidvm_defconfig one level up) over the source storage of iPadOS 27; no display or GPU yet.
 
 CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
@@ -21,7 +21,21 @@ CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_KERNEL_CHAINED_FIXUPS=y
 # and matches it against a RELEASE build of the same source (build/xnu/fileset-reference, the OS profile's --fileset-reference).
 CONFIG_XNU_FILESET_REFERENCE=y
-CONFIG_XNU_EXTRA_LD_ARCHIVES=""
+# The disks: build/droidvm-source-storage (scripts/build-droidvm-source-storage.py) instead of the iPadOS 17 board's
+# NativeVirtioBlock personality and verified-root bundle. Their root policies come from the firmware (RootPolicies).
+CONFIG_XNU_SOURCE_STORAGE=y
+CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/droidvm-source-storage/libDroidVMSourceStorage.a"
+CONFIG_XNU_OWNER_ROOT_AUDIT=y
+CONFIG_XNU_OWNER_ROOT_TRUST=y
+# SystemOS cryptex, boot manifest and the writable Data volume from the Data seed's RAM disk, as on iPadOS 17.
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+# APFS volume UUID of the iPadOS 27 Data seed; a placeholder until that seed exists (a new seed has a new UUID).
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="00000000-0000-4000-8000-000000002701"
 CONFIG_XNU_ARMVIRT_PLATFORM=n
 CONFIG_XNU_NATIVE_UFS=n
 CONFIG_XNU_SHENG_PMGR=n

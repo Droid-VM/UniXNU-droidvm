@@ -1,0 +1,19 @@
+The weak hook that starts a board's source-built storage after the IOKit bootstrap (native_source_storage_start, here
+package/DroidVMSourceStorage.cpp: the public IOBlockStorageDevice under the original class, then the virtio disks and the Data
+seed); upstream sheng's patches/xnu-12377/source-storage-runtime.patch.
+
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 2591e0f..3907c55 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -787,6 +787,10 @@ bsd_init(void)
+ 	/* Initialize the file systems. */
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
++	/* Optional source storage runtime registers after the IOKit bootstrap. */
++	extern void native_source_storage_start(void) __attribute__((weak_import));
++	if (&native_source_storage_start)
++		native_source_storage_start();
+ #if DEVELOPMENT || DEBUG
+ 	native_apfs_load_probe();
+ 	native_mobile_graphics_load_probe();
