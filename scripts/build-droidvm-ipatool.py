@@ -13,12 +13,17 @@ Staged with
 and run as root (install's register step as mobile, -u 501) over ssh or by ownervisor. An app only *runs* once its Mach-Os are
 trusted (boot trust cache or the planned runtime-trust SPI); ipatool reports the CDHashes, it does not grant trust."""
 import json
+import os
 import plistlib
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+# DROIDVM_IOS_TARGET picks the build: arm64-apple-ios17.0 (the default) or arm64e-apple-ios27.0 (iPadOS 27 runs no arm64 platform
+# binaries: it killed them at exec).
+TARGET = os.environ.get('DROIDVM_IOS_TARGET', 'arm64-apple-ios17.0')
+ARCH, IOS = TARGET.split('-', 1)[0], TARGET.rsplit('ios', 1)[1]
 
 FORK = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else sys.exit(__doc__)
 SOURCE = Path(__file__).resolve().parents[1] / 'package/ipatool/ipatool.m'
@@ -36,7 +41,7 @@ shim.mkdir(exist_ok=True)
 shutil.copyfile(macos_sdk + '/usr/include/zlib.h', shim / 'zlib.h')
 
 binary = OUT / 'ipatool'
-subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', iphone_sdk, f'-I{shim}',
+subprocess.run(['xcrun', 'clang', '-target', TARGET, '-isysroot', iphone_sdk, f'-I{shim}',
                 '-O2', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-framework', 'Foundation', '-framework', 'MobileCoreServices', '-lz',
                 SOURCE, '-o', binary], check=True)
 
@@ -63,5 +68,5 @@ extra = FORK / 'build/owner-trust-extra'
 extra.mkdir(parents=True, exist_ok=True)
 (extra / 'ipatool.json').write_text(json.dumps(
     {'cdhashes': [cdhash], 'category': 3, 'binary': 'build/ipatool/ipatool',
-     'source': 'package/ipatool/ipatool.m, iphoneos arm64'}, indent=2) + '\n')
+     'source': f'package/ipatool/ipatool.m, iphoneos {ARCH}'}, indent=2) + '\n')
 print('ipatool CDHash', cdhash)

@@ -13,8 +13,14 @@ char PE_builtin_boot_args[] =
     "owner-staged-apps=1 "
     // Data protection classes on a Data volume without content protection (the bring-up patch): PosterBoard's wallpaper store
     "owner-dataprotect=1 "
-    // owner binaries (ownervisor, the debug tools) run without the launch constraints of the trust cache category they lack
-    "owner-skip-launch-constraints=1 "
+    // the App cryptex's daemons and the owner binaries (ownervisor, the debug tools) run without the launch constraints of the
+    // platform category their trust entries lack (fork patches/xnu-12377/zzyc-owner-skip-launch-constraints.patch: sheng-no-lc;
+    // iPadOS 17's patch read owner-skip-launch-constraints): AMFI refused guidedbrowsingd and webinspectord from /private/preboot
+    "sheng-no-lc=1 "
+    // the App cryptex (Safari's daemons and settings) from the seed's /private/var/ngpu/preboot over /private/preboot, and the owner
+    // service manager (ownervisor: ssh on port 2222 and the debug shell), both started by the launch policy (DroidVMLaunchPolicy.c)
+    "owner-app-cryptex=1 "
+    "owner-service-manager=1 "
     // the processes besides the render server that get the accelerator's user client and a native Metal device, as on iPadOS 17
     // (DroidVMBootArgs.c): the launch policy writes the plugin's NativeAdrenoMetal.clients from it at every boot
     "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,com.apple.WebKit.*,Preferences,MetalCheck,app_ios,"

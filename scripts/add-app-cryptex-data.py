@@ -6,7 +6,8 @@ safarifetcherd, ...), SafariSupport.bundle and Safari's settings pane, which the
 through /System/Cryptexes/App. Here it is owner Data: its files go to /private/var/ngpu/preboot/Cryptexes/App, next to the mount
 points Cryptexes/OS/{System,usr} for the SystemOS volume's own directories, and the kernel shows that directory over the empty /private/preboot
 with owner-app-cryptex=1 (package/DroidVMLaunchPolicy.c). The binaries keep Apple's signatures and pass AMFI through the cryptex's own
-trust module, which the owner trust bundle carries unchanged (make-owner-trust-bundle.py). Only the pinned 21H461 cryptex is accepted.
+trust module, which the owner trust bundle carries unchanged (make-owner-trust-bundle.py; ipados27/scripts/build-droidvm-trust.py
+for iPadOS 27). Only the pinned cryptexes are accepted: 21H461's and 24A446's.
 BASE is not modified and the volume UUID is unchanged. Run where hdiutil may attach images (not on an external volume over ssh)."""
 import hashlib
 import json
@@ -22,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'drivers/DarwinBoot/Test'))
 import packed_ramdisk
 
-APP_CRYPTEX_SHA256 = '52e568e1eaaede5fde4684ad10afc60f8fb236bfb5a23e0869bb0ed8a1d275d7'   # 044-75188-038.dmg of 21H461
+APP_CRYPTEX_SHA256 = {'21H461': '52e568e1eaaede5fde4684ad10afc60f8fb236bfb5a23e0869bb0ed8a1d275d7',   # 044-75188-038.dmg
+                      '24A446': '37f1a44e69120d0a1bab947bb4d69714e2e0dcfb9a8d75c13b71df336463a408'}   # 043-69297-793.dmg
 
 
 def attach(image, mountpoint, raw=False):
@@ -42,8 +44,9 @@ def main():
     base, cryptex, output = (Path(a).resolve() for a in sys.argv[1:])
     if output.exists():
         sys.exit('Refuse to overwrite ' + str(output))
-    if hashlib.sha256(cryptex.read_bytes()).hexdigest() != APP_CRYPTEX_SHA256:
-        sys.exit('Not the App cryptex of 21H461: ' + str(cryptex))
+    digest = hashlib.sha256(cryptex.read_bytes()).hexdigest()
+    if digest not in APP_CRYPTEX_SHA256.values():
+        sys.exit('Not a pinned App cryptex (' + ', '.join(APP_CRYPTEX_SHA256) + '): ' + str(cryptex))
     blob = base.read_bytes()
     logical, extents = packed_ramdisk.regions(blob)
     with tempfile.TemporaryDirectory(prefix='data-seed-', dir=str(ROOT / 'build')) as td:
@@ -85,7 +88,7 @@ def main():
         if raw.read_bytes()[32:36] != b'NXSB':
             sys.exit('The edited image is no APFS container any more')
         metadata = packed_ramdisk.pack(raw, output)
-    report = dict(base_sha256=packed_ramdisk.inspect(base)[0]['sha256'], output=metadata, app_cryptex_sha256=APP_CRYPTEX_SHA256)
+    report = dict(base_sha256=packed_ramdisk.inspect(base)[0]['sha256'], output=metadata, app_cryptex_sha256=digest)
     output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
 

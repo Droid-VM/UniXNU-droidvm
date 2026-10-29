@@ -10,11 +10,16 @@ files staged into the Data overlay before a VM stop. Staged with
   export.py put build/gfxprobe/gfxprobe /private/var/ngpu/bin/gfxprobe 0755
 and run as root over ssh."""
 import json
+import os
 import plistlib
 import re
 import subprocess
 import sys
 from pathlib import Path
+# DROIDVM_IOS_TARGET picks the build: arm64-apple-ios17.0 (the default) or arm64e-apple-ios27.0 (iPadOS 27 runs no arm64 platform
+# binaries: it killed them at exec).
+TARGET = os.environ.get('DROIDVM_IOS_TARGET', 'arm64-apple-ios17.0')
+ARCH, IOS = TARGET.split('-', 1)[0], TARGET.rsplit('ios', 1)[1]
 
 FORK = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else sys.exit(__doc__)
 SOURCE = Path(__file__).resolve().parents[1] / 'package/gfxprobe/gfxprobe.m'
@@ -23,7 +28,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
 binary = OUT / 'gfxprobe'
-subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk, '-O2', '-Wall', '-Wextra', '-Werror',
+subprocess.run(['xcrun', 'clang', '-target', TARGET, '-isysroot', sdk, '-O2', '-Wall', '-Wextra', '-Werror',
                 '-fno-objc-arc', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface',
                 '-framework', 'QuartzCore', '-framework', 'IOKit', '-framework', 'CoreGraphics', '-framework', 'CoreImage', '-framework', 'CoreMotion',
                 # `gfxprobe virtgpu`: NativeAdreno's virtio-gpu 3D methods (DroidVMVirtgpuABI.h)
@@ -46,5 +51,5 @@ extra = FORK / 'build/owner-trust-extra'
 extra.mkdir(parents=True, exist_ok=True)
 (extra / 'gfxprobe.json').write_text(json.dumps(
     {'cdhashes': [cdhash], 'category': 3, 'binary': 'build/gfxprobe/gfxprobe',
-     'source': 'package/gfxprobe/gfxprobe.m, iphoneos arm64'}, indent=2) + '\n')
+     'source': f'package/gfxprobe/gfxprobe.m, iphoneos {ARCH}'}, indent=2) + '\n')
 print('gfxprobe CDHash', cdhash)

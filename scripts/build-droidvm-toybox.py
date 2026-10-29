@@ -22,6 +22,10 @@ import sys
 import tarfile
 import urllib.request
 from pathlib import Path
+# DROIDVM_IOS_TARGET picks the build: arm64-apple-ios17.0 (the default) or arm64e-apple-ios27.0 (iPadOS 27 runs no arm64 platform
+# binaries: it killed them at exec).
+TARGET = os.environ.get('DROIDVM_IOS_TARGET', 'arm64-apple-ios17.0')
+ARCH, IOS = TARGET.split('-', 1)[0], TARGET.rsplit('ios', 1)[1]
 
 VERSION = '0.8.11'
 URL = f'https://landley.net/toybox/downloads/toybox-{VERSION}.tar.gz'
@@ -57,7 +61,7 @@ shim = WORK / 'shim'
 (shim / 'sys').mkdir(parents=True, exist_ok=True)
 shutil.copyfile(macos_sdk + '/usr/include/sys/disk.h', shim / 'sys/disk.h')
 cc = WORK / 'ios-clang'
-cc.write_text(f'#!/bin/sh\nexec xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot {iphone_sdk} -I{shim} "$@"\n')
+cc.write_text(f'#!/bin/sh\nexec xcrun -sdk iphoneos clang -arch {ARCH} -miphoneos-version-min={IOS} -isysroot {iphone_sdk} -I{shim} "$@"\n')
 cc.chmod(0o755)
 
 env = dict(os.environ, PATH=f'{gnubin}:{os.environ["PATH"]}')
@@ -87,5 +91,5 @@ extra = FORK / 'build/owner-trust-extra'
 extra.mkdir(parents=True, exist_ok=True)
 (extra / 'toybox.json').write_text(json.dumps(
     {'cdhashes': [cdhash], 'category': 3, 'binary': 'build/toybox/toybox',
-     'source': f'toybox {VERSION}, macos_defconfig + CONFIG_SH, iphoneos arm64'}, indent=2) + '\n')
+     'source': f'toybox {VERSION}, macos_defconfig + CONFIG_SH, iphoneos {ARCH}'}, indent=2) + '\n')
 print('toybox CDHash', cdhash)

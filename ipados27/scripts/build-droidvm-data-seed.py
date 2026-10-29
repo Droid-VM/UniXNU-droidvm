@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The Data seed of the iPadOS 27 board: 24A446's own /private/var in a fresh APFS volume, Setup skipped, packed for DarwinBoot.
 
-  build-droidvm-data-seed.py --tree TREE --profile PROFILE --ipsw IPSW_DIR [--gib 2] [--plugin DIR [--clients NAMES] [--store-gib 12]]
+  build-droidvm-data-seed.py --tree TREE --profile PROFILE --ipsw IPSW_DIR [--gib 2] [--plugin DIR [--clients NAMES] [--store-gib 12]
+                             [--tools TREE]]
 
 As the iPadOS 17 build makes its seed (scripts/build-droidvm-all.py data-base): the IPSW's OS image is attached read-only, the
 fork's prepare-owner-data-fixture.py copies its /private/var into a new 32 MiB APFS volume (whose volume UUID the kernel mounts
@@ -10,8 +11,16 @@ GIB GiB one, seed-data-skip-setup.py marks Setup done for 24A446, and seed-data-
 add-gpu-plugin-data.py then stages the Metal plugin (the build directory of build-adreno-metal-plugin.py --target ios27) for the
 render server and the GPU clients, and seed-data-grow.py makes the container STORE_GIB GiB for the persistent Data store
 (droidvm-data-persist=2): data-<STORE_GIB>g-27-gpu.dbr. Its CDHashes are trusted by build-droidvm-trust.py --owner <DIR>/trust.json.
-A new seed needs a new store (tools/rig/make-data-store.sh): the store holds the changes of the seed it ran on. Not yet: the App
-cryptex, ownervisor.
+A new seed needs a new store (tools/rig/make-data-store.sh): the store holds the changes of the seed it ran on.
+
+With --plugin, the App cryptex (the IPSW's Cryptex1,AppOS: Safari's daemons and settings) goes in first (add-app-cryptex-data.py,
+shown over /private/preboot with owner-app-cryptex=1; its own trust module is among the original ones), and with --tools TREE the
+debug shell (ownervisor, dropbear, applebox, ...) and the board's tools as TREE's build/ holds them go in last
+(add-ownervisor-data.py, started with owner-service-manager=1); their CDHashes are TREE's build/owner-trust-extra/*.json, for
+build-droidvm-trust.py --owner. iPadOS 27 kills arm64 platform binaries at exec, so they are built for arm64e into this board's
+tree first: DROIDVM_IOS_TARGET=arm64e-apple-ios27.0 OWNERVISOR=<ownervisor c6c8b2a or later> APPLEBOX=<applebox 6e3b471 or later>
+python3 scripts/build-droidvm-{ownervisor,toybox,gfxprobe,lsdiag,ipatool}.py TREE (gfxprobe takes NativeAdreno's headers from the
+tree: link-droidvm-gpu-sources.py first).
 
 The OS image is the decrypted IPSW member whose digest the OS profile pins ([root] os_image_sha256, as recorded by the IPSW cache
 next to it). macOS refuses an image attachment on the external DATA volume to a process started over ssh, so the image, its mount
@@ -88,6 +97,8 @@ def main():
                         help='the Metal plugin build (TREE/build/adreno-metal-plugin27) to stage, for the persistent Data store')
     parser.add_argument('--clients', default=GPU_CLIENTS, help=f'with --plugin: the GPU clients (default {GPU_CLIENTS})')
     parser.add_argument('--store-gib', type=int, default=12, help='with --plugin: the container size for the store (default 12)')
+    parser.add_argument('--tools', type=Path, default=None,
+                        help="with --plugin: a tree whose build/ holds the debug shell and the board's tools (the iPadOS 17 board's)")
     args = parser.parse_args()
     tree = args.tree.resolve()
     packer = args.packer or next((base / 'drivers/DarwinBoot/Test' for base in tree.parents
@@ -136,14 +147,33 @@ def main():
     run(['python3', root / 'scripts/seed-data-prefs.py', skipped, final, *PREFS], cwd=root)
     plugin = None
     if args.plugin:
+        # The App cryptex, from the IPSW cache, copied to the system volume as the OS image is.
+        record = next(json.loads(p.read_text()) for p in args.ipsw.resolve().glob('*.dmg.json')
+                      if json.loads(p.read_text()).get('component') == 'Cryptex1,AppOS')
+        cryptex = SCRATCH / record['member']
+        if not cryptex.is_file() or cryptex.stat().st_size != record['size']:
+            run(['cp', args.ipsw.resolve() / record['member'], cryptex])
+        with_app = work / f'data-{args.gib}g-27-app.dbr'
+        run(['python3', root / 'scripts/add-app-cryptex-data.py', final, cryptex, with_app], cwd=root)
         # The plugin is copied to the system volume as well: the staging script attaches the seed there.
         plugin = SCRATCH / 'plugin27'
         if plugin.exists():
             shutil.rmtree(plugin)
         shutil.copytree(args.plugin.resolve(), plugin)
         staged = work / f'data-{args.gib}g-27-gpu.dbr'
-        run(['python3', root / 'scripts/add-gpu-plugin-data.py', '--publish', '--plugin', plugin, '--clients', args.clients, final, staged],
-            cwd=root)
+        run(['python3', root / 'scripts/add-gpu-plugin-data.py', '--publish', '--plugin', plugin, '--clients', args.clients, with_app,
+             staged], cwd=root)
+        if args.tools:
+            # The debug shell and the tools, where add-ownervisor-data.py looks for them (the seed tree's build/).
+            for name in ('debug-shell', 'toybox', 'gfxprobe', 'ipatool', 'lsdiag'):
+                source, target = args.tools.resolve() / 'build' / name, root / 'build' / name
+                if target.exists():
+                    shutil.rmtree(target)
+                if source.is_dir():
+                    shutil.copytree(source, target, symlinks=True)
+            with_tools = work / f'data-{args.gib}g-27-ov.dbr'
+            run(['python3', root / 'scripts/add-ownervisor-data.py', staged, with_tools], cwd=root)
+            staged = with_tools
         final = work / f'data-{args.store_gib}g-27-gpu.dbr'
         run(['python3', root / 'scripts/seed-data-grow.py', '--gib', args.store_gib, staged, final], cwd=root)
     for path in sorted(work.iterdir()):

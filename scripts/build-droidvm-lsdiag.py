@@ -13,11 +13,16 @@ can-register-install-results lets `lsdiag relink` register an app with its plug-
   export.py put build/lsdiag/lsdiag /private/var/ngpu/bin/lsdiag 0755
 and run as root over ssh; `lsdiag -u 501 ...` reads the mobile user's database, which the apps and widgets use."""
 import json
+import os
 import plistlib
 import re
 import subprocess
 import sys
 from pathlib import Path
+# DROIDVM_IOS_TARGET picks the build: arm64-apple-ios17.0 (the default) or arm64e-apple-ios27.0 (iPadOS 27 runs no arm64 platform
+# binaries: it killed them at exec).
+TARGET = os.environ.get('DROIDVM_IOS_TARGET', 'arm64-apple-ios17.0')
+ARCH, IOS = TARGET.split('-', 1)[0], TARGET.rsplit('ios', 1)[1]
 
 FORK = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else sys.exit(__doc__)
 SOURCE = Path(__file__).resolve().parents[1] / 'package/lsdiag/lsdiag.m'
@@ -28,7 +33,7 @@ sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'],
 binary = OUT / 'lsdiag'
 # Manual reference counting: the records are made with alloc + an init sent through a cast objc_msgSend, which ARC would
 # not see as consuming the allocation (it released it a second time, a crash). A short-lived tool can leak instead.
-subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk, '-O2', '-Wall', '-Wextra', '-Werror',
+subprocess.run(['xcrun', 'clang', '-target', TARGET, '-isysroot', sdk, '-O2', '-Wall', '-Wextra', '-Werror',
                 '-fno-objc-arc', '-framework', 'Foundation', '-framework', 'ImageIO', '-framework', 'CoreGraphics', SOURCE, '-o', binary], check=True)
 entitlements = OUT / 'entitlements.plist'
 entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True,
@@ -57,5 +62,5 @@ extra = FORK / 'build/owner-trust-extra'
 extra.mkdir(parents=True, exist_ok=True)
 (extra / 'lsdiag.json').write_text(json.dumps(
     {'cdhashes': [cdhash], 'category': 3, 'binary': 'build/lsdiag/lsdiag',
-     'source': 'package/lsdiag/lsdiag.m, iphoneos arm64'}, indent=2) + '\n')
+     'source': f'package/lsdiag/lsdiag.m, iphoneos {ARCH}'}, indent=2) + '\n')
 print('lsdiag CDHash', cdhash)
