@@ -1,0 +1,36 @@
+Sheng's recovery of a core whose start-up self-IPI was lost (sheng_sigp_recover: SIGPdisabled cleared by the signalling core or the
+idle loop) is off unless sheng-sigp-recover=1. A DroidVM guest loses no IPI (ArmCpu delivers them as SPIs), and the recovery cleared
+SIGPdisabled of the first secondary between its start and processor_cpu_reinit(), which asserts it is still set.
+
+diff --git a/osfmk/arm/cpu_common.c b/osfmk/arm/cpu_common.c
+index 8776f16..fbcaf99 100644
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -32,6 +32,7 @@
+  */
+ 
+ #include <kern/machine.h>
++#include <kern/startup.h>
+ #include <kern/cpu_number.h>
+ #include <kern/thread.h>
+ #include <kern/percpu.h>
+@@ -413,9 +414,19 @@ cpu_immediate_xcall(int cpu_number, broadcastFunc func, void *param)
+  * and UFS root failures under SMP: the I/O thread's wakeup IPI to that core was silently dropped). A core in InitState|StartedState runs and
+  * takes interrupts, so the flag is cleared here and the signal sent. Counted in sheng_sigp_recovered. */
+ volatile uint32_t sheng_sigp_recovered;
++/*
++ * DroidVM: off unless sheng-sigp-recover=1. A guest's IPIs, its start-up self-IPI included, reach every vCPU (ArmCpu's SPI path), so
++ * nothing is lost to recover; and the recovery clears SIGPdisabled of a core that machine_cpu_reinit() has started but whose
++ * processor_cpu_reinit() has not yet enabled interrupts, when another core signals it in that window (an AST at the first secondary's
++ * start: "Assertion failed: getCpuDatap()->cpu_signal == SIGPdisabled (0x8 == 0x80000000)").
++ */
++static TUNABLE(bool, sheng_sigp_recovery, "sheng-sigp-recover", false);
+ bool
+ sheng_sigp_recover(cpu_data_t *target_proc)
+ {
++	if (!sheng_sigp_recovery) {
++		return false;
++	}
+ 	if ((os_atomic_load(&target_proc->cpu_flags, relaxed) & (InitState | StartedState)) != (InitState | StartedState)) {
+ 		return false;
+ 	}
