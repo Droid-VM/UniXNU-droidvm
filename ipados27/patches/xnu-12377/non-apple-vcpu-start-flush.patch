@@ -28,10 +28,10 @@ index 0a10bd7..e13591e 100644
  #endif
  #if CONFIG_SPTM
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 827236a..938f1e7 100644
+index 827236a..722c23d 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -102,6 +102,55 @@
+@@ -102,6 +102,53 @@
   */
  	.text
  	.align 12
@@ -58,14 +58,12 @@ index 827236a..938f1e7 100644
 +.endmacro
 +
 +/*
-+ * An exception in early bootstrap: record it (with the MMU off only; with it on, the slot's physical address may not be mapped)
-+ * and park in WFI rather than spin. Gunyah traps WFI and blocks the vCPU, but a vCPU spinning here kept its physical core until
-+ * the host's watchdog rebooted the phone.
++ * An exception in early bootstrap: record it and park in WFI rather than spin. Gunyah traps WFI and blocks the vCPU, but a vCPU
++ * spinning here kept its physical core until the host's watchdog rebooted the phone. The slot's address is PC-relative, so it is
++ * mapped whenever this vector runs, with the MMU off (physical) or on (the V=P or the kernel's mapping).
 + */
 +.macro EARLY_TRAP vector
 +	msr		DAIFSet, #(DAIFSC_ALL)
-+	mrs		x9, SCTLR_EL1
-+	tbnz	x9, #0, 1f
 +	EARLY_TRACE_SLOT
 +	mov		x10, #(0xe0 + \vector)
 +	str		x10, [x9]
@@ -87,7 +85,7 @@ index 827236a..938f1e7 100644
  	.globl EXT(LowResetVectorBase)
  LEXT(LowResetVectorBase)
  	/*
-@@ -116,6 +165,7 @@ LEXT(LowResetVectorBase)
+@@ -116,6 +163,7 @@ LEXT(LowResetVectorBase)
  
  	/* EL1 SP1: These vectors trap errors during early startup on non-boot CPUs. */
  	.align	9
@@ -95,7 +93,7 @@ index 827236a..938f1e7 100644
  	b		.
  	.align	7
  	b		.
-@@ -123,6 +173,15 @@ LEXT(LowResetVectorBase)
+@@ -123,6 +171,15 @@ LEXT(LowResetVectorBase)
  	b		.
  	.align	7
  	b		.
@@ -111,7 +109,7 @@ index 827236a..938f1e7 100644
  
  	.align	7
  	.globl EXT(reset_vector)
-@@ -141,6 +200,9 @@ LEXT(reset_vector)
+@@ -141,6 +198,9 @@ LEXT(reset_vector)
  
  
  
@@ -121,7 +119,7 @@ index 827236a..938f1e7 100644
  	// Process reset handlers
  	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
  	add		x19, x19, EXT(ResetHandlerData)@pageoff
-@@ -164,6 +226,10 @@ Lnext_cpu_data_entry:
+@@ -164,6 +224,10 @@ Lnext_cpu_data_entry:
  	b.eq	Lskip_cpu_reset_handler				// Not found
  	b		Lcheck_cpu_data_entry	// loop
  Lfound_cpu_data_entry:
@@ -132,7 +130,7 @@ index 827236a..938f1e7 100644
  
  #ifdef APPLEEVEREST
  	/*
-@@ -202,9 +268,30 @@ Lfound_cpu_data_entry:
+@@ -202,9 +266,30 @@ Lfound_cpu_data_entry:
  	msr		TPIDR_EL1, x13
  #endif /* __ARM_KERNEL_PROTECT__ */
  
@@ -163,7 +161,7 @@ index 827236a..938f1e7 100644
  
  	.align 3
  	.global EXT(LowResetVectorEnd)
-@@ -245,40 +332,104 @@ LEXT(_start)
+@@ -245,40 +330,104 @@ LEXT(_start)
  	.global	EXT(LowExceptionVectorBase)
  LEXT(LowExceptionVectorBase)
  	/* EL1 SP 0 */
@@ -268,7 +266,7 @@ index 827236a..938f1e7 100644
  	.align 12, 0
  
  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
-@@ -307,6 +458,9 @@ LEXT(start_cpu)
+@@ -307,6 +456,9 @@ LEXT(start_cpu)
  
  	.align 2
  start_cpu:
@@ -278,7 +276,7 @@ index 827236a..938f1e7 100644
  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
  	// This is done right away in reset vector for pre-KTRR devices
  	// Set low reset vector now that we are in the KTRR-free zone
-@@ -763,6 +917,9 @@ common_start:
+@@ -763,6 +915,9 @@ common_start:
  	MOV64   x0, SCTLR_EL1_DEFAULT
  	MSR_SCTLR_EL1_X0
  	isb		sy
@@ -288,7 +286,7 @@ index 827236a..938f1e7 100644
  
  #if !VMAPPLE
  	MOV64	x1, SCTLR_EL1_DEFAULT
-@@ -888,6 +1045,9 @@ arm_init_tramp:
+@@ -888,6 +1043,9 @@ arm_init_tramp:
  	isb		sy
  #endif /* T0SZ_USER != T0SZ_BOOT */
  

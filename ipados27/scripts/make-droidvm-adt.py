@@ -1,0 +1,1 @@
+../../scripts/make-droidvm-adt.py

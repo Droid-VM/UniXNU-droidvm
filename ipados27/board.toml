@@ -38,3 +38,42 @@ archives = [
   # Data store, registered after the original storage family (package/DroidVMSourceStorage.cpp). Needs the owner keys.
   "build-droidvm-source-storage.py",
 ]
+
+# The FAT volume of the boot disk (scripts/make-droidvm-disk.sh one level up adds UniXNU.efi and DarwinBoot.efi), as on iPadOS 17.
+# The root policies of the OS and SystemOS disks (scripts/build-droidvm-root-policies.py, bundled by the source storage step)
+# travel beside the kernel as kernel.macho.vroot, which DarwinBoot hands over as /chosen/memory-map RootPolicies: 117 MiB of block
+# hashes for 24A446, hence the larger volume.
+[payload]
+volume = "DROIDVMESP"
+size_mib = 320
+loader = "driver"
+title = "DroidVM: iPadOS 27.0.1"
+# guest RAM of the 5120 MiB pseudo-unprotected VM with drm-host-mb=8, as the iPadOS 17 board's
+dram_size = "0x13f200000"
+root_policies = "{tree}/build/droidvm-source-storage/root-policies.bin"
+kernel_args = [
+  "debug=0x14e",
+  "kt_fixed_zones=120",
+  "-no_slto_panic",
+  "ml-timeout-lock-panic-scale=40",
+  "tlto_us=0",
+  # The switches the iPadOS 17 kernel has built in (package/DroidVMBootArgs.c), until this kernel links them too.
+  "sheng-smp=1",
+  "armcpu-self-ipi=1",
+  "armcpu-spi-ipi=1",
+  "native-source-storage=1",
+  "-v",
+]
+
+[payload.adt]
+tool = "scripts/make-droidvm-adt.py"
+dram_base = "0x80600000"
+owned_memory_size = "0x20000000"
+cpu_regs = "0,1,2,3"
+packed_data_ramdisk = true
+ipad_identity = true
+unique_chip_id = "required"
+chip_id = "8142"                     # iPad17,3 (the OS profile's [ipsw] chip_id 33090)
+# The J820's identity from the IPSW's own device tree (unixnu ipsw fetch DeviceTree, copied to .cache/firmware here).
+tool_args = ["--dynamic", "--boot-video-mib", "8", "--reclaim-memory", "--display-gamut", "sRGB",
+             "--identity-tree", ".cache/firmware/DeviceTree.j820ap.im4p"]

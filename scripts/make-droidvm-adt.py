@@ -93,10 +93,47 @@ def read_adt(blob, offset=0):
 IDENTITY_PRODUCT_DROPPED = {'name', 'AAPL,phandle', 'exclaves-enabled', 'has-exclaves', 'artwork-display-gamut'}
 
 
+def device_tree_bytes(path):
+    """A device tree from a file: a decoded tree as it is, or the IPSW's IM4P (DeviceTree.<board>.im4p), whose payload is
+    LZFSE-compressed (decoded by macOS compression_tool)."""
+    data = Path(path).read_bytes()
+    if data[:1] != b'\x30':
+        return data
+
+    def element(at):
+        tag, length = data[at], data[at + 1]
+        at += 2
+        if length & 0x80:
+            count = length & 0x7f
+            length = int.from_bytes(data[at:at + count], 'big')
+            at += count
+        return tag, at, at + length
+
+    _, at, end = element(0)
+    fields = []
+    while at < end and len(fields) < 4:
+        tag, start, stop = element(at)
+        fields.append((tag, data[start:stop]))
+        at = stop
+    if len(fields) < 4 or fields[0] != (0x16, b'IM4P') or fields[3][0] != 0x04:
+        raise SystemExit(f'{path}: neither a device tree nor an IM4P')
+    payload = fields[3][1]
+    if payload[:4] in (b'bvx2', b'bvxn', b'bvx-', b'bvx1'):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'in', Path(directory) / 'out'
+            source.write_bytes(payload)
+            subprocess.run(['compression_tool', '-decode', '-a', 'lzfse', '-i', str(source), '-o', str(target)], check=True)
+            payload = target.read_bytes()
+    return payload
+
+
 def identity_of(path):
-    """The device identity of an OS's own device tree (the IPSW's DeviceTree, decoded): the root's model, target and board
-    names, and the /product properties MobileGestalt and the frameworks read (product-id, artwork, feature classes)."""
-    (root, children), _ = read_adt(Path(path).read_bytes())
+    """The device identity of an OS's own device tree (the IPSW's DeviceTree, decoded or as its IM4P): the root's model,
+    target and board names, and the /product properties MobileGestalt and the frameworks read (product-id, artwork, feature
+    classes)."""
+    (root, children), _ = read_adt(device_tree_bytes(path))
     product = next((props for props, _ in children if props.get('name', b'').rstrip(b'\0') == b'product'), None)
     if product is None or 'model' not in root or 'target-type' not in root:
         raise SystemExit(f'{path}: not a device tree with a model, a target-type and /product')
@@ -271,12 +308,15 @@ def main():
     parser.add_argument('--ipad-identity', action='store_true',
                         help='/product and /buttons describe an iPad-class device (values of the unchanged iPad7,1 tree)')
     parser.add_argument('--identity-tree', type=Path, default=None,
-                        help='with --ipad-identity: the identity (root model, target-type, board, /product) of this decoded '
-                             'device tree of the target OS (its IPSW DeviceTree) instead of the iPad7,1 values')
+                        help='with --ipad-identity: the identity (root model, target-type, board, /product) of this device '
+                             'tree of the target OS (its IPSW DeviceTree, the IM4P or decoded) instead of the iPad7,1 values')
     parser.add_argument('--packed-data-ramdisk', action='store_true')
     parser.add_argument('--data-ramdisk', action='store_true',
                         help='/chosen/memory-map RAMDisk placeholder; the loader fills in the real range')
     parser.add_argument('--trust-cache', action='store_true', help='Zeroed TrustCache sidecar handoff placeholder')
+    parser.add_argument('--root-policies', action='store_true',
+                        help='Zeroed RootPolicies placeholder: DarwinBoot hands kernel.macho.vroot (the disks\' signed root policies) '
+                             'over there')
     parser.add_argument('--data-store-mmio', type=lambda value: int(value, 0), default=None,
                         help='Base of the FDT virtio-mmio window that holds the persistent Data store (/arm-io/data-store)')
     parser.add_argument('--display-gamut', choices=['P3', 'sRGB'], default='P3',
@@ -435,7 +475,8 @@ def main():
                         *empty_nvram_proxy()],
              [node('memory-map', ([('PackedRAMDisk' if args.packed_data_ramdisk else 'RAMDisk', bytes(16))]
                                   if (args.data_ramdisk or args.packed_data_ramdisk) else []) +
-                                 ([('TrustCache', bytes(16))] if args.trust_cache else [])),
+                                 ([('TrustCache', bytes(16))] if args.trust_cache else []) +
+                                 ([('RootPolicies', bytes(16))] if args.root_policies else [])),
               node('manifest-properties')]),
         node('cpus', children=cpus),
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', psci_method.encode() + b'\0')])]
