@@ -77,6 +77,12 @@ def main():
             ssh_dir = mount / 'ngpu/ssh'
             ssh_dir.mkdir(parents=True, exist_ok=True)
             os.chmod(ssh_dir, 0o700)
+            # The tools on root's PATH: dropbear starts the shell with /private/var/ngpu/bin first, and iPadOS 27's zsh puts the
+            # system's default back for a login shell (17's kept it); every zsh reads ~/.zshenv first.
+            zshenv = mount / 'root/.zshenv'
+            if (mount / 'root').is_dir() and not zshenv.exists():
+                zshenv.write_text('export PATH=/private/var/ngpu/bin:$PATH\n')
+                os.chmod(zshenv, 0o644)
             # The board's own tools beside the shell, each staged when it has been built: toybox (~137 coreutils applets and a
             # shell, scripts/build-droidvm-toybox.py), gfxprobe (the GPU and display probes; its orient-follow keeps backboardd's
             # device orientation where the motion sensors say, by hand only), ipatool (the .ipa installer) and lsdiag
