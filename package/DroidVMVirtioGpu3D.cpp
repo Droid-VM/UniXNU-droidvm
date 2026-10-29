@@ -175,7 +175,7 @@ volatile uint32_t droidvm_virtgpu_chunk_kib = 256;
 namespace DroidVMVirtioGpu {
 namespace {
 enum : uint32_t { MaxClients = 64, MaxRings = 64, MaxPending = 256, FirstContext = 16, ContiguousLimit = 4u << 20,
-                  MaxBlobEntries = (MaxCommand - sizeof(CreateBlob)) / sizeof(Entry) };
+                  MaxBlobEntries = (HugeRequest - sizeof(CreateBlob)) / sizeof(Entry) };
 struct Resource {
     uint32_t handle, id;
     uint64_t size;
@@ -425,7 +425,7 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
     IOReturn status = in.cmd_size ? submitCommand(c, ccmd, in.cmd_size) : kIOReturnSuccess;
     if (status) return status;
     Resource r = {}; r.handle = c->nextHandle++; r.id = resourceId(); r.size = in.size; r.hostVisible = !guest;
-    Entry *entries = nullptr; uint32_t entryCount = 0;
+    Entry *entries = nullptr; uint32_t entryCount = 0, entryCapacity = 0;
     const uint64_t pagesBegin = nowUsLocal();
     c->blobKib = uint32_t(in.size >> 10);
     if (guest) {
@@ -440,7 +440,9 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
             r.pages = guestPages(bytes);
             if (!r.pages) { droidvm_virtgpu_last_blob_refused = bytes; return kIOReturnNoMemory; }
         }
-        entries = IONewData(Entry, MaxBlobEntries);
+        // At most one entry a page (the pages are page aligned), and MaxBlobEntries in all.
+        entryCapacity = uint32_t(bytes / 4096 + 1 < MaxBlobEntries ? bytes / 4096 + 1 : MaxBlobEntries);
+        entries = IONewData(Entry, entryCapacity);
         if (!entries) { dropPages(r); return kIOReturnNoMemory; }
         for (uint64_t offset = 0; offset < bytes;) {
             IOByteCount length = 0;
@@ -449,7 +451,7 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
             if (length > bytes - offset) length = bytes - offset;
             if (entryCount && entries[entryCount - 1].address + entries[entryCount - 1].length == physical &&
                 entries[entryCount - 1].length + length <= 0x80000000u) entries[entryCount - 1].length += uint32_t(length);
-            else if (entryCount == MaxBlobEntries) { status = kIOReturnNoResources; droidvm_virtgpu_last_blob_refused = bytes; break; }
+            else if (entryCount == entryCapacity) { status = kIOReturnNoResources; droidvm_virtgpu_last_blob_refused = bytes; break; }
             else entries[entryCount++] = {physical, uint32_t(length), 0};
             offset += length;
         }
@@ -460,7 +462,7 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
         Header reply = {};
         status = command(&blob, sizeof blob, entries, entryCount * uint32_t(sizeof(Entry)), &reply, sizeof reply);
     }
-    if (entries) IODeleteData(entries, Entry, MaxBlobEntries);
+    if (entries) IODeleteData(entries, Entry, entryCapacity);
     if (status) { dropPages(r); return status; }
     c->resources[c->resourceCount++] = r;
     out.handle = r.handle; out.resource_id = r.id; count(2);

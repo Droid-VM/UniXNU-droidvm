@@ -40,6 +40,13 @@ alignas(16384) uint8_t queues[2][16384];
 alignas(16384) uint8_t requests[Large][SlotRequest];
 alignas(4096) uint8_t responses[Large][SlotResponse];
 alignas(16384) uint8_t largeRequest[LargeSlots][MaxCommand], largeResponse[LargeSlots][MaxCommand];
+// The one request buffer for a command longer than MaxCommand, lent to a large slot until the device returns it (it has read the
+// request by then): a CREATE_BLOB_USER over a process's scattered pages -- a 44.5 MiB no-copy buffer is ~11,400 runs, 180 KiB of
+// entries -- which was refused, and Metal took the refusal for a lost device (Core Animation ended backboardd: a respring each
+// time the wallpaper editor opened). Such commands are rare; another one waits for the buffer as a command waits for a slot.
+alignas(16384) uint8_t hugeRequest[HugeRequest];
+uint64_t hugeRequestPA;
+uint32_t hugeOwner = Slots;   // the slot the buffer is lent to; Slots when free
 Slot slots[Slots];
 uintptr_t registers;
 uint64_t negotiated, nextFence, lastReturnUs;
@@ -95,6 +102,7 @@ void reap() {
             IOLog("virtio-gpu: command %x response %x length %u status %x\n", slot.type, answer->type, length, result);
         }
         slot.state = slot.state == Abandoned ? Free : Done;
+        if (hugeOwner == head / 2) hugeOwner = Slots;
         droidvm_virtio_gpu_in_flight = droidvm_virtio_gpu_in_flight - 1;
     }
     if (any) { uint32_t interrupts = rd(0x60) & 3; if (interrupts) wr(0x64, interrupts); }
@@ -123,6 +131,7 @@ bool start() {
         if (!physical(slot.request, slot.requestCapacity, slot.requestPA) || !physical(slot.response, slot.responseCapacity, slot.responsePA))
             return fail("noncontiguous command buffers");
     }
+    if (!physical(hugeRequest, sizeof hugeRequest, hugeRequestPA)) return fail("noncontiguous command buffers");
     lock = IOLockAlloc(); if (!lock) return fail("no lock");
     // Reset the firmware's queues before replacing any descriptor addresses.
     wr(0x70, 0);
@@ -159,9 +168,10 @@ IOReturn post(const void *data, uint32_t size, const void *extra, uint32_t extra
               uint32_t *ticket) {
     if (ticket) *ticket = 0;
     if (!ready()) return kIOReturnNotReady;
-    if (!ticket || !data || size < sizeof(Header) || size > MaxCommand || extraSize > MaxCommand - size || (extraSize && !extra) ||
+    if (!ticket || !data || size < sizeof(Header) || size > MaxCommand || extraSize > HugeRequest - size || (extraSize && !extra) ||
         capacity < sizeof(Header) || capacity > MaxCommand) return kIOReturnBadArgument;
-    const bool large = size + extraSize > SlotRequest || capacity > SlotResponse;
+    const bool huge = size + extraSize > MaxCommand;
+    const bool large = huge || size + extraSize > SlotRequest || capacity > SlotResponse;
     const uint64_t begin = nowUs();
     IOLockLock(lock);
     uint32_t s = Slots;
@@ -169,8 +179,9 @@ IOReturn post(const void *data, uint32_t size, const void *extra, uint32_t extra
     while (s == Slots) {
         if (!ready()) { IOLockUnlock(lock); return kIOReturnNotResponding; }
         reap();
-        // A short command takes a large slot too when the short ones are all in flight.
-        for (uint32_t i = large ? Large : 0; i < Slots && s == Slots; ++i) if (slots[i].state == Free) s = i;
+        // A short command takes a large slot too when the short ones are all in flight; a huge one a large slot and hugeRequest.
+        if (!huge || hugeOwner == Slots)
+            for (uint32_t i = large ? Large : 0; i < Slots && s == Slots; ++i) if (slots[i].state == Free) s = i;
         if (s != Slots) break;
         // Every slot in flight is the GPU's backlog: wait while the device keeps returning commands. Refusing after 5 s turned a
         // heavy frame (GFXBench's Start all) into a submission error, which Turnip takes for a lost device: every later command
@@ -186,14 +197,16 @@ IOReturn post(const void *data, uint32_t size, const void *extra, uint32_t extra
     const uint64_t waited = nowUs() - begin;
     if (waited > droidvm_virtio_gpu_slot_wait_max_us) droidvm_virtio_gpu_slot_wait_max_us = waited;
     Slot &slot = slots[s];
-    memcpy(slot.request, data, size); if (extraSize) memcpy(slot.request + size, extra, extraSize);
-    Header *hdr = reinterpret_cast<Header *>(slot.request);
+    uint8_t *const request = huge ? hugeRequest : slot.request;
+    if (huge) hugeOwner = s;
+    memcpy(request, data, size); if (extraSize) memcpy(request + size, extra, extraSize);
+    Header *hdr = reinterpret_cast<Header *>(request);
     if (globalFence) { hdr->flags = (hdr->flags | FlagFence) & ~uint32_t(FlagRingIndex); hdr->fence = ++nextFence; }
     slot.fenced = hdr->flags & FlagFence; slot.fence = hdr->fence; slot.type = hdr->type;
     slot.capacity = capacity; slot.length = 0; slot.result = kIOReturnNotReady;
     memset(slot.response, 0, capacity);
     auto desc = reinterpret_cast<Desc *>(queues[0]);
-    desc[2 * s] = {slot.requestPA, size + extraSize, 1, uint16_t(2 * s + 1)};
+    desc[2 * s] = {huge ? hugeRequestPA : slot.requestPA, size + extraSize, 1, uint16_t(2 * s + 1)};
     desc[2 * s + 1] = {slot.responsePA, capacity, 2, 0};
     slot.state = Posted;
     if (++slot.generation == 0) slot.generation = 1;

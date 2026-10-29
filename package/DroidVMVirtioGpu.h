@@ -8,7 +8,9 @@ namespace DroidVMVirtioGpu {
 struct Header { uint32_t type, flags; uint64_t fence; uint32_t context; uint8_t ring, padding[3]; };
 struct Entry { uint64_t address; uint32_t length, padding; };
 static_assert(sizeof(Header) == 24 && sizeof(Entry) == 16, "virtio-gpu wire ABI");
-enum : uint32_t { MaxEntries = 4096, MaxCommand = 131072, FlagFence = 1, FlagRingIndex = 2 };
+// MaxCommand: the longest command a slot holds, and the longest response. HugeRequest: the longest command at all, one at a time
+// (DroidVMVirtioGpu.cpp hugeRequest) -- a blob over scattered pages, whose entries outgrow MaxCommand.
+enum : uint32_t { MaxEntries = 4096, MaxCommand = 131072, HugeRequest = 1u << 20, FlagFence = 1, FlagRingIndex = 2 };
 // One control queue shared by the display and 3D clients, with many commands in flight: the device returns a fenced command
 // only when its fence signals (a 3D submission once the GPU has run it), so a waiting submission must not hold the queue.
 // command() posts and waits, numbering the command on the device's global fence ring. post() returns a ticket at once and
