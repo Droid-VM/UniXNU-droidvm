@@ -359,6 +359,10 @@ static IOReturn wrappedRegister(IOUserClient *client,mach_port_t port,UInt32 typ
     return status;
 }
 static void interpose(IOUserClient *client,int pid) {
+#if __has_feature(ptrauth_calls)
+    // The vtable pointer and its entries are signed: a copied vtable would not authenticate. Clients are not interposed.
+    (void)client;(void)pid;return;
+#endif
     if(seenClientCount>=kSeenClients)return;
     ClientStat &stat=seenClients[seenClientCount];
     memset(&stat,0,sizeof stat);
@@ -530,7 +534,13 @@ void native_legacy_display_late_probe(void) {
         // A real firmware framebuffer resource, with addresses and extent
         // obtained from the actual GOP handoff. It has no invented compatible,
         // display list, panel timing, GPU/fence completion or vendor registers.
+#if NATIVE_LEGACY_PLAIN_NUB
+        // iPadOS 27: a plain service, as upstream sheng's probe makes it. An IOPlatformDevice expects the platform expert as its
+        // provider (compareName calls it), not the resources.
+        native_legacy_stage=4;IOService *nub=new IOService;
+#else
         native_legacy_stage=4;IOPlatformDevice *nub=new IOPlatformDevice;
+#endif
         native_legacy_nub=(uintptr_t)nub;bool nubAttached=false,nubStarted=false,attached=false,started=false;
         IORegistryEntry *displayTreeParent=nullptr;bool dtAttached=false;
         IOService *parent=IOService::getResourceService();

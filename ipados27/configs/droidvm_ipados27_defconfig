@@ -42,3 +42,5 @@ CONFIG_XNU_SHENG_PMGR=n
 CONFIG_XNU_NATIVE_ADRENO=n
 CONFIG_XNU_BOOT_PROGRESS=n
 CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+# The owned GOP backend under the original IOMobileFramebufferLegacy (scripts/build-droidvm-legacy-display.py).
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y

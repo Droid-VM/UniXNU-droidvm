@@ -18,7 +18,7 @@ kit = "droidvm"
 
 # The whole list: a layer's list replaces the one below it (the SoC layer's would drop the arm64e profile's XnuPrelink).
 [components]
-include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "VirtioMmioBlock", "RamBlock", "VerifiedRoot"]
+include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "VirtioMmioBlock", "RamBlock", "VerifiedRoot", "GopFramebuffer", "AppleKeyStoreState"]
 
 [kernel]
 defconfig = "droidvm_ipados27_defconfig"
@@ -37,6 +37,10 @@ archives = [
   # The disks (scripts/build-droidvm-source-storage.py): the public IOBlockStorageDevice, NativeVirtioBlock, NativeRamBlock and the
   # Data store, registered after the original storage family (package/DroidVMSourceStorage.cpp). Needs the owner keys.
   "build-droidvm-source-storage.py",
+  # The display (scripts/build-droidvm-legacy-display.py): GopFramebuffer's owned backend under the original IOMobileFramebufferLegacy
+  # of the fileset, presenting to the firmware framebuffer, and the key-store event service, as sheng's board builds them.
+  "component:AppleKeyStoreState",
+  "build-droidvm-legacy-display.py",
 ]
 
 # The FAT volume of the boot disk (scripts/make-droidvm-disk.sh one level up adds UniXNU.efi and DarwinBoot.efi), as on iPadOS 17.
@@ -70,6 +74,26 @@ kernel_args = [
   # 19.2 MHz, then panic): a vCPU the host preempts holds both for as long as it is off its core (usermanagerd's first boot, 881 us).
   "interrupt-masked-debug-mode=0",
   "sched_preemption_disable_debug_mode=0",
+  # Bring-up: the user exceptions of these processes go to the kernel log and sheng_exc_ring (the bring-up patch's exception.c).
+  "sheng-exc-name=SpringBoard,backboardd,devicerecoverytool,liveactivitiesd,chronod",
+  # The legacy display (bsd_init's native_mobile_graphics_load_probe, LegacyDisplayProbe.cpp): load the original graphics family and
+  # register the owned GOP backend under it, as the iPadOS 17 kernel's built-in arguments do (package/DroidVMBootArgs.c), and the
+  # key store events with the keybag of a guest without a passcode.
+  "offline-mobile-graphics-load=1",
+  "offline-mobile-graphics-client=1",
+  "offline-legacy-register=1",
+  "offline-legacy-gop=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-unit-scale=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "offline-key-events=1",
+  "sheng-aks=1",
+  "sheng-aks-sls=3",
+  # The host's file mailbox (tools/rig export.py, crashes.py), answered by the droidvm-monitor worker.
+  "droidvm-monitor=1000",
   "-v",
 ]
 

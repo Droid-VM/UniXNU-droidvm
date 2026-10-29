@@ -22,6 +22,7 @@ import peek
 
 BOX = struct.Struct('<IIIiQQQ512s')     # request, done, kind, status, offset, length, total, path
 DATA_BYTES = 1 << 20
+PUT_BYTES = 256 << 10      # the smallest buffer a guest builds (the iPadOS 27 board's DROIDVM_EXPORT_BYTES)
 
 
 def physical(name):
@@ -89,9 +90,9 @@ def main():
     if args.command == 'put':
         source = open(args.path, 'rb').read()
         mode = int(args.length or '0644', 8)
-        # In 1 MiB pieces: the first creates or truncates the file and sets its mode, the rest append at their offsets.
-        for offset in range(0, max(len(source), 1), DATA_BYTES):
-            piece = source[offset:offset + DATA_BYTES]
+        # In 256 KiB pieces: the first creates or truncates the file and sets its mode, the rest append at their offsets.
+        for offset in range(0, max(len(source), 1), PUT_BYTES):
+            piece = source[offset:offset + PUT_BYTES]
             request(5, args.output, offset, len(piece), mode, piece)
         print(f'{args.output}: {len(source)} bytes, mode {mode:o}')
     elif args.command == 'mem':

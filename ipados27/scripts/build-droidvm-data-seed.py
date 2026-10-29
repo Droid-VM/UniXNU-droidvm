@@ -6,7 +6,7 @@
 As the iPadOS 17 build makes its seed (scripts/build-droidvm-all.py data-base): the IPSW's OS image is attached read-only, the
 fork's prepare-owner-data-fixture.py copies its /private/var into a new 32 MiB APFS volume (whose volume UUID the kernel mounts
 Data by: CONFIG_XNU_OWNER_DATA_VOLUME_UUID), DarwinBoot's packed_ramdisk packs it, seed-data-grow.py makes the container a volatile
-GIB GiB one, and seed-data-skip-setup.py marks Setup done for 24A446. Not yet: the App cryptex, the GPU plugin, ownervisor.
+GIB GiB one, seed-data-skip-setup.py marks Setup done for 24A446, and seed-data-prefs.py adds PREFS. Not yet: the App cryptex, the GPU plugin, ownervisor.
 
 The OS image is the decrypted IPSW member whose digest the OS profile pins ([root] os_image_sha256, as recorded by the IPSW cache
 next to it). macOS refuses an image attachment on the external DATA volume to a process started over ssh, so the image, its mount
@@ -24,6 +24,8 @@ import subprocess
 import tomllib
 
 SCRATCH = Path('/tmp') / f'droidvm27-seed-{os.environ.get("USER", "build")}'
+# The preferences the seed carries (seed-data-prefs.py USER:DOMAIN:KEY=VALUE).
+PREFS = ['mobile:com.apple.coreanimation:CAEnableMedina=false', 'root:com.apple.coreanimation:CAEnableMedina=false']
 
 
 def run(command, **kwargs):
@@ -116,12 +118,17 @@ def main():
     run(['python3', root / 'scripts/seed-data-grow.py', '--volatile', '--gib', args.gib, work / 'data-32.dbr', grown], cwd=root)
     skipped = work / f'data-{args.gib}g-skip.dbr'
     run(['python3', root / 'scripts/seed-data-skip-setup.py', grown, skipped, f'--build={build_id}'], cwd=root)
+    # CAEnableMedina false: the J820 is a device QuartzCore draws secure (camera, microphone) indicators for through the display
+    # pipe (CADeviceSupportsMedina), and SpringBoard's indicator layer then needs a valid indicator name; this guest's has none and
+    # every commit raised CASecureIndicatorLayerInvalidName ("Invalid indicator name (null)"), aborting SpringBoard.
+    final = work / f'data-{args.gib}g-27.dbr'
+    run(['python3', root / 'scripts/seed-data-prefs.py', skipped, final, *PREFS], cwd=root)
     for path in sorted(work.iterdir()):
         shutil.copyfile(path, out / path.name)
     record = dict(build=build_id, volume_uuid=seed['volume_uuid'], launchd_sha256=launchd, os_image=source.name,
-                  seed=skipped.name, seed_sha256=hashlib.sha256((out / skipped.name).read_bytes()).hexdigest())
+                  seed=final.name, seed_sha256=hashlib.sha256((out / final.name).read_bytes()).hexdigest(), preferences=PREFS)
     (out / 'seed.json').write_text(json.dumps(record, indent=2) + '\n')
-    print(f'Data seed {out / skipped.name}: volume UUID {seed["volume_uuid"]}')
+    print(f'Data seed {out / final.name}: volume UUID {seed["volume_uuid"]}')
 
 
 if __name__ == '__main__':

@@ -20,7 +20,10 @@
 #include <sys/signal.h>
 #include <kern/kalloc.h>
 
+// A board may build a smaller buffer (-DDROIDVM_EXPORT_BYTES=...): the iPadOS 27 fileset leaves the kernel's __DATA little room.
+#ifndef DROIDVM_EXPORT_BYTES
 #define DROIDVM_EXPORT_BYTES (1u << 20)
+#endif
 
 // request: the host bumps it after writing kind, offset and path; done: set to request once data and status are
 // final. kind 0 reads up to DROIDVM_EXPORT_BYTES of a regular file from offset (total = its size); kind 1 lists a
