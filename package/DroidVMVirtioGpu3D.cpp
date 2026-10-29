@@ -144,7 +144,11 @@ void selftest3D() {
 
 // ---- user space: the virtgpu methods of the accelerator's user client (DroidVMVirtgpuABI.h) -------------------------------------
 // One client per connection that called a method: its DRM context, its resources by handle and its fenced submissions in flight.
-// A client's lock serializes its methods (a Metal device's threads share one connection); a fence wait sleeps without it.
+// A client's lock serializes its methods (a Metal device's threads share one connection); a fence wait sleeps without it. Its
+// fenced submissions in flight have a lock of their own, held only to look at them or change them, never across a wait: the
+// display and the client's fence waits look at them while a method of the client runs, which can take long without the device
+// (a method held the client's lock ~0.8 s while the GPU sat idle, and the display, which took a busy client for one whose work
+// was not done, showed nothing meanwhile).
 #include "DroidVMVirtgpuABI.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMultiMemoryDescriptor.h>
@@ -157,6 +161,16 @@ volatile uint64_t droidvm_virtgpu_stats[8];
 volatile uint64_t droidvm_virtgpu_closes[4];
 // the last refusal: op, status, input and output size; and refusals by op
 volatile uint64_t droidvm_virtgpu_last_refusal[4], droidvm_virtgpu_refusals_by_op[16];
+// Methods that held their client's lock over 10 ms, the last 32 (slow_count of them so far): when (us), the op, how long (us), the
+// process. For peek.py; the display no longer waits for them (droidvm_virtgpu_finished), set finished_trylock to 1 for the old
+// rule (a client in a method counts as unfinished work), whose waits finished_blocked counts.
+// A blob's record adds its size (KiB) and the part of the time its guest pages took to get (us).
+struct DroidVMSlowOp { uint64_t at; uint32_t op, us; char name[16]; uint32_t kib, pagesUs; };
+DroidVMSlowOp droidvm_virtgpu_slow_ops[32];
+volatile uint64_t droidvm_virtgpu_slow_count, droidvm_virtgpu_finished_blocked;
+volatile uint32_t droidvm_virtgpu_finished_trylock;
+// The physically contiguous pieces a guest blob's pages come in, at most (KiB; see guestPages).
+volatile uint32_t droidvm_virtgpu_chunk_kib = 256;
 }
 namespace DroidVMVirtioGpu {
 namespace {
@@ -179,6 +193,9 @@ struct Closed { Resource resource; uint64_t sequence; };
 struct Client {
     void *connection;
     IOLock *lock;
+    IOLock *fenceLock;                 // pending, pendingCount, nextFence and completed (see above)
+    char name[16];                     // the process that made the connection
+    uint32_t blobKib, blobPagesUs;     // the last blob made: its size, and how long its guest pages took (slow-op records)
     uint32_t context, rings, nextHandle, resourceCount, resourceCapacity, pendingCount, closedCount, closedCapacity;
     Resource *resources;
     Closed *closed;
@@ -210,9 +227,13 @@ Client *client(void *connection, bool create) {
     if (!found && create && empty >= 0) {
         found = IONewZero(Client, 1);
         if (found) {
-            found->connection = connection; found->lock = IOLockAlloc(); found->nextHandle = 1;
-            if (!found->lock) { IODelete(found, Client, 1); found = nullptr; }
-            else { gClients[empty] = found; count(0); }
+            found->connection = connection; found->lock = IOLockAlloc(); found->fenceLock = IOLockAlloc(); found->nextHandle = 1;
+            proc_selfname(found->name, sizeof found->name);
+            if (!found->lock || !found->fenceLock) {
+                if (found->lock) IOLockFree(found->lock);
+                if (found->fenceLock) IOLockFree(found->fenceLock);
+                IODelete(found, Client, 1); found = nullptr;
+            } else { gClients[empty] = found; count(0); }
         }
     }
     IOLockUnlock(gClientsLock);
@@ -223,9 +244,8 @@ Resource *resource(Client *c, uint32_t handle) {
     for (uint32_t i = 0; i < c->resourceCount; ++i) if (c->resources[i].handle == handle) return &c->resources[i];
     return nullptr;
 }
-// Takes every finished fenced submission off the client's list, then releases the closed resources no submission in flight
-// was made before.
-void reapPending(Client *c) {
+// Takes every finished fenced submission off the client's list. With its fenceLock held.
+void reapFences(Client *c) {
     for (uint32_t i = 0; i < c->pendingCount;) {
         IOReturn result;
         if (!poll(c->pending[i].ticket, &result)) { ++i; continue; }
@@ -233,9 +253,15 @@ void reapPending(Client *c) {
         if (done.fence > c->completed[done.ring]) c->completed[done.ring] = done.fence;
         c->pending[i] = c->pending[--c->pendingCount];
     }
-    if (!c->closedCount) return;
+}
+// reapFences, then releases the closed resources no submission in flight was made before. With the client's lock held.
+void reapPending(Client *c) {
+    IOLockLock(c->fenceLock);
+    reapFences(c);
     uint64_t oldest = ~uint64_t(0);
     for (uint32_t i = 0; i < c->pendingCount; ++i) if (c->pending[i].sequence < oldest) oldest = c->pending[i].sequence;
+    IOLockUnlock(c->fenceLock);
+    if (!c->closedCount) return;
     for (uint32_t i = 0; i < c->closedCount;) {
         if (c->closed[i].sequence >= oldest) { ++i; continue; }
         releaseResource(c, c->closed[i].resource);
@@ -334,11 +360,18 @@ IOReturn contextInit(Client *c, const droidvm_virtgpu_context_init &in, droidvm_
 // A guest blob's pages: wired and zeroed, physically contiguous in chunks of at most ContiguousLimit (halved down to 64 KiB
 // while an allocation fails), so a blob of any size the host is told about in few entries (one per page refused blobs above
 // 16 MiB). Several chunks become one IOMultiMemoryDescriptor.
+// In physically contiguous pieces of droidvm_virtgpu_chunk_kib (256 KiB), larger only as far as the blob's entries need
+// (MaxBlobEntries, one per piece at worst). Pieces of ContiguousLimit (4 MiB) took 0.2-3.7 s a blob once the VM had run a while:
+// the kernel finds so long a run of free pages only by scanning, and moving, its memory -- with the client's lock held, so every
+// later method of the process (Core Animation's, in backboardd) waited.
 IOMemoryDescriptor *guestPages(uint64_t bytes) {
     const uint32_t most = uint32_t((bytes + 0xffff) >> 16);
     IOMemoryDescriptor **chunks = IONew(IOMemoryDescriptor *, most);
     if (!chunks) return nullptr;
-    uint32_t count = 0; uint64_t chunk = ContiguousLimit, offset = 0;
+    uint64_t chunk = uint64_t(droidvm_virtgpu_chunk_kib) << 10;
+    if (chunk < 0x10000 || chunk > ContiguousLimit) chunk = ContiguousLimit;
+    while (chunk < ContiguousLimit && (bytes + chunk - 1) / chunk > MaxBlobEntries) chunk <<= 1;
+    uint32_t count = 0; uint64_t offset = 0;
     while (offset < bytes) {
         const uint64_t length = bytes - offset < chunk ? bytes - offset : chunk;
         IOBufferMemoryDescriptor *piece = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
@@ -393,6 +426,8 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
     if (status) return status;
     Resource r = {}; r.handle = c->nextHandle++; r.id = resourceId(); r.size = in.size; r.hostVisible = !guest;
     Entry *entries = nullptr; uint32_t entryCount = 0;
+    const uint64_t pagesBegin = nowUsLocal();
+    c->blobKib = uint32_t(in.size >> 10);
     if (guest) {
         // Guest memory the host imports (a pseudo-unprotected VM shares all of its RAM).
         const uint64_t bytes = (in.size + 4095) & ~uint64_t(4095);
@@ -419,6 +454,7 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
             offset += length;
         }
     }
+    c->blobPagesUs = uint32_t(nowUsLocal() - pagesBegin);
     if (!status) {
         CreateBlob blob = {{CmdCreateBlob, 0, 0, c->context, 0, {}}, r.id, in.blob_mem, in.blob_flags, entryCount, in.blob_id, in.size};
         Header reply = {};
@@ -469,9 +505,11 @@ IOReturn execbuffer(Client *c, const droidvm_virtgpu_execbuffer &in, const uint8
     uint32_t ticket = 0;
     IOReturn status = post(&submit, sizeof submit, commands, in.size, sizeof(Header), false, &ticket);
     if (status) return status;
+    IOLockLock(c->fenceLock);
     c->nextFence[in.ring_idx] = fence;
     c->pending[c->pendingCount++] = {ticket, in.ring_idx, fence, ++c->sequence,
                                      __atomic_add_fetch(&gSubmittedOrder, 1, __ATOMIC_ACQ_REL)};
+    IOLockUnlock(c->fenceLock);
     out.fence = fence; count(5);
     return kIOReturnSuccess;
 }
@@ -479,11 +517,15 @@ IOReturn waitFence(Client *c, const droidvm_virtgpu_wait_fence &in) {
     if (in.ring_idx >= MaxRings) return kIOReturnBadArgument;
     const uint64_t begin = nowUsLocal(), timeoutUs = in.timeout_ns / 1000;
     for (;;) {
-        IOLockLock(c->lock);
-        reapPending(c);
+        IOLockLock(c->fenceLock);
+        reapFences(c);
         const bool done = c->completed[in.ring_idx] >= in.fence || in.fence > c->nextFence[in.ring_idx];
-        IOLockUnlock(c->lock);
-        if (done) return kIOReturnSuccess;
+        IOLockUnlock(c->fenceLock);
+        if (done) {
+            // The closed resources the finished work held go now, unless a method of the client runs (it reaps them itself).
+            if (IOLockTryLock(c->lock)) { reapPending(c); IOLockUnlock(c->lock); }
+            return kIOReturnSuccess;
+        }
         if (nowUsLocal() - begin >= timeoutUs) { if (timeoutUs) count(6); return kIOReturnTimeout; }
         IOSleep(1);   // a fence is a GPU job: sleep, so the vCPU goes idle (see pause() in DroidVMVirtioGpu.cpp)
     }
@@ -524,12 +566,14 @@ extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t t
     auto fixed = [&](size_t inBytes, size_t outBytes, bool variableIn = false) {
         return (variableIn ? inSize >= inBytes : inSize == inBytes) && outSize == outBytes && (!inBytes || in) && (!outBytes || out);
     };
-    if (op == DROIDVM_VIRTGPU_WAIT_FENCE) {   // sleeps; takes the client's lock only to look
+    if (op == DROIDVM_VIRTGPU_WAIT_FENCE) {   // sleeps; takes the client's fence lock only to look
         if (!fixed(sizeof(droidvm_virtgpu_wait_fence), 0)) return kIOReturnBadArgument;
         return waitFence(c, *static_cast<const droidvm_virtgpu_wait_fence *>(in));
     }
     IOReturn status = kIOReturnBadArgument;
     IOLockLock(c->lock);
+    const uint64_t began = nowUsLocal();
+    c->blobKib = c->blobPagesUs = 0;
     switch (op) {
     case DROIDVM_VIRTGPU_GETPARAM:
         if (fixed(sizeof(droidvm_virtgpu_getparam), sizeof(droidvm_virtgpu_getparam_reply)))
@@ -582,7 +626,15 @@ extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t t
         if (fixed(sizeof(droidvm_virtgpu_handle), 0)) status = closeResource(c, static_cast<const droidvm_virtgpu_handle *>(in)->handle);
         break;
     }
+    const uint64_t held = nowUsLocal() - began;
     IOLockUnlock(c->lock);
+    if (held > 10000) {
+        const uint64_t n = __atomic_fetch_add(&droidvm_virtgpu_slow_count, 1, __ATOMIC_RELAXED);
+        DroidVMSlowOp &slow = droidvm_virtgpu_slow_ops[n % 32];
+        slow.at = began; slow.op = op; slow.us = uint32_t(held < 0xffffffffu ? held : 0xffffffffu);
+        memcpy(slow.name, c->name, sizeof slow.name);
+        slow.kib = c->blobKib; slow.pagesUs = c->blobPagesUs;
+    }
     if (status) {
         count(7);
         droidvm_virtgpu_last_refusal[0] = op; droidvm_virtgpu_last_refusal[1] = uint32_t(status);
@@ -598,8 +650,9 @@ extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t t
 extern "C" uint64_t droidvm_virtgpu_submitted(void) {
     return __atomic_load_n(&DroidVMVirtioGpu::gSubmittedOrder, __ATOMIC_ACQUIRE);
 }
-// A client in one of its methods holds its lock, perhaps while it waits for the device: it is looked at again later rather
-// than waited for, so the clients' list is never held across a wait.
+// A client's fenced submissions are looked at under its fence lock, which nothing holds across a wait; the client may be in one
+// of its methods meanwhile. (droidvm_virtgpu_finished_trylock = 1: the old rule, which took a client in a method, holding its
+// lock, for one whose work was not done -- and showed nothing while a method ran long without the device.)
 extern "C" bool droidvm_virtgpu_finished(uint64_t order) {
     using namespace DroidVMVirtioGpu;
     if (!order || !gClientsLock) return true;
@@ -608,10 +661,14 @@ extern "C" bool droidvm_virtgpu_finished(uint64_t order) {
     for (uint32_t i = 0; i < MaxClients && finished; ++i) {
         Client *c = gClients[i];
         if (!c) continue;
-        if (!IOLockTryLock(c->lock)) { finished = false; break; }
-        reapPending(c);
+        if (droidvm_virtgpu_finished_trylock) {
+            if (!IOLockTryLock(c->lock)) { finished = false; droidvm_virtgpu_finished_blocked = droidvm_virtgpu_finished_blocked + 1; break; }
+            IOLockUnlock(c->lock);
+        }
+        IOLockLock(c->fenceLock);
+        reapFences(c);
         for (uint32_t j = 0; j < c->pendingCount && finished; ++j) if (c->pending[j].order <= order) finished = false;
-        IOLockUnlock(c->lock);
+        IOLockUnlock(c->fenceLock);
     }
     IOLockUnlock(gClientsLock);
     return finished;
@@ -638,6 +695,7 @@ extern "C" void droidvm_virtgpu_close(void *connection) {
     }
     IOLockUnlock(c->lock);
     IOLockFree(c->lock);
+    IOLockFree(c->fenceLock);
     IODelete(c, Client, 1);
     droidvm_virtgpu_stats[0] = droidvm_virtgpu_stats[0] - 1;
 }
