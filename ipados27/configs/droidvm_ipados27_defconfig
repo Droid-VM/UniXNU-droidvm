@@ -19,6 +19,8 @@ CONFIG_XNU_CRYPTO_BOOTSTRAP="source"
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 # The kernel collection of 24A446 is an MH_FILESET; XnuPrelink's fileset emitter links this kernel into it.
 CONFIG_XNU_KERNEL_CHAINED_FIXUPS=y
+# and matches it against a RELEASE build of the same source (build/xnu/fileset-reference, the OS profile's --fileset-reference).
+CONFIG_XNU_FILESET_REFERENCE=y
 CONFIG_XNU_EXTRA_LD_ARCHIVES=""
 CONFIG_XNU_ARMVIRT_PLATFORM=n
 CONFIG_XNU_NATIVE_UFS=n

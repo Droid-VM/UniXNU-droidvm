@@ -16,6 +16,10 @@ os_profile = "ipados-27.0.1-24A446"
 description = "DroidVM guest (crosvm on Gunyah), iPadOS 27"
 kit = "droidvm"
 
+# The whole list: a layer's list replaces the one below it (the SoC layer's would drop the arm64e profile's XnuPrelink).
+[components]
+include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink"]
+
 [kernel]
 defconfig = "droidvm_ipados27_defconfig"
 config_fragments = ["arch:configs/common.config", "os:configs/ipados.config"]
