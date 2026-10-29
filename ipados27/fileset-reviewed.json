@@ -13,8 +13,8 @@
     },
     {
       "original": "0xfffffe000ae9bd20",
-      "native_symbol": "_SHA512_Init",
-      "evidence": "References 'corecrypto_sha2.c', 'SHA512_Init' and '%s: inconsistent size for SHA512 context @%s:%d': the libkern/crypto/corecrypto_sha2.c wrapper."
+      "native_symbol": "_read_random",
+      "evidence": "prng_funcs.refresh(prng_ctx) (an authenticated call through a global, prng_ctx from another), then while numbytes: prng_funcs.generate(prng_ctx, cpu_number() (TPIDR_EL1 +0x1b0), MIN(numbytes, 0x100), buffer): read_random of osfmk/prng/prng_random.c with read_random_generate inlined. corecrypto and AppleImage4 call it for entropy. (Paired with SHA512_Init before: a string scan that ran past this function's end; the original SHA512_Init is 0xfffffe000b42b644, which the matcher pairs. AppleImage4's nonce buffer then got a SHA-512 context, written over its interface pointer.)"
     },
     {
       "original": "0xfffffe000b42b4a0",
@@ -105,6 +105,146 @@
       "original": "0xfffffe000b3d2524",
       "native_symbol": "_OSAddAtomic64",
       "evidence": "ldadd x0, x0, [x1]; ret: OSAddAtomic64(amount, address) (OSAddAtomicLong has the same body), between the paired OSAddAtomic and OSIncrementAtomic."
+    },
+    {
+      "original": "0xfffffe000b55a1e4",
+      "native_symbol": "_PE_parse_boot_arg_str",
+      "evidence": "PE_parse_boot_argn_internal(PE_state.bootArgs->CommandLine (+0x6c), arg_string, arg_ptr, strlen, TRUE) as a tail call, between the paired isargsep and PE_get_default: pexpert/gen/bootargs.c PE_parse_boot_arg_str (the native one also reads the built-in boot arguments). The sandbox reads its 'rd' argument with it."
+    },
+    {
+      "original": "0xfffffe000acf454c",
+      "native_symbol": "_continuoustime_to_absolutetime",
+      "evidence": "umax(conttime, g) - g of one global (mach_absolutetime_asleep): 0 when conttime <= it, else the difference, osfmk/kern/clock.c; between the paired clock_get_uptime and absolutetime_to_continuoustime."
+    },
+    {
+      "original": "0xfffffe000ad4b73c",
+      "native_symbol": "_lck_rw_gate_init",
+      "evidence": "Zeroes the 24-byte gate at x1 and sets its type and state word (0x60001); the RELEASE reference compiles lck_rw_gate_init and lck_mtx_gate_init to these instructions; this one sits right before the paired lck_rw_gate_alloc_init, as osfmk/kern/locks.c orders them."
+    },
+    {
+      "original": "0xfffffe000ad8273c",
+      "native_symbol": "_task_set_cs_auxiliary_info",
+      "evidence": "if (task) { task->task_cs_auxiliary_info = info; return KERN_SUCCESS } (else KERN_INVALID_ARGUMENT): osfmk/kern/task.c; between the paired task_start_halt and task_hold_and_wait. AMFI calls it."
+    },
+    {
+      "original": "0xfffffe000ad8f6b8",
+      "native_symbol": "_task_deallocate_external",
+      "evidence": "NULL-checked os_ref release of the task's reference count (+0x10), the last reference going to the task's teardown: task_deallocate_external of osfmk/kern/task_ref.c, after the paired task_reference. The IOKit families call it."
+    },
+    {
+      "original": "0xfffffe000ad94128",
+      "native_symbol": "_thread_tid",
+      "evidence": "thread ? thread->thread_id : 0 (one load at +0x4f0): thread_tid of osfmk/kern/thread.c, which the sandbox, APFS and the display drivers call."
+    },
+    {
+      "original": "0xfffffe000ad94e9c",
+      "native_symbol": "_thread_set_allocation_name",
+      "evidence": "The current thread's kernel state (an authenticated pointer), old = its allocation_name; stores new_name when new_name or old is NULL; returns old: thread_set_allocation_name of osfmk/kern/thread.c, after the paired thread_set_thread_name."
+    },
+    {
+      "original": "0xfffffe000ae3d5a8",
+      "native_symbol": "_mach_vm_wire_level_monitor",
+      "evidence": "KERN_INVALID_ARGUMENT for requested_pages <= 0, else KERN_RESOURCE_SHORTAGE (6) when it exceeds atop(vm_global_user_wire_limit) - vm_page_wire_count: osfmk/vm/vm_pageout.c, the one native function between the paired vm_pressure_thread and mach_vm_pressure_level_monitor."
+    },
+    {
+      "original": "0xfffffe000ae72a14",
+      "native_symbol": "_mach_vm_region",
+      "evidence": "NULL map refused; flavor VM_REGION_BASIC_INFO (10) becomes VM_REGION_BASIC_INFO_64 (9); tail call to vm_map_region: mach_vm_region of osfmk/vm/vm_user.c, between the paired mach_vm_behavior_set and mach_vm_purgable_control_external."
+    },
+    {
+      "original": "0xfffffe000aec5fe0",
+      "native_symbol": "_ml_stack_remaining",
+      "evidence": "sp minus the bottom of the interrupt stack when sp is in it (cpu data +0x18 minus 16 KiB), else minus the thread's kernel stack (one page lower with a red zone stack): ml_stack_remaining of osfmk/arm/machine_routines_common.c."
+    },
+    {
+      "original": "0xfffffe000aefd90c",
+      "native_symbol": "_bufattr_setcpx",
+      "evidence": "bap->ba_cpx = cpx (a store at +0): bufattr_setcpx of bsd/vfs/vfs_bio.c; among the native bufattr functions between the paired buf_markfua and bufattr_dup."
+    },
+    {
+      "original": "0xfffffe000aefd924",
+      "native_symbol": "_bufattr_setcpoff",
+      "evidence": "bap->ba_cp_file_off = cpoff (a store at +8): bufattr_setcpoff, next to bufattr_setcpx."
+    },
+    {
+      "original": "0xfffffe000aefd930",
+      "native_symbol": "_bufattr_alloc",
+      "evidence": "kalloc_type of struct bufattr with Z_ZERO (a type view and flags 4, tail call to the allocator): bufattr_alloc, after bufattr_setcpoff."
+    },
+    {
+      "original": "0xfffffe000aefd944",
+      "native_symbol": "_bufattr_free",
+      "evidence": "kfree_type of struct bufattr (a type view and the pointer, tail call): bufattr_free, after bufattr_alloc."
+    },
+    {
+      "original": "0xfffffe000af682c4",
+      "native_symbol": "_fifo_lookup",
+      "evidence": "*ap->a_vpp = NULL; return ENOTDIR (20): the fifo vnode operations' lookup of bsd/miscfs/fifofs/fifo_vnops.c, among the paired fifo functions; APFS's fifo vnode operations table points at it."
+    },
+    {
+      "original": "0xfffffe000b226994",
+      "native_symbol": "_csblob_get_base_offset",
+      "evidence": "One 64-bit load from the blob (+0x28): csblob_get_base_offset of bsd/kern/kern_cs.c (the RELEASE reference has the same body); the first of the cs_blob accessors AMFI calls, before csblob_get_size and csblob_get_addr."
+    },
+    {
+      "original": "0xfffffe000b2269a0",
+      "native_symbol": "_csblob_get_size",
+      "evidence": "One 64-bit load from the blob (+0x40): csblob_get_size, after csblob_get_base_offset."
+    },
+    {
+      "original": "0xfffffe000b2269ac",
+      "native_symbol": "_csblob_get_addr",
+      "evidence": "One 64-bit load from the blob (+0x50): csblob_get_addr, after csblob_get_size."
+    },
+    {
+      "original": "0xfffffe000b2269b8",
+      "native_symbol": "_csblob_get_platform_binary",
+      "evidence": "blob && blob->csb_platform_binary (bit 0 of +0xdc) ? 1 : 0: csblob_get_platform_binary of bsd/kern/kern_cs.c, after csblob_get_addr."
+    },
+    {
+      "original": "0xfffffe000b26324c",
+      "native_symbol": "_proc_best_name",
+      "evidence": "p->p_name[0] ? p->p_name : p->p_comm (+0x56d, +0x55c): proc_best_name of bsd/kern/kern_proc.c, after the paired proc_name."
+    },
+    {
+      "original": "0xfffffe000b263410",
+      "native_symbol": "_proc_exiting",
+      "evidence": "p && a state byte of the proc (+0xe21) > 3, the one function between proc_noremotehang (p_flag test) and proc_lvfork (return 0), where xnu-12377 has proc_exiting and proc_in_teardown (folded into one in this build). APFS calls it."
+    },
+    {
+      "original": "0xfffffe000b267104",
+      "native_symbol": "_proc_is_translated",
+      "evidence": "p && (p->p_flag (+0x444, whose bit 2 proc_is64bit tests) & P_TRANSLATED (bit 17)): proc_is_translated of bsd/kern/kern_proc.c. The sandbox calls it."
+    },
+    {
+      "original": "0xfffffe000b3d53c4",
+      "native_symbol": "__ZNK11OSMetaClass13getSuperClassEv",
+      "evidence": "return superClassLink (+0x10): OSMetaClass::getSuperClass, between the paired checkMetaCastWithName and printInstanceCounts, before getKmodName."
+    },
+    {
+      "original": "0xfffffe000b417540",
+      "native_symbol": "__ZN11OSSerialize10setIndexedEb",
+      "evidence": "indexData (+0x50) = OSData::withCapacity(256) inlined (the OSData metaclass's alloc, initWithCapacity(0x100), release on failure); the bool argument unused: OSSerialize::setIndexed of libkern/c++/OSSerializeBinary.cpp."
+    },
+    {
+      "original": "0xfffffe000b42e66c",
+      "native_symbol": "__ZN8OSActionC2EPK11OSMetaClass",
+      "evidence": "Stores a signed vtable and retainCount 1, no instanceConstructed: the OSAction(const OSMetaClass *) constructor that subclasses call, right after OSAction.iig.cpp's static initializer."
+    },
+    {
+      "original": "0xfffffe000b42e698",
+      "native_symbol": "__ZN8OSActionD2Ev",
+      "evidence": "Stores -1 over the vtable pointer (~OSMetaClassBase, all that OSObject destructors compile to): OSAction's base destructor, after its constructor."
+    },
+    {
+      "original": "0xfffffe000b54c0bc",
+      "native_symbol": "_IOPMRootDomainGetWillShutdown",
+      "evidence": "return gWillShutdown != 0 (one 32-bit global): IOPMRootDomainGetWillShutdown of iokit/Kernel/IOPMrootDomain.cpp, between the root domain's operator new and the paired registerSleepWakeInterest."
+    },
+    {
+      "original": "0xfffffe000b5920cc",
+      "native_symbol": "_panic_with_options",
+      "evidence": "panic_trap_to_debugger(str, &args, reason, ctx, mask & ~0x200, NULL, return address, NULL) with four fixed arguments (reason, ctx, mask, str): panic_with_options of osfmk/kern/debug.c, between the paired Assert and panic_with_options_and_initiator (panic_with_data has five)."
     }
   ]
 }
