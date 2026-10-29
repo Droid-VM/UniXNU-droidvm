@@ -66,6 +66,10 @@ kernel_args = [
   # re-protection of __PRELINK_TEXT (arm_vm_prot_finalize) then sets the contiguous hint on a 64 KiB range whose pages __TEXT
   # mapped without it (arm_vm_init.c:1107). No hints until the emitter places native segments at 64 KiB.
   "use_contiguous_hint=0",
+  # xnu-12377's DEVELOPMENT watchdogs of interrupt-masked and preemption-disabled time (iOS: 12000 timebase ticks, 625 us at
+  # 19.2 MHz, then panic): a vCPU the host preempts holds both for as long as it is off its core (usermanagerd's first boot, 881 us).
+  "interrupt-masked-debug-mode=0",
+  "sched_preemption_disable_debug_mode=0",
   "-v",
 ]
 
