@@ -451,7 +451,9 @@ def main():
         ('#address-cells', struct.pack('<I', 2)),
         ('#size-cells', struct.pack('<I', 2)),
     ], [
-        node('chosen', [('random-seed', os.urandom(64)),
+        # xnu-12377 takes 4 x 64 seed bytes on ARM and panics with fewer ("Expected 256 seed bytes from bootloader"); older
+        # kernels read the first 64.
+        node('chosen', [('random-seed', os.urandom(256)),
                         *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]
                           if args.unique_chip_id is not None else []),
                         ('osenvironment', b'main\0'),

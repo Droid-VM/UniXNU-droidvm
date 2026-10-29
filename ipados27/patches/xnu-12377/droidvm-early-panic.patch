@@ -1,0 +1,30 @@
+The message and caller of a panic before the console exists, kept in droidvm_early_panic and droidvm_early_panic_caller for the
+host's reader (tools/rig peek.py): a DroidVM guest has no serial console, and such a panic writes nowhere before it parks the CPU.
+
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 75b6d55..5543ded 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -279,6 +279,9 @@ void panic_spin_forever(void) __dead2;
+ #endif
+ #if defined(__arm64__) && !defined(APPLE_ARM64_ARCH_FAMILY)
+ extern void panic_park_cpu(void) __dead2;
++/* The message and caller of a panic before the console exists (panic_trap_to_debugger), for the host's reader (peek.py). */
++char droidvm_early_panic[256] __attribute__((aligned(64)));
++volatile uint64_t droidvm_early_panic_caller;
+ #endif
+ void panic_stackshot_release_lock(void);
+ extern void PE_panic_hook(const char*);
+@@ -1267,6 +1270,12 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ 	if (PE_kputc == NULL) {
+ 		char buf[EARLY_PANIC_BUFLEN];
+ 		vsnprintf(buf, EARLY_PANIC_BUFLEN, panic_format_str, *panic_args);
++#if defined(__arm64__) && !defined(APPLE_ARM64_ARCH_FAMILY)
++		/* A virtual machine with no console this early: keep the message and its caller where the host reads guest memory. */
++		strlcpy(droidvm_early_panic, buf, sizeof(droidvm_early_panic));
++		droidvm_early_panic_caller = panic_caller;
++		__builtin_arm_dsb(DSB_SY);
++#endif
+ 		paniclog_append_noflush("panic: %s\n", buf);
+ 		paniclog_append_noflush("Kernel panicked very early before serial init, spinning forever...\n");
+ 		panic_spin_forever();

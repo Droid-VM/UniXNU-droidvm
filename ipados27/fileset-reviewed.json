@@ -1,0 +1,110 @@
+{
+  "kernelcache_sha256": "38e6d9fa5f789b8228f4617ef4c6d2a3fd8ab564abdc9b62920f1db53fc1780a",
+  "functions": [
+    {
+      "original": "0xfffffe000aecef24",
+      "native_symbol": "_mach_absolute_time",
+      "evidence": "Reads the non-speculative Apple timebase (S3_4_C15_C10_6, KERNEL_CNTVCTSS_EL0 of machine_routines.c) and adds the CPU's base timebase (current thread -> CpuDatap -> +88), retrying when the CPU changed. corecrypto calls it first in a FIPS timing function after its POST."
+    },
+    {
+      "original": "0xfffffe000acf450c",
+      "native_symbol": "_clock_get_uptime",
+      "evidence": "The same timebase read as mach_absolute_time, stored to *x0 and returning nothing: clock_get_uptime(uint64_t *)."
+    },
+    {
+      "original": "0xfffffe000ae9bd20",
+      "native_symbol": "_SHA512_Init",
+      "evidence": "References 'corecrypto_sha2.c', 'SHA512_Init' and '%s: inconsistent size for SHA512 context @%s:%d': the libkern/crypto/corecrypto_sha2.c wrapper."
+    },
+    {
+      "original": "0xfffffe000b42b4a0",
+      "native_symbol": "_register_crypto_functions",
+      "evidence": "Returns -1 when a global pointer is already set, else stores x0 there (and sets a flag): register_crypto_functions(funcs) of libkern/crypto/register_crypto.c. corecrypto calls it with its function table (in its __DATA_CONST) right after the POST."
+    },
+    {
+      "original": "0xfffffe000aebdee4",
+      "native_symbol": "_cpu_number",
+      "evidence": "TPIDR_EL1 (the current thread), a 16-bit load from its machine area: cpu_number() of osfmk/arm/cpu_common.c, current_thread()->machine.cpu_number."
+    },
+    {
+      "original": "0xfffffe000aec69e4",
+      "native_symbol": "_ml_cpu_init_completed",
+      "evidence": "A one-branch thunk to sched_cpu_init_completed (paired by reference order); the native ml_cpu_init_completed is the same thunk."
+    },
+    {
+      "original": "0xfffffe000aec097c",
+      "native_symbol": "_IOSimpleLockUnlock",
+      "evidence": "A one-branch thunk to hw_lock_unlock (paired), right after the paired IOSimpleLockLock (0xfffffe000aec08f4) of IOLocks.cpp: the RELEASE IOSimpleLockUnlock, lck_spin_unlock inlined to its tail call."
+    },
+    {
+      "original": "0xfffffe000b3d6498",
+      "native_symbol": "__ZN8OSObjectC2EPK11OSMetaClass",
+      "evidence": "Stores the OSObject vtable (+16, signed with pacda and the 0xcda1 vtable discriminator) at [x0] and 1 at [x0+8] (retainCount): an OSObject constructor; both (the default and the OSMetaClass one, OSObject.cpp:427 and :433) compile to these instructions."
+    },
+    {
+      "original": "0xfffffe000b4424c4",
+      "native_symbol": "_IOLockAlloc",
+      "evidence": "Loads a global (the IOLock group) into x0 and tail-calls lck_mtx_alloc_init (paired); the next function is IOLockFree (lck_mtx_destroy, then kfree_type of KT_LCK_MTX), as IOLocks.cpp:54 and :72. The attribute argument is not set: 12377's lck_mtx_alloc_init ignores it."
+    },
+    {
+      "original": "0xfffffe000b55be5c",
+      "native_symbol": "_PE_i_can_has_debugger",
+      "evidence": "if (x0) *x0 = (g1 ? g2 : 0); return g1: PE_i_can_has_debugger(uint32_t *debug_flags) of pexpert, between the paired PE_call_timebase_callback and PE_update_panic_crc."
+    },
+    {
+      "original": "0xfffffe000b55be88",
+      "native_symbol": "_PE_panic_debugging_enabled",
+      "evidence": "Returns one 32-bit global, right after PE_i_can_has_debugger and before the paired PE_update_panic_crc."
+    },
+    {
+      "original": "0xfffffe000ae825b8",
+      "native_symbol": "_strncasecmp",
+      "evidence": "Returns 0 for n == 0, then compares bytes folded to lower case (sub 65 / orr 0x20) up to n: strncasecmp, between the paired strcasecmp and strchr."
+    },
+    {
+      "original": "0xfffffe000ad6c15c",
+      "native_symbol": "_preemption_enabled",
+      "evidence": "0 when the current thread's preemption level (+448) is nonzero, else tests DAIF: preemption_enabled()."
+    },
+    {
+      "original": "0xfffffe000aec69f8",
+      "native_symbol": "_ml_get_topology_info",
+      "evidence": "Returns the address of a global (adrp/add), the topology structure whose +4 ml_get_cpu_count reads; between the paired current_act and ml_cpu_down."
+    },
+    {
+      "original": "0xfffffe000aec7e34",
+      "native_symbol": "_ml_get_cpu_count",
+      "evidence": "Returns the 32-bit word at the topology structure +4 (num_cpus of ml_topology_info_t), between the paired ml_io_map and ml_get_boot_cpu_number."
+    },
+    {
+      "original": "0xfffffe000aec8c20",
+      "native_symbol": "_ml_page_protection_type",
+      "evidence": "Returns a constant, between the paired ml_static_mfree and ml_nofault_copy; the native one returns this kernel's protection type."
+    },
+    {
+      "original": "0xfffffe000af295a4",
+      "native_symbol": "_vnode_usecount",
+      "evidence": "One 32-bit load from the vnode (v_usecount), between the paired vnode_isinuse and vnode_iocount."
+    },
+    {
+      "original": "0xfffffe000aefe018",
+      "native_symbol": "_buf_vnode",
+      "evidence": "One pointer load from the buf (b_vp), between the paired buf_setdataptr and buf_callback."
+    },
+    {
+      "original": "0xfffffe000b2638a0",
+      "native_symbol": "_proc_is64bit",
+      "evidence": "0 for NULL, else tests bit 2 (P_LP64) of a proc flag byte: proc_is64bit, between the paired proc_ucred_locked and proc_isinitproc."
+    },
+    {
+      "original": "0xfffffe000ad32bb4",
+      "native_symbol": "_host_self",
+      "evidence": "Returns the address of a global (realhost): host_self (host_priv_self has the same body), between the paired host_get_io_main and host_set_atm_diagnostic_flag."
+    },
+    {
+      "original": "0xfffffe000b3d2524",
+      "native_symbol": "_OSAddAtomic64",
+      "evidence": "ldadd x0, x0, [x1]; ret: OSAddAtomic64(amount, address) (OSAddAtomicLong has the same body), between the paired OSAddAtomic and OSIncrementAtomic."
+    }
+  ]
+}

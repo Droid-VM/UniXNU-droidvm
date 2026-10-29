@@ -7,3 +7,4 @@ non-apple-idle-wfi.patch
 zzx-pmap-sync-flush.patch
 zzw-native-sandbox-grant-patterns.patch
 source-storage-start.patch
+droidvm-early-panic.patch
