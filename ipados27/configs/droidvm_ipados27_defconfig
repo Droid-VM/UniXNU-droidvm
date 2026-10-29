@@ -13,7 +13,9 @@ CONFIG_XNU_ARMCPU=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_DT_PANIC_REGION=y
-CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+# xnu-12377's OSKext starts the original corecrypto through the source provider's entry (source-corecrypto14-bootstrap), which
+# prng_random.c has only in source mode; prelinked (the OS profile's fragment) leaves the kernel unlinked. As sheng's.
+CONFIG_XNU_CRYPTO_BOOTSTRAP="source"
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 # The kernel collection of 24A446 is an MH_FILESET; XnuPrelink's fileset emitter links this kernel into it.
 CONFIG_XNU_KERNEL_CHAINED_FIXUPS=y
