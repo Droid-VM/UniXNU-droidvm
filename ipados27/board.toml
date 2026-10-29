@@ -103,10 +103,13 @@ kernel_args = [
   "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1",
   "offline-key-events=1",
-  # The HID device (HidInputProbe.cpp) with the Home button and touch, as package/DroidVMBootArgs.c.
+  # The HID device (HidInputProbe.cpp) with the Home button and touch, as package/DroidVMBootArgs.c, and the touch screen as a device
+  # of its own (sheng-touch-split): iPadOS 27 serves HID through AppleUserHIDEventService, whose service keeps the combined device's
+  # primary usage (Keyboard), and backboardd takes digitizer events only from a Digitizer/Touch Screen service.
   "offline-hid-input=1",
   "offline-hid-home=1",
   "sheng-touch-hid=1",
+  "sheng-touch-split=1",
   "sheng-aks=1",
   "sheng-aks-sls=3",
   # The host's file mailbox (tools/rig export.py, crashes.py), answered by the droidvm-monitor worker.
