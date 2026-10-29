@@ -69,7 +69,9 @@ def summary(name, raw):
     except json.JSONDecodeError:
         return [f'== {name}', *raw.splitlines()[:8]]
     lines = [f"== {name}  (bug_type {header.get('bug_type')}, {header.get('timestamp', report.get('captureTime', ''))})"]
-    if 'exception' in report:
+    if isinstance(report.get('exception'), str):   # a stackshot report (stacks+...): its reason, no faulting thread
+        lines.append(f"stackshot: {report.get('exception')} {report.get('reason', '')}".rstrip())
+    elif 'exception' in report:
         exception, termination = report['exception'], report.get('termination', {})
         lines.append(f"{report.get('procName')} pid {report.get('pid')} ({report.get('procPath')})")
         lines.append(f"{exception.get('type')} {exception.get('signal', '')} {exception.get('subtype', '')}".rstrip())

@@ -284,6 +284,9 @@ print(subprocess.run(['python3', ROOT / 'scripts/build-adreno740-accelerator.py'
                      text=True).stdout, end='')
 accelerator = ROOT / 'build/adreno740-accelerator'
 objects += [accelerator / 'NativeAdrenoAccelerator.late.o', accelerator / 'original-bindings.o']
+# An arm64e fileset (iPadOS 27) reaches the original base through owned stubs, whose absolute targets are a separate object.
+if (accelerator / 'original-addresses.o').is_file():
+    objects.append(accelerator / 'original-addresses.o')
 
 defined = subprocess.run(['xcrun', 'nm', '-g', '-U', *objects], capture_output=True, text=True, check=True).stdout
 required = ['_native_adreno_publish', '_sheng_gpu_power_probe', '_droidvm_gpu_window_base', '_AdrenoPM4Type7',

@@ -9,6 +9,7 @@
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSData.h>
 #include <kern/task.h>
+#include <kern/clock.h>
 #include <sys/proc.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
@@ -264,10 +265,36 @@ static bool offeredToVirtioDisplay;
 volatile uint32_t droidvm_virtio_retire_on_offer=1;
 // format: GopFramebuffer's NGPSwap format (NativeGOPWire.h). The virtio GPU display scans the surface out as it lies, 32-bit BGRA rows
 // (NGP_BGRX8888, 1) only; a half-float frame (iPadOS 27's 'RGhA') goes to the GOP presenter's GPU conversion, or the CPU copy.
+// A frame neither takes is copied by the CPU (NativeLegacyDisplay's copy, or its half-float conversion) as soon as this returns, and
+// the render server submits a swap once its GPU work is submitted, not done: the copy would read the surface before the GPU drew it
+// (iPadOS 27's half-float frames showed black, every one). When that copy is what the screen shows -- a format the virtio display
+// does not scan out, or no virtio display -- it first waits, as the virtio display's worker does, for the GPU work submitted until
+// now: at most DROIDVM_CPU_COPY_WAIT_US, then it copies what is there. A BGRA frame the busy virtio display refused is not waited
+// for (that display shows the next one; the copy only keeps the GOP framebuffer current).
+extern "C" uint64_t droidvm_virtgpu_submitted(void);
+extern "C" bool droidvm_virtgpu_finished(uint64_t order);
+extern "C" volatile uint32_t droidvm_virtio_display_state;
+volatile uint64_t droidvm_cpu_copy_waits,droidvm_cpu_copy_wait_us,droidvm_cpu_copy_late;
+static constexpr uint64_t DROIDVM_CPU_COPY_WAIT_US=200000;
+static void waitForGpuWork() {
+    const uint64_t work=droidvm_virtgpu_submitted();
+    if(droidvm_virtgpu_finished(work))return;
+    uint64_t begin=mach_absolute_time(),elapsed=0,ns=0;
+    bool drawn=false;
+    do {
+        delay_for_interval(100,NSEC_PER_USEC);
+        drawn=droidvm_virtgpu_finished(work);
+        absolutetime_to_nanoseconds(mach_absolute_time()-begin,&ns);elapsed=ns/1000;
+    } while(!drawn && elapsed<DROIDVM_CPU_COPY_WAIT_US);
+    droidvm_cpu_copy_waits=droidvm_cpu_copy_waits+1;droidvm_cpu_copy_wait_us=droidvm_cpu_copy_wait_us+elapsed;
+    if(!drawn)droidvm_cpu_copy_late=droidvm_cpu_copy_late+1;
+}
 bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height,uint32_t format) {
     offeredToVirtioDisplay=format==1 && droidvm_virtio_gpu_offer(display,memory,stride,width,height);
     if(offeredToVirtioDisplay)return true;
-    return gpuHandoffPresenter && native_gop_gpu_offer(gpuHandoffPresenter,display,memory,stride,width,height,format);
+    if(gpuHandoffPresenter && native_gop_gpu_offer(gpuHandoffPresenter,display,memory,stride,width,height,format))return true;
+    if(format!=1 || droidvm_virtio_display_state!=2)waitForGpuWork();
+    return false;
 }
 extern "C" bool native_legacy_gpu_retires_on_offer(void *) {return offeredToVirtioDisplay && droidvm_virtio_retire_on_offer;}
 void native_legacy_gpu_fallback_observed(int status) {

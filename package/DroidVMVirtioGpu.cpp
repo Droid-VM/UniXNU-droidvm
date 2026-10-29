@@ -2,6 +2,9 @@
 // Modern virtio-mmio GPU transport. No renderer or display policy belongs here.
 #include "DroidVMVirtioGpu.h"
 #include <kern/clock.h>
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#endif
 #include <machine/machine_routines.h>
 #include <pexpert/device_tree.h>
 extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -36,15 +39,31 @@ struct Slot {
     bool fenced;
     IOReturn result;
 };
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+// A board whose kernel data has no room for them (the iPadOS 27 fileset: the native __DATA must fit the original kernel's slot)
+// takes the queues and buffers below from one physically contiguous allocation when the device starts; the arrays become pointers
+// to their rows, and physical() answers from the allocation's base.
+uint8_t (*queues)[16384];
+uint8_t (*requests)[SlotRequest];
+uint8_t (*responses)[SlotResponse];
+uint8_t (*largeRequest)[MaxCommand], (*largeResponse)[MaxCommand];
+uint8_t *hugeRequest;
+IOBufferMemoryDescriptor *buffers;
+uintptr_t buffersBase;
+uint64_t buffersPA, buffersBytes;
+#else
 alignas(16384) uint8_t queues[2][16384];
 alignas(16384) uint8_t requests[Large][SlotRequest];
 alignas(4096) uint8_t responses[Large][SlotResponse];
 alignas(16384) uint8_t largeRequest[LargeSlots][MaxCommand], largeResponse[LargeSlots][MaxCommand];
+#endif
 // The one request buffer for a command longer than MaxCommand, lent to a large slot until the device returns it (it has read the
 // request by then): a CREATE_BLOB_USER over a process's scattered pages -- a 44.5 MiB no-copy buffer is ~11,400 runs, 180 KiB of
 // entries -- which was refused, and Metal took the refusal for a lost device (Core Animation ended backboardd: a respring each
 // time the wallpaper editor opened). Such commands are rare; another one waits for the buffer as a command waits for a slot.
+#if !DROIDVM_VIRTIO_GPU_DYNAMIC
 alignas(16384) uint8_t hugeRequest[HugeRequest];
+#endif
 uint64_t hugeRequestPA;
 uint32_t hugeOwner = Slots;   // the slot the buffer is lent to; Slots when free
 Slot slots[Slots];
@@ -64,6 +83,12 @@ void wr64(unsigned offset, uint64_t v) { wr(offset, uint32_t(v)); wr(offset + 4,
 void barrier() { __asm__ volatile("dmb osh" ::: "memory"); }
 uint64_t nowUs() { uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000; }
 bool physical(void *p, size_t size, uint64_t &pa) {
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+    if (buffers && uintptr_t(p) >= buffersBase && uintptr_t(p) - buffersBase <= buffersBytes - size) {
+        pa = buffersPA + (uintptr_t(p) - buffersBase);
+        return true;
+    }
+#endif
     pa = ml_static_vtop(uintptr_t(p));
     for (size_t i = 0; i < size; i += 4096) if (ml_static_vtop(uintptr_t(p) + i) != pa + i) return false;
     return pa != 0;
@@ -108,6 +133,31 @@ void reap() {
     if (any) { uint32_t interrupts = rd(0x60) & 3; if (interrupts) wr(0x64, interrupts); }
 }
 }
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+// One physically contiguous, wired allocation for the queues and command buffers, each region 16 KiB aligned.
+bool allocateBuffers() {
+    if (buffers) return true;
+    const uint64_t sizes[] = {sizeof(*queues) * 2, sizeof(*requests) * Large, sizeof(*responses) * Large,
+                              sizeof(*largeRequest) * LargeSlots, sizeof(*largeResponse) * LargeSlots, HugeRequest};
+    uint64_t at[6], total = 0;
+    for (unsigned i = 0; i < 6; ++i) { at[i] = total; total = (total + sizes[i] + 16383) & ~uint64_t(16383); }
+    buffers = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous),
+                                                               total, 0x0000fffffffff000ULL);
+    if (!buffers) return false;
+    buffersBase = uintptr_t(buffers->getBytesNoCopy());
+    buffersPA = buffers->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    buffersBytes = total;
+    if (!buffersBase || !buffersPA) return false;
+    memset(reinterpret_cast<void *>(buffersBase), 0, total);
+    queues = reinterpret_cast<uint8_t (*)[16384]>(buffersBase + at[0]);
+    requests = reinterpret_cast<uint8_t (*)[SlotRequest]>(buffersBase + at[1]);
+    responses = reinterpret_cast<uint8_t (*)[SlotResponse]>(buffersBase + at[2]);
+    largeRequest = reinterpret_cast<uint8_t (*)[MaxCommand]>(buffersBase + at[3]);
+    largeResponse = reinterpret_cast<uint8_t (*)[MaxCommand]>(buffersBase + at[4]);
+    hugeRequest = reinterpret_cast<uint8_t *>(buffersBase + at[5]);
+    return true;
+}
+#endif
 bool start() {
     if (attempted) return ready();
     attempted = true;
@@ -122,6 +172,9 @@ bool start() {
     if (reg[0] < ranges[0] || reg[1] < 0x100 || reg[1] > ranges[2] || reg[0] - ranges[0] > ranges[2] - reg[1]) return fail("invalid reg");
     registers = ml_io_map(reg[0] - ranges[0] + ranges[1], 0x1000);
     if (!registers || rd(0) != 0x74726976 || rd(4) != 2 || rd(8) != 16) return fail("not a modern virtio GPU");
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+    if (!allocateBuffers()) return fail("no contiguous command buffers");
+#endif
     for (uint32_t s = 0; s < Slots; ++s) {
         Slot &slot = slots[s];
         slot.request = s >= Large ? largeRequest[s - Large] : requests[s];
@@ -131,7 +184,7 @@ bool start() {
         if (!physical(slot.request, slot.requestCapacity, slot.requestPA) || !physical(slot.response, slot.responseCapacity, slot.responsePA))
             return fail("noncontiguous command buffers");
     }
-    if (!physical(hugeRequest, sizeof hugeRequest, hugeRequestPA)) return fail("noncontiguous command buffers");
+    if (!physical(hugeRequest, HugeRequest, hugeRequestPA)) return fail("noncontiguous command buffers");
     lock = IOLockAlloc(); if (!lock) return fail("no lock");
     // Reset the firmware's queues before replacing any descriptor addresses.
     wr(0x70, 0);

@@ -370,18 +370,14 @@ extern "C" int boot_progress_prepare_scanout(void) {return 1;}
 extern "C" void boot_progress_cancel_scanout(void) {}
 extern "C" void boot_progress_stage(const char *) {}
 extern "C" int boot_progress_pulse_anchor(uintptr_t,uint64_t,unsigned,unsigned,unsigned) {return 0;}
-// DroidVM: the virtio GPU display of the iPadOS 17 board is not part of this archive. The probe offers no frame to it (every frame
-// goes to the GOP presenter), and the render server's own 1/60 s paces the frames.
-extern "C" void droidvm_virtio_gpu_display_start(void) {}
-extern "C" bool droidvm_virtio_gpu_offer(void *,IOMemoryDescriptor *,uint64_t,uint32_t,uint32_t) {return false;}
-extern "C" void droidvm_virtio_gpu_boot_dirty(void) {}
-extern "C" {volatile uint32_t droidvm_virtio_display_refresh_hz=0;}
-// The board hooks the shared probe and backend call (as the iPadOS 17 board's DroidVMStubs.c defines them): no HID or touch probe
+// The board hooks the shared probe and backend call (as the iPadOS 17 board's DroidVMStubs.c defines them; sheng_gpu_power_probe is
+// DroidVMGpu.cpp's, the virtio GPU's DroidVMVirtioGpu*.cpp's): no HID or touch probe
 // in this archive (native_touch_probe, the late probe's hook after bsd_autoconf, is DroidVMMonitor27.c), no UFS display window, no
 // cpufreq or GPU power probe.
 extern "C" void native_hid_input_probe(void) {}
 extern "C" void sheng_cpufreq_probe(void) {}
-extern "C" void sheng_gpu_power_probe(void) {}
+// sheng's boot log export (NativeAdrenoPublish's diagnostic upload): no UFS log here.
+extern "C" int boot_log_export_put(uint32_t,uint32_t,uint32_t,const void *,uint32_t) {return -1;}
 extern "C" {volatile uint32_t native_ufs_dpu_state=0;}
 extern "C" uint32_t native_ufs_dpu_map(unsigned,const uint64_t *,unsigned) {return 0;}
 ''')
@@ -419,6 +415,18 @@ void native_touch_probe(void) {
 compile_c(monitor, OUT / 'DroidVMMonitor27.o')
 export_source = ROOT / 'kits/droidvm/DroidVMFileExport.c'
 compile_c(export_source, OUT / 'DroidVMFileExport.o', 'bsd/DEVELOPMENT/kern_exec.o.json', ('-DDROIDVM_EXPORT_BYTES=(256u<<10)',))
+# The virtio GPU (kits/droidvm/DroidVMVirtioGpu*.cpp: transport, the 3D methods over the host's DRM context, and the display the
+# probe offers frames to) and NativeAdreno's face for Metal over it (scripts/build-droidvm-gpu.py, an earlier archive step), as the
+# iPadOS 17 board's display archive takes them. The 3D methods' ABI (DroidVMVirtgpuABI.h) is NativeAdreno's.
+virtio_gpu_sources = [ROOT / 'kits/droidvm' / name for name in ('DroidVMVirtioGpu.cpp', 'DroidVMVirtioGpu3D.cpp', 'DroidVMVirtioGpuDisplay.cpp')]
+virtio_gpu_objects = []
+for gpu_source in virtio_gpu_sources:
+    # Its queues and command buffers (about 9 MiB) come from a contiguous allocation (DROIDVM_VIRTIO_GPU_DYNAMIC): the native
+    # __DATA must fit the original kernel's slot of the fileset.
+    compile_cpp(gpu_source, OUT / (gpu_source.stem + '.o'), ('-I', str(ROOT / 'drivers/Adreno740'), '-DDROIDVM_VIRTIO_GPU_DYNAMIC=1'))
+    virtio_gpu_objects.append(OUT / (gpu_source.stem + '.o'))
+gpu_objects = [ROOT / p for p in json.loads((ROOT / 'build/droidvm-gpu/objects.json').read_text())]
+gpu_sources = [ROOT / p for p in json.loads((ROOT / 'build/droidvm-gpu/sources.json').read_text())]
 # The keystore state service (AppleKeyStoreState) and its probe, unchanged from iPadOS 17.
 keystore_source = ROOT / 'kits/droidvm/KeyStoreProbe.cpp'
 compile_cpp(keystore_source, OUT / 'KeyStoreProbe.o')
@@ -436,12 +444,12 @@ archive = OUT / 'libNativeLegacyDisplay.late.a'
 archive.unlink(missing_ok=True)
 run(['xcrun', 'ar', 'rcs', archive, late, OUT / 'original-bindings.o', OUT / 'original-addresses.o', OUT / 'LegacyDisplayProbe.o',
      OUT / 'LegacyDisplaySupport27.o', gop_late, OUT / 'KeyStoreProbe.o', keyevents_late, OUT / 'DroidVMMonitor27.o',
-     OUT / 'DroidVMFileExport.o'])
+     OUT / 'DroidVMFileExport.o', *virtio_gpu_objects, *gpu_objects])
 sources = [ROOT / 'drivers/GopFramebuffer/NativeLegacyDisplay.cpp', ROOT / 'drivers/GopFramebuffer/NativeLegacyRequest.h',
            ROOT / 'drivers/GopFramebuffer/NativeGOPPresenter.cpp', ROOT / 'drivers/GopFramebuffer/NativeGOPWire.h',
            ROOT / 'drivers/GopFramebuffer/NativeHalfCodes.h', source,
            ROOT / 'scripts' / ABI_PATH.name, keystore_source, ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',
-           export_source]
+           export_source, *virtio_gpu_sources, *gpu_sources]
 (OUT / 'build-report.json').write_text(json.dumps(dict(
     source_sha256={str(p.relative_to(ROOT)): sha(p) for p in sources}, generated_abi_sha256=sha(OUT / 'OriginalLegacyFramebufferABI.h'),
     kernelcache_sha256=abi['kernelcache_sha256'], compiled_object_sha256=sha(obj), archive_sha256=sha(archive),

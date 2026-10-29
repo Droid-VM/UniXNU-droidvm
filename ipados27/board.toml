@@ -40,6 +40,12 @@ archives = [
   # The display (scripts/build-droidvm-legacy-display.py): GopFramebuffer's owned backend under the original IOMobileFramebufferLegacy
   # of the fileset, presenting to the firmware framebuffer, and the key-store event service, as sheng's board builds them.
   "component:AppleKeyStoreState",
+  # Metal over the virtio GPU (DroidVMGpu.cpp, scripts/build-droidvm-gpu.py as on iPadOS 17): NativeAdreno's user client, surface,
+  # execbuf and memory, with the staged AGXAccelerator under the original IOGPUFamily of the fileset (build-adreno740-accelerator.py,
+  # the reviewed 24A446 base). Its objects ride in the display archive. Adreno740 and AdrenoMetal are not components (that would
+  # build sheng's whole GPU driver); their checkouts are linked into the tree first.
+  "link-droidvm-gpu-sources.py",
+  "build-droidvm-gpu.py",
   "build-droidvm-legacy-display.py",
 ]
 
@@ -66,6 +72,10 @@ kernel_args = [
   "armcpu-self-ipi=1",
   "armcpu-spi-ipi=1",
   "native-source-storage=1",
+  # The Data disk keeps what the system writes in the store window of the third virtio-mmio disk (package/DroidVMDataStore.c,
+  # tools/rig/make-data-store.sh), not in RAM: a 2 GiB volatile Data held 781 MiB of it in guest RAM after one boot, and the GPU's
+  # contiguous blob pages then found none free. The Data seed is the 12 GiB one (seed-data-grow.py --gib 12).
+  "droidvm-data-persist=2",
   # The fileset puts this 4 KiB kernel's __TEXT at a 16 KiB boundary inside the collection's __PRELINK_TEXT: lockdown's
   # re-protection of __PRELINK_TEXT (arm_vm_prot_finalize) then sets the contiguous hint on a 64 KiB range whose pages __TEXT
   # mapped without it (arm_vm_init.c:1107). No hints until the emitter places native segments at 64 KiB.
@@ -94,6 +104,15 @@ kernel_args = [
   "sheng-aks-sls=3",
   # The host's file mailbox (tools/rig export.py, crashes.py), answered by the droidvm-monitor worker.
   "droidvm-monitor=1000",
+  # Metal's 3D through the virtio GPU's DRM context (drm2kgsl on the host), and the AGXAccelerator for Metal's discovery, as the
+  # iPadOS 17 kernel's built-in arguments (package/DroidVMBootArgs.c).
+  "vgpu-3d=1",
+  "droidvm-gpu-metal=1",
+  # The plugin's addon view over /System/Library/Extensions and LaunchDaemons (the Data seed's /private/var/ngpu, staged by the fork's
+  # add-gpu-plugin-data.py --plugin build/adreno-metal-plugin27), and the processes besides the render server that get the
+  # accelerator's user client (the seed's NativeAdrenoMetal.clients lists the same).
+  "sheng-gpu-addon=1",
+  "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent",
   "-v",
 ]
 

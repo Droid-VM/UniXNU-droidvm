@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """The Data seed of the iPadOS 27 board: 24A446's own /private/var in a fresh APFS volume, Setup skipped, packed for DarwinBoot.
 
-  build-droidvm-data-seed.py --tree TREE --profile PROFILE --ipsw IPSW_DIR [--gib 2]
+  build-droidvm-data-seed.py --tree TREE --profile PROFILE --ipsw IPSW_DIR [--gib 2] [--plugin DIR [--clients NAMES] [--store-gib 12]]
 
 As the iPadOS 17 build makes its seed (scripts/build-droidvm-all.py data-base): the IPSW's OS image is attached read-only, the
 fork's prepare-owner-data-fixture.py copies its /private/var into a new 32 MiB APFS volume (whose volume UUID the kernel mounts
 Data by: CONFIG_XNU_OWNER_DATA_VOLUME_UUID), DarwinBoot's packed_ramdisk packs it, seed-data-grow.py makes the container a volatile
-GIB GiB one, seed-data-skip-setup.py marks Setup done for 24A446, and seed-data-prefs.py adds PREFS. Not yet: the App cryptex, the GPU plugin, ownervisor.
+GIB GiB one, seed-data-skip-setup.py marks Setup done for 24A446, and seed-data-prefs.py adds PREFS. With --plugin, the fork's
+add-gpu-plugin-data.py then stages the Metal plugin (the build directory of build-adreno-metal-plugin.py --target ios27) for the
+render server and the GPU clients, and seed-data-grow.py makes the container STORE_GIB GiB for the persistent Data store
+(droidvm-data-persist=2): data-<STORE_GIB>g-27-gpu.dbr. Its CDHashes are trusted by build-droidvm-trust.py --owner <DIR>/trust.json.
+A new seed needs a new store (tools/rig/make-data-store.sh): the store holds the changes of the seed it ran on. Not yet: the App
+cryptex, ownervisor.
 
 The OS image is the decrypted IPSW member whose digest the OS profile pins ([root] os_image_sha256, as recorded by the IPSW cache
 next to it). macOS refuses an image attachment on the external DATA volume to a process started over ssh, so the image, its mount
@@ -26,6 +31,8 @@ import tomllib
 SCRATCH = Path('/tmp') / f'droidvm27-seed-{os.environ.get("USER", "build")}'
 # The preferences the seed carries (seed-data-prefs.py USER:DOMAIN:KEY=VALUE).
 PREFS = ['mobile:com.apple.coreanimation:CAEnableMedina=false', 'root:com.apple.coreanimation:CAEnableMedina=false']
+# The processes besides the render server that get a native Metal device (the board's droidvm-gpu-clients), as on iPadOS 17.
+GPU_CLIENTS = 'WidgetRenderer_Default,PosterBoard,iconservicesagent'
 
 
 def run(command, **kwargs):
@@ -77,6 +84,10 @@ def main():
     parser.add_argument('--gib', type=int, default=2, help='the Data container size (volatile; default 2)')
     parser.add_argument('--packer', type=Path, default=None,
                         help='DarwinBoot\'s Test directory (packed_ramdisk.py); default: the UniXNU checkout\'s above the tree')
+    parser.add_argument('--plugin', type=Path, default=None,
+                        help='the Metal plugin build (TREE/build/adreno-metal-plugin27) to stage, for the persistent Data store')
+    parser.add_argument('--clients', default=GPU_CLIENTS, help=f'with --plugin: the GPU clients (default {GPU_CLIENTS})')
+    parser.add_argument('--store-gib', type=int, default=12, help='with --plugin: the container size for the store (default 12)')
     args = parser.parse_args()
     tree = args.tree.resolve()
     packer = args.packer or next((base / 'drivers/DarwinBoot/Test' for base in tree.parents
@@ -123,12 +134,33 @@ def main():
     # every commit raised CASecureIndicatorLayerInvalidName ("Invalid indicator name (null)"), aborting SpringBoard.
     final = work / f'data-{args.gib}g-27.dbr'
     run(['python3', root / 'scripts/seed-data-prefs.py', skipped, final, *PREFS], cwd=root)
+    plugin = None
+    if args.plugin:
+        # The plugin is copied to the system volume as well: the staging script attaches the seed there.
+        plugin = SCRATCH / 'plugin27'
+        if plugin.exists():
+            shutil.rmtree(plugin)
+        shutil.copytree(args.plugin.resolve(), plugin)
+        staged = work / f'data-{args.gib}g-27-gpu.dbr'
+        run(['python3', root / 'scripts/add-gpu-plugin-data.py', '--publish', '--plugin', plugin, '--clients', args.clients, final, staged],
+            cwd=root)
+        final = work / f'data-{args.store_gib}g-27-gpu.dbr'
+        run(['python3', root / 'scripts/seed-data-grow.py', '--gib', args.store_gib, staged, final], cwd=root)
     for path in sorted(work.iterdir()):
         shutil.copyfile(path, out / path.name)
     record = dict(build=build_id, volume_uuid=seed['volume_uuid'], launchd_sha256=launchd, os_image=source.name,
-                  seed=final.name, seed_sha256=hashlib.sha256((out / final.name).read_bytes()).hexdigest(), preferences=PREFS)
+                  seed=final.name, seed_sha256=hashlib.sha256((out / final.name).read_bytes()).hexdigest(), preferences=PREFS,
+                  plugin=json.loads((plugin / 'trust.json').read_text()) if plugin else None,
+                  gpu_clients=args.clients if plugin else None)
     (out / 'seed.json').write_text(json.dumps(record, indent=2) + '\n')
     print(f'Data seed {out / final.name}: volume UUID {seed["volume_uuid"]}')
+    # The kernel mounts Data by its volume UUID, which every fixture is made with anew: the board's configuration must name it.
+    defconfig = Path(__file__).resolve().parents[1] / 'configs/droidvm_ipados27_defconfig'
+    if f'CONFIG_XNU_OWNER_DATA_VOLUME_UUID="{seed["volume_uuid"]}"' not in defconfig.read_text():
+        # The XNU build passes it as a define and does not track defines: kern_exec.o (its only user) is built again only if removed.
+        print(f'NOTE: set CONFIG_XNU_OWNER_DATA_VOLUME_UUID="{seed["volume_uuid"]}" in {defconfig}, merge it again (unixnu '
+              f'defconfig -D <board> droidvm_ipados27_defconfig), remove {tree}/build/xnu/ios-obj/*/bsd/DEVELOPMENT/kern_exec.o '
+              f'and build the kernel again')
 
 
 if __name__ == '__main__':
