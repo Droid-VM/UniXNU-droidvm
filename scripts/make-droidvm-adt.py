@@ -69,6 +69,42 @@ def node(name, properties=(), children=()):
     return result + b''.join(children)
 
 
+def read_adt(blob, offset=0):
+    """An Apple device tree as (properties, children); properties map a name to its bytes. A length's top bit marks a
+    template property (newer trees), not part of its size."""
+    properties_count, children_count = struct.unpack_from('<II', blob, offset)
+    offset += 8
+    properties = {}
+    for _ in range(properties_count):
+        name = blob[offset:offset + 32].split(b'\0')[0].decode()
+        length = struct.unpack_from('<I', blob, offset + 32)[0] & 0x7fffffff
+        offset += 36
+        properties[name] = blob[offset:offset + length]
+        offset += (length + 3) & ~3
+    children = []
+    for _ in range(children_count):
+        child, offset = read_adt(blob, offset)
+        children.append(child)
+    return (properties, children), offset
+
+
+# The /product properties of the identity tree a virtual machine does not have: the exclaves of Apple's SoCs, and the panel's
+# gamut, which --display-gamut sets.
+IDENTITY_PRODUCT_DROPPED = {'name', 'AAPL,phandle', 'exclaves-enabled', 'has-exclaves', 'artwork-display-gamut'}
+
+
+def identity_of(path):
+    """The device identity of an OS's own device tree (the IPSW's DeviceTree, decoded): the root's model, target and board
+    names, and the /product properties MobileGestalt and the frameworks read (product-id, artwork, feature classes)."""
+    (root, children), _ = read_adt(Path(path).read_bytes())
+    product = next((props for props, _ in children if props.get('name', b'').rstrip(b'\0') == b'product'), None)
+    if product is None or 'model' not in root or 'target-type' not in root:
+        raise SystemExit(f'{path}: not a device tree with a model, a target-type and /product')
+    return {'model': root['model'], 'target-type': root['target-type'],
+            'board': root.get('compatible', b'').split(b'\0')[0] + b'\0',
+            'product': [(key, value) for key, value in product.items() if key not in IDENTITY_PRODUCT_DROPPED]}
+
+
 def empty_nvram_proxy():
     """A fresh volatile CHRP bank for upstream IODTNVRAM, with no controller."""
     def header(name, size):
@@ -234,6 +270,9 @@ def main():
     parser.add_argument('--chip-id', type=lambda value: int(value, 16), default=None)
     parser.add_argument('--ipad-identity', action='store_true',
                         help='/product and /buttons describe an iPad-class device (values of the unchanged iPad7,1 tree)')
+    parser.add_argument('--identity-tree', type=Path, default=None,
+                        help='with --ipad-identity: the identity (root model, target-type, board, /product) of this decoded '
+                             'device tree of the target OS (its IPSW DeviceTree) instead of the iPad7,1 values')
     parser.add_argument('--packed-data-ramdisk', action='store_true')
     parser.add_argument('--data-ramdisk', action='store_true',
                         help='/chosen/memory-map RAMDisk placeholder; the loader fills in the real range')
@@ -262,6 +301,8 @@ def main():
                         help='/chosen/darwinboot-memory-limit: DarwinBoot also hands the kernel the RAM after its window that the '
                              'firmware frees at ExitBootServices, up to the panic region (or the end of guest RAM)')
     args = parser.parse_args()
+    if args.identity_tree and not args.ipad_identity:
+        parser.error('--identity-tree takes --ipad-identity')
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
     if args.owned_memory_size is not None and (
@@ -358,14 +399,15 @@ def main():
                                    ('device_type', b'cpu\0'), ('compatible', b'arm,armv8\0'),
                                    ('timebase-frequency', struct.pack('<I', args.timebase))])
             for index, reg in enumerate(cpu_regs[:1] if args.dynamic else cpu_regs)]
+    identity = identity_of(args.identity_tree) if args.identity_tree else None
     tree = node('device-tree', [
-        ('model', b'iPad7,1\0' if args.ipad_identity else b'droidvm-first-boot\0'),
-        *([('target-type', b'J120\0')] if args.ipad_identity else []),
+        ('model', (identity['model'] if identity else b'iPad7,1\0') if args.ipad_identity else b'droidvm-first-boot\0'),
+        *([('target-type', identity['target-type'] if identity else b'J120\0')] if args.ipad_identity else []),
         # The iPad's board name first: libMobileGestalt reads the first entry as the hardware model (HWModelStr), and CoreMotion and
         # locationd know a device's motion sensors only by it (CLPlatformInfo::queryEmbeddedSystemHardware hashes it against its
         # table; "droidvm,crosvm-gunyah" had none, so CMMotionManager reported no accelerometer or gyroscope). The audio server and
         # MediaExperience key their per-board tables on it too (UniXNU 688fa88). The board's own string stays matchable after it.
-        ('compatible', (b'J120AP\0' if args.ipad_identity else b'') + b'droidvm,crosvm-gunyah\0'),
+        ('compatible', ((identity['board'] if identity else b'J120AP\0') if args.ipad_identity else b'') + b'droidvm,crosvm-gunyah\0'),
         ('#address-cells', struct.pack('<I', 2)),
         ('#size-cells', struct.pack('<I', 2)),
     ], [
@@ -409,7 +451,9 @@ def main():
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
                             ('button-names', b'hold\0voldown\0volup\0'),
                             ('home-button-type', struct.pack('<I', 2))])] if args.ipad_identity else []),
-        node('product', [('product-name', b'iPad Pro (12.9-inch) (2nd generation)\0' if args.ipad_identity else b'DroidVM guest\0'),
+        node('product', [*(identity['product'] + [('artwork-display-gamut', args.display_gamut.encode() + b'\0')]
+                           if identity and args.ipad_identity else
+                           [('product-name', b'iPad Pro (12.9-inch) (2nd generation)\0' if args.ipad_identity else b'DroidVM guest\0')]),
                          ('model', b'droidvm,crosvm-gunyah\0'),
                          *([('product-description', b'iPad Pro (12.9-inch) (2nd generation)\0'),
                             ('artwork-device-idiom', b'pad\0'),
@@ -420,7 +464,8 @@ def main():
                             ('thin-bezel', struct.pack('<I', 1)),
                             # MGGetProductType() looks this 20-byte id up in libMobileGestalt's product table (J120: 0x80ac7ae0);
                             # without it the product type is 0 and every client that switches on it sees an unknown device.
-                            ('product-id', bytes.fromhex('e9fefef6e6f9d12a5ba1a2551866cbbd749f0ec3'))] if args.ipad_identity else [])],
+                            ('product-id', bytes.fromhex('e9fefef6e6f9d12a5ba1a2551866cbbd749f0ec3'))]
+                           if args.ipad_identity and not identity else [])],
              # the audio server reads /product/audio (the original also sets supports-always-listening)
              [node('audio', [('wireless-splitter', struct.pack('<I', 1))])] if args.ipad_identity else []),
         node('arm-io', [('device_type', b'arm-io\0'),
