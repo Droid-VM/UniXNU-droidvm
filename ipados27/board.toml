@@ -49,6 +49,9 @@ archives = [
   # Touch, keyboard and motion sensors (scripts/build-droidvm-hid-input.py): NativeHidInput under the original IOHIDDevice of the
   # fileset, fed by the app's virtio-input devices; its objects ride in the display archive as well.
   "build-droidvm-hid-input.py",
+  # The network (IONetworkingFamily and the virtio-net controller), sound, battery and media devices (scripts/build-droidvm-devices.py),
+  # in the display archive too.
+  "build-droidvm-devices.py",
   "build-droidvm-legacy-display.py",
 ]
 
@@ -119,9 +122,12 @@ kernel_args = [
   "vgpu-3d=1",
   "droidvm-gpu-metal=1",
   # The plugin's addon view over /System/Library/Extensions and LaunchDaemons (the Data seed's /private/var/ngpu, staged by the fork's
-  # add-gpu-plugin-data.py --plugin build/adreno-metal-plugin27), and the processes besides the render server that get the
-  # accelerator's user client (the seed's NativeAdrenoMetal.clients lists the same).
+  # add-gpu-plugin-data.py --plugin build/adreno-metal-plugin27). The GPU clients and the other switches of iPadOS 17's built-in
+  # arguments this board has are built in as well (package/DroidVMBootArgs27.c).
   "sheng-gpu-addon=1",
+  # Fewer GPU clients than the built-in iPadOS 17 list for now: with all of them (14 clients, each priming its own pipelines) the
+  # host's GPU memory took the phone to swap and it stopped answering for minutes. The list grows as the plugin's iPadOS 27
+  # gaps close (the command line wins over the built-in value).
   "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent",
   "-v",
 ]

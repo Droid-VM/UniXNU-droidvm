@@ -27,7 +27,6 @@
 // droidvm_fix_ownervisor_bootstrap() does the copy and is called from the board monitor thread (DroidVMStubs.c) until it
 // takes once. Inert unless owner-service-manager=1 actually spawned ownervisor (droidvm_ownervisor_pid stays 0 otherwise).
 typedef struct ipc_port *droidvm_ipc_port_t;
-extern struct proc *initproc;
 extern kern_return_t task_get_special_port(task_t, int, droidvm_ipc_port_t *);
 extern kern_return_t task_set_special_port(task_t, int, droidvm_ipc_port_t);
 extern void ipc_port_release_send(droidvm_ipc_port_t);

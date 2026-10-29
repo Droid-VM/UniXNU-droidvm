@@ -21,6 +21,9 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
+#if DROIDVM_DEVICE_DYNAMIC
+#include "DroidVMDmaRegion.h"
+#endif
 
 extern void IOSleep(unsigned milliseconds);
 extern void delay(int usec);
@@ -42,10 +45,31 @@ struct droidvm_net_desc { uint64_t address; uint32_t length; uint16_t flags, nex
 _Static_assert(sizeof(struct droidvm_net_desc) == 16, "VirtIO wire layout");
 
 // One page per queue: descriptors at 0, the driver (available) ring at 1024, the device (used) ring at 2048.
+#if DROIDVM_DEVICE_DYNAMIC
+// DROIDVM_DEVICE_DYNAMIC (the iPadOS 27 board): the same buffers from one contiguous region allocated when the device starts
+// (DroidVMDmaRegion.h), as pointers indexed as the arrays are.
+static struct droidvm_dma droidvm_net_dma;
+static uint8_t *droidvm_net_rx_ring, *droidvm_net_tx_ring;
+static uint8_t (*droidvm_net_rx_data)[DROIDVM_NET_BUFFER], (*droidvm_net_tx_data)[DROIDVM_NET_BUFFER];
+static bool net_buffers(void) {
+    const uint64_t data = (uint64_t)DROIDVM_NET_QUEUE * DROIDVM_NET_BUFFER;
+    if (!droidvm_dma_alloc(&droidvm_net_dma, 2 * 4096 + 2 * data)) return false;
+    uint8_t *at = (uint8_t *)droidvm_net_dma.base;
+    droidvm_net_rx_ring = at;
+    droidvm_net_tx_ring = at + 4096;
+    droidvm_net_rx_data = (uint8_t (*)[DROIDVM_NET_BUFFER])(at + 2 * 4096);
+    droidvm_net_tx_data = (uint8_t (*)[DROIDVM_NET_BUFFER])(at + 2 * 4096 + data);
+    return true;
+}
+static uint64_t net_pa(const void *p) { return droidvm_dma_pa(&droidvm_net_dma, p); }
+#else
 static uint8_t droidvm_net_rx_ring[4096] __attribute__((aligned(4096)));
 static uint8_t droidvm_net_tx_ring[4096] __attribute__((aligned(4096)));
 static uint8_t droidvm_net_rx_data[DROIDVM_NET_QUEUE][DROIDVM_NET_BUFFER] __attribute__((aligned(4096)));
 static uint8_t droidvm_net_tx_data[DROIDVM_NET_QUEUE][DROIDVM_NET_BUFFER] __attribute__((aligned(4096)));
+static bool net_buffers(void) { return true; }
+static uint64_t net_pa(const void *p) { return ml_static_vtop((vm_offset_t)p); }
+#endif
 
 static struct {
     uintptr_t registers;
@@ -98,7 +122,7 @@ static bool net_queue(unsigned queue, uint8_t *page) {
     if (net_read32(0x44) || net_read32(0x34) < DROIDVM_NET_QUEUE) return false;
     memset(page, 0, 4096);
     *(volatile uint16_t *)(page + 1024) = VIRTQ_AVAIL_F_NO_INTERRUPT;   // this driver polls
-    uint64_t physical = ml_static_vtop((vm_offset_t)page);
+    uint64_t physical = net_pa(page);
     net_barrier();
     net_write32(0x38, DROIDVM_NET_QUEUE);
     net_write64(0x80, physical);
@@ -136,7 +160,7 @@ static const char *net_bring_up(void) {
     struct droidvm_net_desc *descriptors = (struct droidvm_net_desc *)droidvm_net_rx_ring;
     volatile uint16_t *available = (volatile uint16_t *)(droidvm_net_rx_ring + 1024);
     for (uint16_t i = 0; i < DROIDVM_NET_QUEUE; ++i) {
-        descriptors[i] = (struct droidvm_net_desc){ml_static_vtop((vm_offset_t)droidvm_net_rx_data[i]), DROIDVM_NET_BUFFER,
+        descriptors[i] = (struct droidvm_net_desc){net_pa(droidvm_net_rx_data[i]), DROIDVM_NET_BUFFER,
                                                    VIRTQ_DESC_F_WRITE, 0};
         available[2 + i] = i;
     }
@@ -171,7 +195,7 @@ int droidvm_net_tx_frame(const void *frame, unsigned length) {
     memcpy(buffer + DROIDVM_NET_HDR, frame, length);
     struct droidvm_net_desc *descriptors = (struct droidvm_net_desc *)droidvm_net_tx_ring;
     volatile uint16_t *available = (volatile uint16_t *)(droidvm_net_tx_ring + 1024);
-    descriptors[slot] = (struct droidvm_net_desc){ml_static_vtop((vm_offset_t)buffer), DROIDVM_NET_HDR + length, 0, 0};
+    descriptors[slot] = (struct droidvm_net_desc){net_pa(buffer), DROIDVM_NET_HDR + length, 0, 0};
     available[2 + droidvm_net.tx_head % DROIDVM_NET_QUEUE] = slot;
     net_barrier();
     ++droidvm_net.tx_head;
@@ -209,7 +233,7 @@ static void net_rx_poll(void) {
             } else {
                 droidvm_net_rx_drops++;
             }
-            descriptors[id] = (struct droidvm_net_desc){ml_static_vtop((vm_offset_t)droidvm_net_rx_data[id]),
+            descriptors[id] = (struct droidvm_net_desc){net_pa(droidvm_net_rx_data[id]),
                                                         DROIDVM_NET_BUFFER, VIRTQ_DESC_F_WRITE, 0};
             available[2 + (head + returned) % DROIDVM_NET_QUEUE] = (uint16_t)id;
             ++returned;
@@ -271,6 +295,10 @@ void droidvm_net_start(void) {
         return;
     }
     droidvm_net_stage = 2;
+    if (!net_buffers()) {
+        strlcpy(droidvm_net_status, "no memory for the queues", sizeof(droidvm_net_status));
+        return;
+    }
     const char *why = net_bring_up();
     if (why) {
         strlcpy(droidvm_net_status, why, sizeof(droidvm_net_status));

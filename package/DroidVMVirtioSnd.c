@@ -23,6 +23,9 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
+#if DROIDVM_DEVICE_DYNAMIC
+#include "DroidVMDmaRegion.h"
+#endif
 
 extern void IOSleep(unsigned milliseconds);
 extern void delay(int usec);
@@ -50,10 +53,31 @@ _Static_assert(sizeof(struct snd_desc) == 16 && sizeof(struct snd_pcm_info) == 3
                "virtio-snd wire layout");
 
 // One page per queue: descriptors at 0, the driver (available) ring at 1024, the device (used) ring at 2048.
+#if DROIDVM_DEVICE_DYNAMIC
+// DROIDVM_DEVICE_DYNAMIC (the iPadOS 27 board): the same buffers from one contiguous region allocated when the device starts
+// (DroidVMDmaRegion.h), as pointers indexed as the arrays are.
+static struct droidvm_dma snd_dma;
+static uint8_t (*snd_rings)[4096];
+static struct snd_slot *snd_tx, *snd_rx;
+static uint8_t *snd_control_request, *snd_control_reply;
+static bool snd_buffers(void) {
+    const uint64_t slots = ((uint64_t)SND_SLOTS * sizeof(struct snd_slot) + 4095) & ~(uint64_t)4095;
+    if (!droidvm_dma_alloc(&snd_dma, 4 * 4096 + 2 * slots + 4096)) return false;
+    uint8_t *at = (uint8_t *)snd_dma.base;
+    snd_rings = (uint8_t (*)[4096])at;
+    snd_tx = (struct snd_slot *)(at + 4 * 4096);
+    snd_rx = (struct snd_slot *)(at + 4 * 4096 + slots);
+    snd_control_request = at + 4 * 4096 + 2 * slots;
+    snd_control_reply = snd_control_request + 1024;
+    return true;
+}
+#else
 static uint8_t snd_rings[4][4096] __attribute__((aligned(4096)));
 static struct snd_slot snd_tx[SND_SLOTS] __attribute__((aligned(4096)));
 static struct snd_slot snd_rx[SND_SLOTS] __attribute__((aligned(4096)));
 static uint8_t snd_control_request[256] __attribute__((aligned(256))), snd_control_reply[1024] __attribute__((aligned(1024)));
+static bool snd_buffers(void) { return true; }
+#endif
 
 static struct {
     uintptr_t registers;
@@ -85,7 +109,11 @@ static void snd_write64(unsigned offset, uint64_t value) {
     snd_write32(offset + 4, (uint32_t)(value >> 32));
 }
 static void snd_barrier(void) { __asm__ volatile("dmb osh" ::: "memory"); }
+#if DROIDVM_DEVICE_DYNAMIC
+static uint64_t pa(const void *p) { return droidvm_dma_pa(&snd_dma, p); }
+#else
 static uint64_t pa(const void *p) { return ml_static_vtop((vm_offset_t)p); }
+#endif
 
 static struct snd_desc *descriptors(unsigned q) { return (struct snd_desc *)snd_rings[q]; }
 static volatile uint16_t *available(unsigned q) { return (volatile uint16_t *)(snd_rings[q] + 1024); }
@@ -316,7 +344,7 @@ void droidvm_snd_start(void) {
     uint64_t ranges[3], reg[2];
     if (enabled && SecureDTLookupEntry(NULL, "/arm-io", &armio) == kSuccess &&
         SecureDTGetProperty(armio, "ranges", &value, &size) == kSuccess && size >= sizeof(ranges) &&
-        SecureDTLookupEntry(NULL, "/arm-io/virtio-snd", &node) == kSuccess) {
+        SecureDTLookupEntry(NULL, "/arm-io/virtio-snd", &node) == kSuccess && snd_buffers()) {
         memcpy(ranges, value, sizeof(ranges));
         droidvm_snd_found = 1;
         if (SecureDTGetProperty(node, "reg", &value, &size) == kSuccess && size == sizeof(reg)) {

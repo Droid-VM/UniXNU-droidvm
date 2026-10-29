@@ -28,6 +28,9 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
+#if DROIDVM_DEVICE_DYNAMIC
+#include "DroidVMDmaRegion.h"
+#endif
 
 extern void IOSleep(unsigned milliseconds);
 extern void delay(int usec);
@@ -68,12 +71,33 @@ struct media_device {
 
 // Per device: one page per queue (descriptors at 0, the driver ring at 1024, the device ring at 2048), the event buffers,
 // and the command's buffers (a command, its payload out, the response header, the payload back).
-static uint8_t media_rings[MEDIA_MAX][2][4096] __attribute__((aligned(4096)));
-static uint8_t media_events[MEDIA_MAX][MEDIA_EVENTS][MEDIA_EVENT_SIZE] __attribute__((aligned(4096)));
-static struct {
+struct media_io_buffers {
     uint8_t command[64], response[64];
     uint8_t out[MEDIA_PAYLOAD], in[MEDIA_PAYLOAD];
-} media_io[MEDIA_MAX] __attribute__((aligned(4096)));
+};
+#if DROIDVM_DEVICE_DYNAMIC
+// DROIDVM_DEVICE_DYNAMIC (the iPadOS 27 board): the same buffers from one contiguous region allocated when the device starts
+// (DroidVMDmaRegion.h), as pointers indexed as the arrays are.
+static struct droidvm_dma media_dma;
+static uint8_t (*media_rings)[2][4096];
+static uint8_t (*media_events)[MEDIA_EVENTS][MEDIA_EVENT_SIZE];
+static struct media_io_buffers *media_io;
+static bool media_buffers(void) {
+    const uint64_t rings = (uint64_t)MEDIA_MAX * 2 * 4096;
+    const uint64_t events = ((uint64_t)MEDIA_MAX * MEDIA_EVENTS * MEDIA_EVENT_SIZE + 4095) & ~(uint64_t)4095;
+    if (!droidvm_dma_alloc(&media_dma, rings + events + (uint64_t)MEDIA_MAX * sizeof(struct media_io_buffers))) return false;
+    uint8_t *at = (uint8_t *)media_dma.base;
+    media_rings = (uint8_t (*)[2][4096])at;
+    media_events = (uint8_t (*)[MEDIA_EVENTS][MEDIA_EVENT_SIZE])(at + rings);
+    media_io = (struct media_io_buffers *)(at + rings + events);
+    return true;
+}
+#else
+static uint8_t media_rings[MEDIA_MAX][2][4096] __attribute__((aligned(4096)));
+static uint8_t media_events[MEDIA_MAX][MEDIA_EVENTS][MEDIA_EVENT_SIZE] __attribute__((aligned(4096)));
+static struct media_io_buffers media_io[MEDIA_MAX] __attribute__((aligned(4096)));
+static bool media_buffers(void) { return true; }
+#endif
 static struct media_device media[MEDIA_MAX];
 static unsigned media_count;
 static lck_grp_t *media_group;
@@ -98,7 +122,11 @@ static void media_write64(const struct media_device *d, unsigned offset, uint64_
     media_write32(d, offset + 4, (uint32_t)(value >> 32));
 }
 static void media_barrier(void) { __asm__ volatile("dmb osh" ::: "memory"); }
+#if DROIDVM_DEVICE_DYNAMIC
+static uint64_t pa(const void *p) { return droidvm_dma_pa(&media_dma, p); }
+#else
 static uint64_t pa(const void *p) { return ml_static_vtop((vm_offset_t)p); }
+#endif
 
 static unsigned index_of(const struct media_device *d) { return (unsigned)(d - media); }
 static struct media_desc *descriptors(const struct media_device *d, unsigned q) { return (struct media_desc *)media_rings[index_of(d)][q]; }
@@ -329,7 +357,7 @@ void droidvm_media_start(void) {
     if (!enabled || SecureDTLookupEntry(NULL, "/arm-io", &armio) != kSuccess ||
         SecureDTGetProperty(armio, "ranges", &value, &size) != kSuccess || size < sizeof(ranges)) return;
     memcpy(ranges, value, sizeof(ranges));
-    if (!(media_group = lck_grp_alloc_init("droidvm-media", LCK_GRP_ATTR_NULL))) return;
+    if (!(media_group = lck_grp_alloc_init("droidvm-media", LCK_GRP_ATTR_NULL)) || !media_buffers()) return;
     for (unsigned n = 0; n < MEDIA_MAX; ++n) {
         char path[32];
         snprintf(path, sizeof(path), "/arm-io/virtio-media-%u", n);
