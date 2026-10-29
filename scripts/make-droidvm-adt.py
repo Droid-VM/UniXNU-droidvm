@@ -337,6 +337,9 @@ def main():
                         help='Emit /arm-io/battery from the FDT goldfish-battery node (crosvm --battery type=goldfish)')
     parser.add_argument('--boot-video-mib', type=int, default=0,
                         help='Reserve ordinary RAM for the BLT-only GOP boot framebuffer (requires --reclaim-memory)')
+    parser.add_argument('--kernel-ctrr-to-be-enabled', type=int, choices=[0, 1], default=None,
+                        help='/chosen/kernel-ctrr-to-be-enabled, which iBoot writes: 0 when nothing locks the kernel text (xnu-12377 '
+                             'asserts it was given before DTrace\'s SDT probes ask ml_unsafe_kernel_text)')
     parser.add_argument('--reclaim-memory', action='store_true',
                         help='/chosen/darwinboot-memory-limit: DarwinBoot also hands the kernel the RAM after its window that the '
                              'firmware frees at ExitBootServices, up to the panic region (or the end of guest RAM)')
@@ -473,6 +476,8 @@ def main():
                                               args.root_match_volume_uuid.upper() + '</string></dict></dict>\0').encode())]
                           if args.root_match_volume_uuid else []),
                         ('amfi-only-platform-code', struct.pack('<I', 1)),
+                        *([('kernel-ctrr-to-be-enabled', struct.pack('<I', args.kernel_ctrr_to_be_enabled))]
+                          if args.kernel_ctrr_to_be_enabled is not None else []),
                         *([('embedded-panic-log-size', struct.pack('<I', panic_region[1]))] if panic_region else []),
                         *empty_nvram_proxy()],
              [node('memory-map', ([('PackedRAMDisk' if args.packed_data_ramdisk else 'RAMDisk', bytes(16))]

@@ -62,6 +62,10 @@ kernel_args = [
   "armcpu-self-ipi=1",
   "armcpu-spi-ipi=1",
   "native-source-storage=1",
+  # The fileset puts this 4 KiB kernel's __TEXT at a 16 KiB boundary inside the collection's __PRELINK_TEXT: lockdown's
+  # re-protection of __PRELINK_TEXT (arm_vm_prot_finalize) then sets the contiguous hint on a 64 KiB range whose pages __TEXT
+  # mapped without it (arm_vm_init.c:1107). No hints until the emitter places native segments at 64 KiB.
+  "use_contiguous_hint=0",
   "-v",
 ]
 
@@ -76,4 +80,4 @@ unique_chip_id = "required"
 chip_id = "8142"                     # iPad17,3 (the OS profile's [ipsw] chip_id 33090)
 # The J820's identity from the IPSW's own device tree (unixnu ipsw fetch DeviceTree, copied to .cache/firmware here).
 tool_args = ["--dynamic", "--boot-video-mib", "8", "--reclaim-memory", "--display-gamut", "sRGB",
-             "--identity-tree", ".cache/firmware/DeviceTree.j820ap.im4p"]
+             "--identity-tree", ".cache/firmware/DeviceTree.j820ap.im4p", "--kernel-ctrr-to-be-enabled", "0"]
