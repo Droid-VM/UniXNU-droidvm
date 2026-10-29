@@ -1,0 +1,12 @@
+schema_version = 2
+
+# The "SoC" of a DroidVM guest: crosvm's virtual machine on the Gunyah hypervisor of a Snapdragon phone. Every vCPU reports
+# Gunyah's virtual MIDR (0x000f0480), devices are virtio-mmio, interrupts a GICv3, time the architectural timer. Nothing of the
+# phone's own SoC reaches the guest, so this layer only names the drivers every such guest takes; the XNU changes a Gunyah vCPU
+# needs (no WFE, caches written back for a core starting with its MMU off) are the device's (ipados27/patches/xnu-12377).
+[soc]
+name = "crosvm-gunyah"
+description = "crosvm virtual machine on the Gunyah hypervisor"
+
+[components]
+include = ["ArmCpu", "ArmDTPlatform"]

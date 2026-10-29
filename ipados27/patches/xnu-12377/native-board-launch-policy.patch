@@ -1,0 +1,27 @@
+The board's launch policy hook (package/DroidVMLaunchPolicy.c) before launchd starts; as patches/xnu of the iPadOS 17 board.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index bebf036..4dc94b1 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9185,6 +9185,20 @@ load_init_program_at_path(proc_t p, user_addr_t scratch_addr, const char* path,
+ 	assert(scratch_addr);
+ 	assert(path);
+ 
++#if defined(XNU_BOARD_LAUNCH_POLICY) && XNU_BOARD_LAUNCH_POLICY
++	/*
++	 * The board's launchd overrides (jobs its hardware cannot serve), written as
++	 * root into the mounted Data before launchd reads them. Runs before each
++	 * attempt, so the writer is idempotent; it uses the scratch page before the
++	 * arguments below are copied out.
++	 */
++	extern int native_board_launch_policy(void *, uint64_t);
++	error = native_board_launch_policy(p, (uint64_t)scratch_addr);
++	if (error) {
++		panic("board launch policy failed: %d", error);
++	}
++#endif
++
+ 	/*
+ 	 * Copy out program name.
+ 	 */

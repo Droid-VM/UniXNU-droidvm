@@ -1,0 +1,84 @@
+Every idle path ends in WFI (after Droid-VM/macOS-DroidVM patches/xnu-12377/0010): the WFE-recommendation and proximate-timer
+paths returned to machine_idle() without blocking, so a vCPU spun through the idle loop. idle-wfe=1 restores the polling.
+
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index e13591e..ee39d9a 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -160,6 +160,18 @@ static uint32_t idle_proximate_timer_wfe = IDLE_PROXIMATE_TIMER_WFE;
+ static uint32_t idle_proximate_io_wfe_masked = 0;
+ #endif
+ 
++/*
++ * WFE polling in the idle loop, none on a non-Apple core (after Droid-VM/macOS-DroidVM): with a zero cpu_idle_latency,
++ * cpu_proximate_timer() holds on almost every idle entry, and both of its ways out return to machine_idle() without blocking, so a
++ * vCPU spun through the idle loop and kept its physical core. Every idle path then ends in WFI, which Gunyah traps. idle-wfe=1
++ * restores the polling.
++ */
++#if defined(APPLE_ARM64_ARCH_FAMILY)
++uint32_t idle_wfe_poll = 1;
++#else
++uint32_t idle_wfe_poll = 0;
++#endif
++
+ #if __ARM_GLOBAL_SLEEP_BIT__
+ volatile boolean_t arm64_stall_sleep = TRUE;
+ #endif
+@@ -548,7 +560,7 @@ cpu_idle(void)
+ 		processor->next_idle_short_wfe_deadline = UINT64_MAX;
+ 	}
+ 
+-	if (wfe_timeout != 0) {
++	if (wfe_timeout != 0 && idle_wfe_poll) {
+ 		uint64_t wfe_deadline = ctime_for_deadline + wfe_timeout;
+ 		/* Poll issuing event-bounded WFEs until an interrupt
+ 		 * arrives or the WFE recommendation expires
+@@ -567,7 +579,7 @@ cpu_idle(void)
+ 		}
+ 	}
+ 
+-	if (__improbable(cpu_proximate_timer())) {
++	if (__improbable(cpu_proximate_timer()) && idle_wfe_poll) {
+ 		if (idle_proximate_timer_wfe == 1) {
+ 			/* Poll issuing WFEs until the expected
+ 			 * timer FIQ arrives.
+@@ -580,6 +592,7 @@ cpu_idle(void)
+ 		/* Back to machine_idle() */
+ 		Idle_load_context();
+ 	}
++	/* else (no WFE polling): the timer is due soon, and WFI below waits for it (or any interrupt) blocked */
+ 
+ 	lastPop = cpu_data_ptr->rtcPop;
+ 
+@@ -1228,6 +1241,11 @@ cpu_machine_idle_init(boolean_t from_boot)
+ 			idle_enable = TRUE;
+ 		}
+ 
++		uint32_t idle_wfe = 0;
++		if (PE_parse_boot_argn("idle-wfe", &idle_wfe, sizeof(idle_wfe))) {
++			idle_wfe_poll = idle_wfe != 0;
++		}
++
+ #if DEVELOPMENT || DEBUG
+ 		uint32_t wfe_mode = 0;
+ 		if (PE_parse_boot_argn("wfe_mode", &wfe_mode, sizeof(wfe_mode))) {
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 07143d5..dc052f2 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -333,13 +333,14 @@ ml_cpu_signal_retract(unsigned int cpu_mpidr __unused)
+ }
+ 
+ extern uint32_t idle_proximate_io_wfe_unmasked;
++extern uint32_t idle_wfe_poll;   /* osfmk/arm64/cpu.c: WFE polling in the idle loop (none on a non-Apple core) */
+ 
+ #define CPUPM_IDLE_WFE 0x5310300
+ static bool
+ wfe_process_recommendation(void)
+ {
+ 	bool ipending = false;
+-	if (__probable(idle_proximate_io_wfe_unmasked == 1)) {
++	if (__probable(idle_proximate_io_wfe_unmasked == 1) && idle_wfe_poll) {
+ 		/* Check for an active perf. controller generated
+ 		 * WFE recommendation for this cluster.
+ 		 */

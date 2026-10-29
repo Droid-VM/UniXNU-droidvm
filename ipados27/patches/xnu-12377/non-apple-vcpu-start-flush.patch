@@ -1,0 +1,300 @@
+Each core's early bootstrap trace (droidvm_early_trace, read by the host's peek.py) and the trap vectors that park an early
+exception in WFI; the cache flushes of cpu_start themselves are in ipados27-bringup. As the iPadOS 17 patch.
+
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 0a10bd7..e13591e 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -918,6 +918,12 @@ init_ctrr_cluster_states(void)
+ }
+ #endif
+ 
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++extern boot_args const_boot_args;     /* osfmk/arm/arm_init.c */
++/* Each core's early bootstrap trace, 8 words a core (osfmk/arm64/start.s EARLY_TRACE_SLOT), for the host's reader (peek.py). */
++volatile uint64_t droidvm_early_trace[8 * 8] __attribute__((aligned(64)));
++#endif
++
+ void
+ cpu_start(int cpu)
+ {
+@@ -968,6 +974,8 @@ cpu_start(int cpu)
+ 			flush_dcache((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData), FALSE);
+ 			flush_dcache((vm_offset_t)&const_boot_args, sizeof(const_boot_args), FALSE);
+ 			flush_dcache((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep), FALSE);
++			/* and the new core's early trace slot, which it writes uncached (osfmk/arm64/start.s EARLY_TRACE_SLOT) */
++			flush_dcache((vm_offset_t)&droidvm_early_trace[0], sizeof(droidvm_early_trace), FALSE);
+ 		}
+ #endif
+ #if CONFIG_SPTM
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 827236a..938f1e7 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -102,6 +102,55 @@
+  */
+ 	.text
+ 	.align 12
++
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++/*
++ * A core's early bootstrap, traced in its 64-byte slot of droidvm_early_trace (osfmk/arm64/cpu.c; slot = MPIDR Aff0): where it
++ * got to, and the exception that stopped it. The stores are uncached while the MMU is off; cpu_start() wrote the array back
++ * from the caches first, so the guest and its host read what the core wrote. Clobbers x9 and x10.
++ */
++.macro EARLY_TRACE_SLOT
++	mrs		x9, MPIDR_EL1
++	and		x9, x9, #7
++	adrp	x10, EXT(droidvm_early_trace)@page
++	add		x10, x10, EXT(droidvm_early_trace)@pageoff
++	add		x9, x10, x9, lsl #6
++.endmacro
++
++.macro EARLY_TRACE_STAGE stage
++	EARLY_TRACE_SLOT
++	mov		x10, #\stage
++	str		x10, [x9]
++	dsb		sy
++.endmacro
++
++/*
++ * An exception in early bootstrap: record it (with the MMU off only; with it on, the slot's physical address may not be mapped)
++ * and park in WFI rather than spin. Gunyah traps WFI and blocks the vCPU, but a vCPU spinning here kept its physical core until
++ * the host's watchdog rebooted the phone.
++ */
++.macro EARLY_TRAP vector
++	msr		DAIFSet, #(DAIFSC_ALL)
++	mrs		x9, SCTLR_EL1
++	tbnz	x9, #0, 1f
++	EARLY_TRACE_SLOT
++	mov		x10, #(0xe0 + \vector)
++	str		x10, [x9]
++	mrs		x10, ELR_EL1
++	str		x10, [x9, #8]
++	mrs		x10, ESR_EL1
++	str		x10, [x9, #16]
++	mrs		x10, FAR_EL1
++	str		x10, [x9, #24]
++	mrs		x10, SPSR_EL1
++	str		x10, [x9, #32]
++	dsb		sy
++1:
++	wfi
++	b		1b
++.endmacro
++#endif
++
+ 	.globl EXT(LowResetVectorBase)
+ LEXT(LowResetVectorBase)
+ 	/*
+@@ -116,6 +165,7 @@ LEXT(LowResetVectorBase)
+ 
+ 	/* EL1 SP1: These vectors trap errors during early startup on non-boot CPUs. */
+ 	.align	9
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
+ 	.align	7
+ 	b		.
+@@ -123,6 +173,15 @@ LEXT(LowResetVectorBase)
+ 	b		.
+ 	.align	7
+ 	b		.
++#else
++	EARLY_TRAP 0x14
++	.align	7
++	EARLY_TRAP 0x15
++	.align	7
++	EARLY_TRAP 0x16
++	.align	7
++	EARLY_TRAP 0x17
++#endif
+ 
+ 	.align	7
+ 	.globl EXT(reset_vector)
+@@ -141,6 +200,9 @@ LEXT(reset_vector)
+ 
+ 
+ 
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++	EARLY_TRACE_STAGE 0xa1					// at the reset vector, VBAR set
++#endif
+ 	// Process reset handlers
+ 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+@@ -164,6 +226,10 @@ Lnext_cpu_data_entry:
+ 	b.eq	Lskip_cpu_reset_handler				// Not found
+ 	b		Lcheck_cpu_data_entry	// loop
+ Lfound_cpu_data_entry:
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++	EARLY_TRACE_STAGE 0xa2					// found this core's cpu data
++	str		x21, [x9, #40]
++#endif
+ 
+ #ifdef APPLEEVEREST
+ 	/*
+@@ -202,9 +268,30 @@ Lfound_cpu_data_entry:
+ 	msr		TPIDR_EL1, x13
+ #endif /* __ARM_KERNEL_PROTECT__ */
+ 
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++	EARLY_TRACE_STAGE 0xa3					// calling the reset handler
++	str		x0, [x9, #48]
++#endif
+ 	blr		x0
+ Lskip_cpu_reset_handler:
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.									// Hang if the handler is NULL or returns
++#else
++	// No cpu data for this core, or no valid handler: record what the lookup saw, and park blocked (see EARLY_TRAP).
++	EARLY_TRACE_SLOT
++	mov		x10, #0xd0
++	str		x10, [x9]
++	str		x0, [x9, #8]
++	str		x1, [x9, #16]
++	str		x21, [x9, #24]
++	ldr		x10, [x19, CPU_DATA_ENTRIES]
++	str		x10, [x9, #32]
++	dsb		sy
++	msr		DAIFSet, #(DAIFSC_ALL)
++1:
++	wfi
++	b		1b
++#endif
+ 
+ 	.align 3
+ 	.global EXT(LowResetVectorEnd)
+@@ -245,40 +332,104 @@ LEXT(_start)
+ 	.global	EXT(LowExceptionVectorBase)
+ LEXT(LowExceptionVectorBase)
+ 	/* EL1 SP 0 */
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 0
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 1
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 2
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 3
++#endif
+ 	/* EL1 SP1 */
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 4
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 5
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 6
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 7
++#endif
+ 	/* EL0 64 */
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 8
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 9
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 10
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 11
++#endif
+ 	/* EL0 32 */
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 12
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 13
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 14
++#endif
+ 	.align	7
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	b		.
++#else
++	EARLY_TRAP 15
++#endif
+ 	.align 12, 0
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
+@@ -307,6 +458,9 @@ LEXT(start_cpu)
+ 
+ 	.align 2
+ start_cpu:
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++	EARLY_TRACE_STAGE 0xa4					// in start_cpu, MMU still off
++#endif
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
+ 	// This is done right away in reset vector for pre-KTRR devices
+ 	// Set low reset vector now that we are in the KTRR-free zone
+@@ -763,6 +917,9 @@ common_start:
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++	EARLY_TRACE_STAGE 0xa5					// MMU on (running V=P)
++#endif
+ 
+ #if !VMAPPLE
+ 	MOV64	x1, SCTLR_EL1_DEFAULT
+@@ -888,6 +1045,9 @@ arm_init_tramp:
+ 	isb		sy
+ #endif /* T0SZ_USER != T0SZ_BOOT */
+ 
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++	EARLY_TRACE_STAGE 0xa6					// at the kernel's virtual addresses
++#endif
+ 	mov		x19, lr
+ 	// Convert CPU data PA to VA and set as first argument
+ 	mov		x0, x21

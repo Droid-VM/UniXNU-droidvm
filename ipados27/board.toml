@@ -1,0 +1,29 @@
+# The DroidVM guest on iPadOS 27.0.1 (24A446, iPad17,3 J820AP, arm64e): the same crosvm-on-Gunyah virtual machine as the iPadOS 17
+# board in the directory above (../board.toml), on the layered profiles of UniXNU's schema 2 (profiles/arch/arm64e,
+# profiles/os/ipados-27.0.1-24A446, the crosvm-gunyah SoC layer in ../socs). Build it with -D <repo>/ipados27; the iPadOS 17 board
+# stays as it is. It shares the device package (package -> ../package); the device scripts of the iPadOS 17 board are not taken
+# (their build-arm-driver.py predates arm64e and would replace the fork's), each comes over once it builds for this target.
+#
+# Bring-up state (plans/IPADOS27_BUMP.md of the meta repository, P2): the arm64e kernel with the board's XNU changes and the drivers
+# every DroidVM guest needs to start (ArmDTPlatform, ArmCpu); storage, the owner chain, display and GPU follow.
+schema_version = 2
+
+[board]
+name = "droidvm"
+soc = "crosvm-gunyah"
+soc_source = "crosvm-gunyah"
+os_profile = "ipados-27.0.1-24A446"
+description = "DroidVM guest (crosvm on Gunyah), iPadOS 27"
+kit = "droidvm"
+
+[kernel]
+defconfig = "droidvm_ipados27_defconfig"
+config_fragments = ["arch:configs/common.config", "os:configs/ipados.config"]
+patch_series = ["arch:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu-12377/series"]
+archives = [
+  "build-corecrypto-14.py",
+  "build-corecrypto-14.py --namespace",
+  "component:ArmDTPlatform",
+  "component:ArmCpu",
+  "build-libpthread-kernel.py",
+]

@@ -1,0 +1,26 @@
+pmap_sync_page_attributes_phys writes the page's lines back to the point of coherency (a write-combined IOSurface kept the dirty
+lines of its cacheable zero-fill: black runs over Safari's pages). The batched half of the iPadOS 17 patch is in ipados27-bringup.
+
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 2eadcf0..72bf02f 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -7301,9 +7301,15 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	/* ptoa() widens before the shift: pp << PAGE_SHIFT is a 32-bit shift and drops the high bits of physical
+-	 * addresses at or above 4 GiB (all of DRAM on boards whose memory starts there), which phystokv() then rejects. */
+-	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
++	/*
++	 * Not flush_dcache(), which __ARM_COHERENT_IO__ makes a barrier: Apple's SoCs keep a page's lines coherent across a change of
++	 * its memory attributes, and this board's do not. A page made write-combined (an IOSurface a client draws into past the
++	 * cache) kept the dirty lines of its cacheable zero-fill, and the GPU's coherent reads took them over the data written later:
++	 * 16-pixel black runs over Safari's pages. Write them back and drop them through the physical aperture.
++	 * ptoa() widens before the shift: pp << PAGE_SHIFT is a 32-bit shift and drops the high bits of physical addresses at or
++	 * above 4 GiB (all of DRAM on boards whose memory starts there), which phystokv() then rejects.
++	 */
++	FlushPoC_DcacheRegion(phystokv(ptoa(pp)), PAGE_SIZE);
+ }
+ 
+ #if CONFIG_COREDUMP

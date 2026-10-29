@@ -1,0 +1,7 @@
+# Sources of the iPadOS 27 board, in addition to the feeds.toml of UniXNU and its profiles.
+
+# The SoC layer of every DroidVM guest (soc.toml: the drivers it takes), in this repository.
+[[source]]
+kind = "soc"
+name = "crosvm-gunyah"
+local = "../socs/crosvm-gunyah"

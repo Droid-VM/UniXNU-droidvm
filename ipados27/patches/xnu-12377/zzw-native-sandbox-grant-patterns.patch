@@ -1,0 +1,67 @@
+GPU client names by pattern (X*, *X*) and whole 32-character process names, with the first refusals logged, over upstream's
+grant (and sheng's "*"); as the iPadOS 17 board's zzw-native-adreno-sandbox-grant.
+
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index f256633..ce64c14 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4380,34 +4380,53 @@ is_io_service_set_authorization_id(
+ /*
+  * The native GPU driver names, by the property NativeSandboxGrantProcess on its accelerator service, the processes (a comma-separated list of
+  * process names, the render server and the other processes that run its Metal plugin) to which it grants its own user client in place of the
+- * sandbox's verdict: the original profiles name no class of that driver. Nothing else is affected.
++ * sandbox's verdict: the original profiles name no class of that driver. Nothing else is affected. A name ending in '*' names every process
++ * whose name begins with the rest (com.apple.WebKit.*), "*X*" every process whose name holds X (*Poster*: PosterBoard and each wallpaper's
++ * poster extension); the Metal plugin's own list takes the same forms. A process's name is its whole p_name, up to 32 characters.
++ * The first 64 refusals of an AGX service are logged with the name and the list (a framework's sandbox_check is not one of them).
+  */
+ extern "C" void proc_selfname(char * buf, int size);
+ static bool
+ native_sandbox_grant(IOService * service)
+ {
+ 	OSString * list = OSDynamicCast(OSString, service->getProperty("NativeSandboxGrantProcess"));
+-	char name[17] = {};
++	char name[33] = {};
++	proc_selfname(name, sizeof(name));
++	static int told = 0;
+ 	if (!list) {
++		const char * cls = service->getMetaClass()->getClassName();
++		if (told < 64 && 0 == strncmp(cls, "AGX", 3)) {
++			++told;
++			IOLog("native-sandbox-grant: %s opens %s, which names no grant (%s)\n", name, cls,
++			    service->getProperty("NativeSandboxGrantProcess") ? "not a string" : "none");
++		}
+ 		return false;
+ 	}
+ 	/* "*": every process that opens the service (the GPU: every Metal client runs the driver's plugin, no name list). */
+ 	if (list->isEqualTo("*")) {
+ 		return true;
+ 	}
+-	proc_selfname(name, sizeof(name));
+ 	for (const char * at = list->getCStringNoCopy(); *at;) {
+ 		size_t length = 0;
+ 		while (at[length] && at[length] != ',') {
+ 			++length;
+ 		}
+-		/* A process name holds 16 characters, so a longer entry is compared by its first 16. */
+-		if (length && 0 == strncmp(name, at, length < sizeof(name) - 1 ? length : sizeof(name) - 1)
+-		    && (length >= sizeof(name) - 1 || name[length] == 0)) {
++		const bool prefix = length > 1 && at[length - 1] == '*';
++		if (prefix && length > 2 && at[0] == '*') {
++			for (const char * from = name; strlen(from) >= length - 2; ++from) {
++				if (0 == strncmp(from, at + 1, length - 2)) {
++					return true;
++				}
++			}
++		} else if (prefix ? 0 == strncmp(name, at, length - 1) : (length && 0 == strncmp(name, at, length) && name[length] == 0)) {
+ 			return true;
+ 		}
+ 		at += length + (at[length] == ',' ? 1 : 0);
+ 	}
++	if (told < 64) {
++		++told;
++		IOLog("native-sandbox-grant: %s not in %s's grant \"%s\"\n", name, service->getMetaClass()->getClassName(), list->getCStringNoCopy());
++	}
+ 	return false;
+ }
+ 

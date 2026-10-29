@@ -1,0 +1,295 @@
+No WFE on a Gunyah vCPU: Gunyah runs WFE in the guest, and vCPUs waiting in it kept their physical cores until the host's
+watchdog rebooted the phone (2026-10-25). The iPadOS 17 patch, plus xnu-12377's new WFE sites (the two watchdog spins in
+locore.s, the MTE variant of _copyin_atomic32_wait_if_equals, the stackshot wait loop), and WFI rather than sheng's WFE in the
+proximate-timer idle path.
+
+diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+index 4a74130..d3c8dcf 100644
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -28,6 +28,7 @@
+ 
+ #include <machine/asm.h>
+ #include <arm64/machine_machdep.h>
++#include <pexpert/arm64/board_config.h>
+ 
+ /* This section has all the code necessary for the atomic operations supported by
+  * OSAtomicFifoEnqueue, OSAtomicFifoDequeue APIs in libplatform.
+@@ -418,7 +419,11 @@ Lenqueue_determine_success:
+ 	ldxr	w9, [x3]		// arm the monitor for the lock address
+ 	cbz		w9, Lenqueue_clear_monitor // lock is available, retry.
+ 
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	wfe						// Wait with monitor armed
++#else
++	isb						// not WFE, which Gunyah runs in the guest (osfmk/arm/locks.h)
++#endif
+ 
+ 	// Attempt #2
+ 	TRYLOCK_ENQUEUE x9
+@@ -472,7 +477,11 @@ Ldequeue_determine_success:
+ 	ldxr	w9, [x2]		// arm the monitor for the lock address
+ 	cbz		w9, Ldequeue_clear_monitor // lock is available, retry.
+ 
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	wfe						// Wait with monitor armed
++#else
++	isb						// not WFE, which Gunyah runs in the guest (osfmk/arm/locks.h)
++#endif
+ 
+ 	// Attempt #2
+ 	TRYLOCK_DEQUEUE x9
+@@ -573,7 +582,11 @@ Lno_preempt:
+ 	ldxr	w9, [x0]		// Snoop on lock and arm the monitor
+ 	cbz		w9, Lend_backoff // The lock seems to be available, return
+ 
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	wfe						// pause
++#else
++	isb						// not WFE, which Gunyah runs in the guest (osfmk/arm/locks.h)
++#endif
+ 
+ 	b	Lno_preempt
+ 
+diff --git a/osfmk/arm/locks.h b/osfmk/arm/locks.h
+index e5c898f..5204211 100644
+--- a/osfmk/arm/locks.h
++++ b/osfmk/arm/locks.h
+@@ -112,7 +112,16 @@ extern bool                has_lock_pv;
+ #define LOCK_SNOOP_SPINS_MCS    10
+ #define LOCK_PRETEST            0
+ 
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ #define wait_for_event()        __builtin_arm_wfe()
++#else
++/* Not WFE: Gunyah runs WFE in the guest, so a vCPU spinning on a lock in WFE keeps its physical core, and enough of that wedged
++ * a host core until the host's watchdog rebooted the phone (osfmk/arm/rtclock.c machine_delay_until). */
++#define wait_for_event()        __builtin_arm_yield()
++#endif
+ 
+ #ifndef __BUILDING_XNU_LIB_UNITTEST__
+ #if SCHED_HYGIENE_DEBUG
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index be2252c..c06b9dd 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -1349,6 +1349,32 @@ DebuggerXCallReturn(
+ }
+ 
+ extern void wait_while_mp_kdp_trap(bool check_SIGPdebug);
++
++#include <pexpert/arm64/board_config.h>
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++/*
++ * Stop this CPU for good in WFI. A hypervisor traps WFI and blocks the vCPU, but Gunyah runs WFE in the guest, so a panicked
++ * guest whose cores waited in WFE held their physical cores, and Gunyah stopped returning one of them to the host: the host's
++ * watchdog rebooted the phone. The virtual timer and the GIC CPU interface's Group 1 are turned off first, so no interrupt stays
++ * pending to end each WFI at once (the GIC only when this core reaches it through system registers).
++ */
++void panic_park_cpu(void) __dead2;
++void
++panic_park_cpu(void)
++{
++	(void) ml_set_interrupts_enabled(FALSE);
++	__builtin_arm_wsr64("CNTV_CTL_EL0", 0);
++	if (((__builtin_arm_rsr64("ID_AA64PFR0_EL1") >> 24) & 0xf) != 0 &&
++	    (__builtin_arm_rsr64("S3_0_C12_C12_5") & 1) != 0) {         /* ICC_SRE_EL1.SRE */
++		__builtin_arm_wsr64("S3_0_C12_C12_7", 0);               /* ICC_IGRPEN1_EL1 */
++	}
++	__builtin_arm_isb(ISB_SY);
++	for (;;) {
++		__builtin_arm_dsb(DSB_SY);
++		__builtin_arm_wfi();
++	}
++}
++#endif
+ /*
+  * Spin while mp_kdp_trap is set.
+  *
+@@ -1368,6 +1394,13 @@ wait_while_mp_kdp_trap(bool check_SIGPdebug)
+ 			found_SIGPdebug = true;
+ 			break;
+ 		}
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++		/* A panic never lets the other CPUs go (a stackshot does, within milliseconds): park them. */
++		if (panic_active()) {
++			os_atomic_clear_exclusive();
++			panic_park_cpu();
++		}
++#endif
+ 		__builtin_arm_wfe();
+ 	}
+ 	os_atomic_clear_exclusive();
+diff --git a/osfmk/arm/rtclock.c b/osfmk/arm/rtclock.c
+index 58ad17e..7cb022d 100644
+--- a/osfmk/arm/rtclock.c
++++ b/osfmk/arm/rtclock.c
+@@ -523,7 +523,14 @@ machine_delay_until(uint64_t interval,
+ 	uint64_t now;
+ 
+ 	do {
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 		__builtin_arm_wfe();
++#else
++		/* Not WFE: on a hypervisor that runs it in the guest (Gunyah), a vCPU delaying in WFE keeps its physical core in
++		 * WFE, and enough of that (drivers polling a virtio queue through IODelay) wedged a host core until the host's
++		 * watchdog rebooted the phone. */
++		__builtin_arm_isb(ISB_SY);
++#endif
+ 		now = mach_absolute_time();
+ 	} while (now < deadline);
+ }
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 8312c43..0a10bd7 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -139,11 +139,15 @@ uint64_t expecting_ipi_wfe_timeout_mt = 0x0ULL; /* initialized to a non-zero val
+  * loop. The default.
+  */
+ uint32_t idle_proximate_io_wfe_unmasked = 1;
+-/* sheng (UniXNU): off Apple silicon the cores belong to a hypervisor that traps WFI and blocks the vCPU but may run WFE in the guest,
+- * so a core awaiting a proximate timer in WFE keeps its physical core awake. Await it in WFI there. */
+-/* Measured on the board (2026-10-28): with WFI in the idle path every core went to sleep and nothing woke the system again (boot stalled
+- * 30 s after the data disk started), so the stock WFE polling stays. */
++/* Off Apple silicon the core may be a hypervisor's vCPU: Gunyah traps WFI and blocks the vCPU, but runs WFE in the guest, so a
++ * vCPU dwelling in WFE keeps its physical core. Await a proximate timer in WFI there. (sheng, on bare metal, keeps the WFE polling:
++ * with WFI there every core went to sleep and nothing woke the system.)
++ */
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ #define IDLE_PROXIMATE_TIMER_WFE 1
++#else
++#define IDLE_PROXIMATE_TIMER_WFE 0
++#endif
+ #if DEVELOPMENT || DEBUG
+ uint32_t idle_proximate_timer_wfe = IDLE_PROXIMATE_TIMER_WFE;
+ uint32_t idle_proximate_io_wfe_masked = 0;
+@@ -384,8 +388,8 @@ cpu_proximate_timer(void)
+ 	return !SetIdlePop();
+ }
+ 
+-#if defined(ARM64_BOARD_CONFIG_T6000)
+-int wfe_allowed = 0;
++#if defined(ARM64_BOARD_CONFIG_T6000) || !defined(APPLE_ARM64_ARCH_FAMILY)
++int wfe_allowed = 0;    /* off Apple silicon: see IDLE_PROXIMATE_TIMER_WFE */
+ #else
+ int wfe_allowed = 1;
+ #endif /* ARM64_BOARD_CONFIG_T6000 */
+diff --git a/osfmk/arm64/locore.s b/osfmk/arm64/locore.s
+index 3f42af8..2dc35f4 100644
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -863,7 +863,11 @@ LEXT(el1_sp1_synchronous_vector_long_spill_failed)
+ #endif /* CONFIG_XNUPOST */
+ #endif /* CONFIG_SPTM */
+ 0:
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	wfe
++#else
++	wfi						// not WFE, which Gunyah runs in the guest (osfmk/arm/locks.h wait_for_event)
++#endif
+ 	b		0b // Spin for watchdog
+ 	UNWIND_EPILOGUE
+ 
+@@ -1652,7 +1656,11 @@ Lfleh_synchronous_sp1_skip_panic_lockdown:
+ 
+ LEXT(el1_sp1_synchronous_vector_long_invalid_kstack)
+ 0:
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	wfe
++#else
++	wfi						// not WFE, which Gunyah runs in the guest (osfmk/arm/locks.h wait_for_event)
++#endif
+ 	b		0b // Spin for watchdog
+ 
+ 	.text
+diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_asm.s
+index 671dc50..78d0b1f 100644
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -789,7 +789,11 @@ LEXT(_copyin_atomic32_wait_if_equals)
+ 	mov		x0, ESTALE
+ 	b.ne		1f
+ 	mov		x0, #0
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	wfe
++#else
++	isb		// not WFE, which Gunyah runs in the guest (osfmk/arm/locks.h wait_for_event)
++#endif
+ 1:
+ 	clrex
+ 	/*
+@@ -1376,7 +1380,11 @@ LEXT(_copyin_atomic32_wait_if_equals_unchecked)
+ 	mov		x0, ESTALE
+ 	b.ne	1f
+ 	mov		x0, #0
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	wfe
++#else
++	isb		// not WFE, which Gunyah runs in the guest (osfmk/arm/locks.h wait_for_event)
++#endif
+ 1:
+ 	clrex
+ 	/*
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index c3b6ac2..75b6d55 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -274,6 +274,12 @@ void panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args,
+     unsigned long panic_caller, const char *panic_initiator) __dead2 __printflike(1, 0);
+ static void kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags);
+ void panic_spin_forever(void) __dead2;
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(__arm64__) && !defined(APPLE_ARM64_ARCH_FAMILY)
++extern void panic_park_cpu(void) __dead2;
++#endif
+ void panic_stackshot_release_lock(void);
+ extern void PE_panic_hook(const char*);
+ extern int sync_internal(void);
+@@ -1370,6 +1376,9 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ void __attribute__((noinline, optnone))
+ panic_spin_forever(void)
+ {
++#if defined(__arm64__) && !defined(APPLE_ARM64_ARCH_FAMILY)
++	panic_park_cpu();
++#else
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
+@@ -1378,6 +1387,7 @@ panic_spin_forever(void)
+ 		cpu_pause();
+ #endif
+ 	}
++#endif
+ }
+ 
+ void
+diff --git a/osfmk/kern/kern_stackshot.c b/osfmk/kern/kern_stackshot.c
+index 970a39a..7bd6421 100644
+--- a/osfmk/kern/kern_stackshot.c
++++ b/osfmk/kern/kern_stackshot.c
+@@ -36,6 +36,7 @@
+ #include <sys/stackshot.h>
+ #if defined(__arm64__)
+ #include <arm/cpu_internal.h>
++#include <pexpert/arm64/board_config.h>
+ #endif /* __arm64__ */
+ #ifdef IMPORTANCE_INHERITANCE
+ #include <ipc/ipc_importance.h>
+@@ -603,8 +604,11 @@ SECURITY_READ_ONLY_LATE(static uint32_t) max_tracebuf_size = SANE_TRACEBUF_SIZE;
+ 	    }                                              \
+ 	} while (0); /* end kcd_exit_on_error */
+ 
+-#if defined(__arm64__)
++#if defined(__arm64__) && defined(APPLE_ARM64_ARCH_FAMILY)
+ #define loop_wait_noguard() __builtin_arm_wfe()
++#elif defined(__arm64__)
++/* Not WFE, which Gunyah runs in the guest (osfmk/arm/locks.h wait_for_event): every CPU waits here through a stackshot. */
++#define loop_wait_noguard() __builtin_arm_yield()
+ #elif defined(__x86_64__)
+ #define loop_wait_noguard() __builtin_ia32_pause()
+ #else

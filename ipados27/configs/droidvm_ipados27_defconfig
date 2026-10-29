@@ -1,0 +1,26 @@
+# Kernel configuration of the DroidVM iPadOS 27 image (arm64e, xnu-12377). CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build.
+# The configuration fragments of the arm64e and iPadOS 27 profiles come first (board.toml [kernel] config_fragments); this file
+# holds what the board adds or changes.
+#
+# Bring-up step 1: the kernel with the board's XNU changes, its CPU and device tree drivers and no storage, owner chain or display
+# (those of the iPadOS 17 board, configs/droidvm_defconfig one level up, come over one at a time).
+
+CONFIG_XNU_BUILD_ARCHIVES=y
+CONFIG_XNU_SOURCE_CORECRYPTO14=y
+CONFIG_XNU_SOURCE_PTHREAD=y
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+CONFIG_XNU_NATIVE_PAN=y
+CONFIG_XNU_DT_PANIC_REGION=y
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
+# The kernel collection of 24A446 is an MH_FILESET; XnuPrelink's fileset emitter links this kernel into it.
+CONFIG_XNU_KERNEL_CHAINED_FIXUPS=y
+CONFIG_XNU_EXTRA_LD_ARCHIVES=""
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+CONFIG_XNU_NATIVE_UFS=n
+CONFIG_XNU_SHENG_PMGR=n
+CONFIG_XNU_NATIVE_ADRENO=n
+CONFIG_XNU_BOOT_PROGRESS=n
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n

@@ -1,0 +1,8 @@
+# Board patch paths for xnu-12377, one per line in application order (after the arm64e and iPadOS 27 series).
+ipados27-bringup.patch
+native-board-launch-policy.patch
+non-apple-vcpu-park.patch
+non-apple-vcpu-start-flush.patch
+non-apple-idle-wfi.patch
+zzx-pmap-sync-flush.patch
+zzw-native-sandbox-grant-patterns.patch
