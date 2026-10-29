@@ -23,7 +23,7 @@ static IOService *pendingLegacyDisplay;
 static IOService *activeGOPPresenter,*activeGOPNub;
 // GPU hand-off presenter (sheng-fb-gpu=1, phase 4): lives beside the display driver, which offers it frames instead of copying them.
 static IOService *gpuHandoffPresenter;
-extern "C" bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+extern "C" bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t format);
 extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
 volatile uint32_t native_legacy_gpu_fallbacks,native_legacy_gpu_last_status;
 static IOService *activeLegacyDisplay;
@@ -262,10 +262,12 @@ __attribute__((noinline)) void native_legacy_transfer_observed(IOReturn status,c
 static bool offeredToVirtioDisplay;
 // 0 retires the virtio display's swaps after its report again, as other clients' (an A/B switch, written in guest memory).
 volatile uint32_t droidvm_virtio_retire_on_offer=1;
-bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
-    offeredToVirtioDisplay=droidvm_virtio_gpu_offer(display,memory,stride,width,height);
+// format: GopFramebuffer's NGPSwap format (NativeGOPWire.h). The virtio GPU display scans the surface out as it lies, 32-bit BGRA rows
+// (NGP_BGRX8888, 1) only; a half-float frame (iPadOS 27's 'RGhA') goes to the GOP presenter's GPU conversion, or the CPU copy.
+bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height,uint32_t format) {
+    offeredToVirtioDisplay=format==1 && droidvm_virtio_gpu_offer(display,memory,stride,width,height);
     if(offeredToVirtioDisplay)return true;
-    return gpuHandoffPresenter && native_gop_gpu_offer(gpuHandoffPresenter,display,memory,stride,width,height);
+    return gpuHandoffPresenter && native_gop_gpu_offer(gpuHandoffPresenter,display,memory,stride,width,height,format);
 }
 extern "C" bool native_legacy_gpu_retires_on_offer(void *) {return offeredToVirtioDisplay && droidvm_virtio_retire_on_offer;}
 void native_legacy_gpu_fallback_observed(int status) {
