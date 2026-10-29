@@ -4,7 +4,7 @@
   export.py ls /private/var/mobile/Library/Logs/CrashReporter
   export.py tree /private/var/db/uuidtext          (every file below it with its size: "<d_type> <size> <path>")
   export.py cat /private/var/log/some.log [--offset N]
-  export.py get /private/var/db/file OUTPUT        (the whole file, in 1 MiB requests)
+  export.py get /private/var/db/file OUTPUT        (the whole file, in requests of the guest's buffer size)
   export.py ps                                     (pid, parent pid, name of every process)
   export.py kill PID [SIGNAL]                      (default 9; launchd restarts what it keeps alive)
   export.py mem PID ADDRESS [LENGTH]               (hex dump of a process's user memory)
@@ -21,12 +21,26 @@ sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(_
 import peek
 
 BOX = struct.Struct('<IIIiQQQ512s')     # request, done, kind, status, offset, length, total, path
-DATA_BYTES = 1 << 20
-PUT_BYTES = 256 << 10      # the smallest buffer a guest builds (the iPadOS 27 board's DROIDVM_EXPORT_BYTES)
+DATA_BYTES = 1 << 20       # the static buffer of a kernel that builds one (the iPadOS 17 board)
+PUT_BYTES = 256 << 10      # a piece of a file `put` writes: within every buffer a guest builds
 
 
 def physical(name):
     return peek.symbol(name) - peek.KERNEL_VA + peek.KERNEL_PA
+
+
+def data_buffer(pid, maps):
+    """(physical address, bytes) of the data buffer: the static droidvm_export_data, or the one a kernel allocates at its first
+    poll (DROIDVM_EXPORT_DYNAMIC, the iPadOS 27 board), which it publishes in droidvm_export_data_pa and _bytes."""
+    try:
+        published = physical('droidvm_export_data_pa')
+    except SystemExit:
+        return physical('droidvm_export_data'), DATA_BYTES
+    pa = struct.unpack('<Q', read_guest(pid, maps, published, 8))[0]
+    size = struct.unpack('<Q', read_guest(pid, maps, physical('droidvm_export_data_bytes'), 8))[0]
+    if not pa or not size:
+        sys.exit('the guest has not allocated its export buffer yet (is droidvm-monitor running?)')
+    return pa, size
 
 
 def write_guest(pid, maps, pa, data):
@@ -55,7 +69,7 @@ def read_guest(pid, maps, pa, length):
 
 def request(kind, path, offset=0, length=0, total=0, payload=b''):
     pid, maps = peek.crosvm_maps()
-    box, data = physical('droidvm_export_box'), physical('droidvm_export_data')
+    box, (data, _) = physical('droidvm_export_box'), data_buffer(pid, maps)
     current = BOX.unpack(read_guest(pid, maps, box, BOX.size))
     number = (current[0] + 1) & 0xffffffff
     if payload:

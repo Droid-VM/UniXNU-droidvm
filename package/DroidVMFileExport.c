@@ -19,8 +19,11 @@
 #include <sys/kauth.h>
 #include <sys/signal.h>
 #include <kern/kalloc.h>
+#if DROIDVM_EXPORT_DYNAMIC
+#include <vm/vm_kern_xnu.h>
+#endif
 
-// A board may build a smaller buffer (-DDROIDVM_EXPORT_BYTES=...): the iPadOS 27 fileset leaves the kernel's __DATA little room.
+// A board may build another buffer size (-DDROIDVM_EXPORT_BYTES=...).
 #ifndef DROIDVM_EXPORT_BYTES
 #define DROIDVM_EXPORT_BYTES (1u << 20)
 #endif
@@ -43,7 +46,27 @@ struct droidvm_export {
 	char path[512];
 };
 struct droidvm_export droidvm_export_box;
+#if DROIDVM_EXPORT_DYNAMIC
+// A board whose kernel data has no room for it (the iPadOS 27 fileset: the native __DATA must fit the original kernel's slot)
+// allocates the buffer, physically contiguous, at the first poll and publishes where it lies: the host reads
+// droidvm_export_data_pa and droidvm_export_data_bytes (tools/rig/export.py), which stay 0 until it exists.
+char *droidvm_export_data;
+volatile uint64_t droidvm_export_data_pa, droidvm_export_data_bytes;
+extern uint64_t kvtophys(vm_offset_t va);
+static bool droidvm_export_buffer(void) {
+	vm_offset_t address = 0;
+	if (droidvm_export_data) return true;
+	if (kmem_alloc_contig(kernel_map, &address, DROIDVM_EXPORT_BYTES, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_PERMANENT,
+	    VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) return false;
+	droidvm_export_data = (char *)address;
+	droidvm_export_data_bytes = DROIDVM_EXPORT_BYTES;
+	__atomic_store_n(&droidvm_export_data_pa, kvtophys(address), __ATOMIC_RELEASE);
+	return true;
+}
+#else
 char droidvm_export_data[DROIDVM_EXPORT_BYTES] __attribute__((aligned(4096)));
+static bool droidvm_export_buffer(void) { return true; }
+#endif
 
 static int droidvm_export_file(const char *path, uint64_t offset, uint64_t *length, uint64_t *total) {
 	vfs_context_t ctx = vfs_context_kernel();
@@ -273,6 +296,7 @@ static int droidvm_export_process(proc_t p, void *argument) {
 }
 
 void droidvm_export_poll(void) {
+	if (!droidvm_export_buffer()) return;
 	uint32_t request = __atomic_load_n(&droidvm_export_box.request, __ATOMIC_ACQUIRE);
 	if (request == droidvm_export_box.done) return;
 	char path[sizeof(droidvm_export_box.path)];

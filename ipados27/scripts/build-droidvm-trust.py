@@ -12,7 +12,8 @@ Writes TREE/build/droidvm-trust-<build>/original.bundle and inputs.json.
 
 --owner adds one owner module before them with the CDHashes an owner build records (build-adreno-metal-plugin.py's trust.json:
 cdhash, daemon_cdhash, turnip_cdhash; or a "cdhashes" list with an optional "category"), as make-owner-trust-bundle.py does for
-iPadOS 17; the bundle is then NAME.bundle (default owner). The original modules stay byte for byte.
+iPadOS 17; several records may share a CDHash (an old and a new plugin build kept trusted together). The bundle is then
+NAME.bundle (default owner). The original modules stay byte for byte.
 """
 import argparse
 import hashlib
@@ -62,10 +63,13 @@ def owner_module(paths):
         listed = [record[key] for key in ('cdhash', 'daemon_cdhash', 'turnip_cdhash') if key in record] + record.get('cdhashes', [])
         for value in listed:
             digest = bytes.fromhex(value)
-            if len(digest) != 20 or digest in categories:
-                raise SystemExit(f'{path}: {value} is no new 20-byte CDHash')
-            hashes.append(digest)
-            categories[digest] = record.get('category', 0)
+            if len(digest) != 20:
+                raise SystemExit(f'{path}: {value} is no 20-byte CDHash')
+            # Two builds kept trusted side by side (a plugin redeployed into a running Data) share what did not change.
+            if categories.setdefault(digest, record.get('category', 0)) != record.get('category', 0):
+                raise SystemExit(f'{path}: {value} listed with two categories')
+            if digest not in hashes:
+                hashes.append(digest)
     hashes.sort()
     identifier = uuid.uuid5(uuid.NAMESPACE_URL, 'org.blu-sharky.droidvm-owner:' + ''.join(h.hex() for h in hashes))
     return struct.pack('<I16sI', 2, identifier.bytes, len(hashes)) + b''.join(h + bytes([2, 0, categories[h], 0]) for h in hashes), hashes
