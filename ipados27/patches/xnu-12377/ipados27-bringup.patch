@@ -5,7 +5,8 @@ plug-in mount). It carries the Darwin 26 posix_spawnattr layout, the 47-bit user
 signed with the one native key set, the GPU kobject grant, upstream's ports of this board's iPadOS 17 patches (hw.pagesize for
 everyone, bindfs vfs_vget, data protection classes without content protection, built-in boot arguments, 16-bit ASIDs, the pmap's
 user mappings, the write-combined cache sync of batched attribute changes, the start-up flushes of cpu_start, the staged apps
-view) and sheng's bring-up diagnostics. Sheng's idle WFE polling (cpu.c) is kept here and turned off by non-apple-vcpu-park.
+view) and sheng's bring-up diagnostics (proc_pid declared for them in exception.c, which a RELEASE build, the fileset reference, needs).
+Sheng's idle WFE polling (cpu.c) is kept here and turned off by non-apple-vcpu-park.
 
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 0a1186e..bebf036 100644
@@ -1402,7 +1403,7 @@ index fd3e49e..64bcd3f 100644
  iokit_lookup_ident_port(ipc_port_t port)
  {
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 29d7dbe..af797d0 100644
+index 29d7dbe..9dfd1f6 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
 @@ -94,6 +94,9 @@
@@ -1426,7 +1427,15 @@ index 29d7dbe..af797d0 100644
  
  bool panic_on_exception_triage = false;
  
-@@ -957,9 +964,115 @@ exception_triage(
+@@ -130,6 +137,7 @@ kern_return_t bsd_exception(
+ 
+ #ifdef MACH_BSD
+ extern int      proc_selfpid(void);
++extern int      proc_pid(struct proc *p);
+ extern char     *proc_name_address(struct proc *p);
+ #endif /* MACH_BSD */
+ 
+@@ -957,9 +965,115 @@ exception_triage(
  		/* Note this may consume control flow if it decides the exception is unrecoverable. */
  		maybe_unrecoverable_exception_triage(exception, code);
  	}
