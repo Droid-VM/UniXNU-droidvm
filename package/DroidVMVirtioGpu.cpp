@@ -98,7 +98,9 @@ bool fail(const char *why) { droidvm_virtio_gpu_state = 3; IOLog("virtio-gpu: %s
 // costs no exit. A wait spins for its first 200 us and then sleeps, so the vCPUs of waiting threads go idle (WFI, on which the
 // hypervisor blocks them): four vCPUs that spun through commands the host was slow to return came before each host watchdog
 // bite on 2026-10-25, when this spun for 2 ms.
-void pause(uint64_t begin) { if (nowUs() - begin < 200) IODelay(5); else IOSleep(1); }
+// A waiter's step between looks at the used ring (the device raises no interrupt): a short spin, then sleeps of 100 us -- not
+// IOSleep(1), whose millisecond (and timer leeway) every command's completion paid.
+void pause(uint64_t begin) { if (nowUs() - begin < 50) IODelay(5); else delay_for_interval(100, NSEC_PER_USEC); }
 // Takes every command the device has returned off the used ring, in whatever order it returned them (a fenced command comes back
 // when its fence signals). Called with the lock held, by whichever thread is waiting.
 void reap() {

@@ -10,6 +10,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
+#include <kern/clock.h>
 extern "C" {
 // stage, status, capset gpu id, context type, pool offset, ccmd ret, ccmd gpu id, capset bytes; then the shmem's seqno and response
 // offset, and the first 32 bytes of the response as they were read
@@ -171,6 +172,12 @@ volatile uint64_t droidvm_virtgpu_slow_count, droidvm_virtgpu_finished_blocked;
 volatile uint32_t droidvm_virtgpu_finished_trylock;
 // The physically contiguous pieces a guest blob's pages come in, at most (KiB; see guestPages).
 volatile uint32_t droidvm_virtgpu_chunk_kib = 256;
+// The render server's fenced submissions, from their EXECBUFFER to the guest seeing the host return them (the host returns a
+// fenced command once its fence signals, after the GPU ran it): count, total and largest (us), and a histogram by power-of-two
+// milliseconds (<1, <2 ... <256, more). What of a frame's commit-to-completion is the host's and the GPU's.
+volatile uint64_t droidvm_virtgpu_rs_fences[3], droidvm_virtgpu_rs_fence_hist[10];
+// The step (us) a fence wait sleeps between looks at the device's returned commands (waitFence).
+volatile uint32_t droidvm_virtgpu_fence_poll_us = 100;
 // Guest blobs whose pages, or the rest of them, came as ordinary pages because no 64 KiB contiguous piece was free, and their bytes.
 volatile uint64_t droidvm_virtgpu_scattered_blobs, droidvm_virtgpu_scattered_bytes;
 }
@@ -189,7 +196,7 @@ struct Resource {
 };
 // A fenced submission in flight; `sequence` numbers the client's fenced submissions in the order they were made, `order`
 // every client's (the display waits by it: droidvm_virtgpu_finished).
-struct Pending { uint32_t ticket, ring; uint64_t fence, sequence, order; };
+struct Pending { uint32_t ticket, ring; uint64_t fence, sequence, order, postedUs; };
 // A closed resource the GPU may still use: released once every submission made before it was closed has finished.
 struct Closed { Resource resource; uint64_t sequence; };
 struct Client {
@@ -253,6 +260,15 @@ void reapFences(Client *c) {
         if (!poll(c->pending[i].ticket, &result)) { ++i; continue; }
         const Pending done = c->pending[i];
         if (done.fence > c->completed[done.ring]) c->completed[done.ring] = done.fence;
+        if (!strncmp(c->name, "backboardd", sizeof c->name)) {
+            const uint64_t us = nowUsLocal() - done.postedUs, ms = us / 1000;
+            unsigned bucket = 0;
+            while (bucket < 9 && ms >= (uint64_t(1) << bucket)) ++bucket;
+            droidvm_virtgpu_rs_fence_hist[bucket] = droidvm_virtgpu_rs_fence_hist[bucket] + 1;
+            droidvm_virtgpu_rs_fences[0] = droidvm_virtgpu_rs_fences[0] + 1;
+            droidvm_virtgpu_rs_fences[1] = droidvm_virtgpu_rs_fences[1] + us;
+            if (us > droidvm_virtgpu_rs_fences[2]) droidvm_virtgpu_rs_fences[2] = us;
+        }
         c->pending[i] = c->pending[--c->pendingCount];
     }
 }
@@ -530,7 +546,7 @@ IOReturn execbuffer(Client *c, const droidvm_virtgpu_execbuffer &in, const uint8
     IOLockLock(c->fenceLock);
     c->nextFence[in.ring_idx] = fence;
     c->pending[c->pendingCount++] = {ticket, in.ring_idx, fence, ++c->sequence,
-                                     __atomic_add_fetch(&gSubmittedOrder, 1, __ATOMIC_ACQ_REL)};
+                                     __atomic_add_fetch(&gSubmittedOrder, 1, __ATOMIC_ACQ_REL), nowUsLocal()};
     IOLockUnlock(c->fenceLock);
     out.fence = fence; count(5);
     return kIOReturnSuccess;
@@ -548,8 +564,14 @@ IOReturn waitFence(Client *c, const droidvm_virtgpu_wait_fence &in) {
             if (IOLockTryLock(c->lock)) { reapPending(c); IOLockUnlock(c->lock); }
             return kIOReturnSuccess;
         }
-        if (nowUsLocal() - begin >= timeoutUs) { if (timeoutUs) count(6); return kIOReturnTimeout; }
-        IOSleep(1);   // a fence is a GPU job: sleep, so the vCPU goes idle (see pause() in DroidVMVirtioGpu.cpp)
+        const uint64_t waited = nowUsLocal() - begin;
+        if (waited >= timeoutUs) { if (timeoutUs) count(6); return kIOReturnTimeout; }
+        // A fence is a GPU job: sleep, so the vCPU goes idle -- but in steps of 100 us after a short spin, not IOSleep(1).
+        // The device raises no interrupt (waiters poll), so the step is the latency between the host retiring the fence and
+        // Metal's completion: IOSleep(1), timer leeway included, held each frame's commit-to-completion near 10 ms while
+        // its GPU work took about 1 ms, the GPU sat idle most of the frame and its governor kept it at the lowest clocks.
+        if (waited < 50) IODelay(5);
+        else delay_for_interval(droidvm_virtgpu_fence_poll_us, NSEC_PER_USEC);
     }
 }
 // The handle goes now; the pages go once the GPU cannot be using them. A submission does not name the resources it uses, so
