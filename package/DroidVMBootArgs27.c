@@ -27,6 +27,7 @@ char PE_builtin_boot_args[] =
     // then waits on panel hardware and its watchdog kills SpringBoard.
     "owner-hide-vmm=audiomxd "
     // the processes besides the render server that get the accelerator's user client and a native Metal device, as on iPadOS 17
-    // (DroidVMBootArgs.c): the launch policy writes the plugin's NativeAdrenoMetal.clients from it at every boot
-    "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,com.apple.WebKit.*,Preferences,MetalCheck,app_ios,"
-    "gfxprobe";
+    // (DroidVMBootArgs.c), and iPadOS 27's wallpaper renderer (SBRendererService, PaperBoardUI): the launch policy writes the
+    // plugin's NativeAdrenoMetal.clients from it at every boot
+    "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService,com.apple.WebKit.*,Preferences,"
+    "MetalCheck,app_ios,gfxprobe";

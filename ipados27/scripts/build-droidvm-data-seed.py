@@ -41,7 +41,7 @@ SCRATCH = Path('/tmp') / f'droidvm27-seed-{os.environ.get("USER", "build")}'
 # The preferences the seed carries (seed-data-prefs.py USER:DOMAIN:KEY=VALUE).
 PREFS = ['mobile:com.apple.coreanimation:CAEnableMedina=false', 'root:com.apple.coreanimation:CAEnableMedina=false']
 # The processes besides the render server that get a native Metal device (the board's droidvm-gpu-clients), as on iPadOS 17.
-GPU_CLIENTS = 'WidgetRenderer_Default,PosterBoard,iconservicesagent'
+GPU_CLIENTS = 'WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService'
 
 
 def run(command, **kwargs):

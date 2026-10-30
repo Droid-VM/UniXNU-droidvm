@@ -127,8 +127,9 @@ kernel_args = [
   "sheng-gpu-addon=1",
   # Fewer GPU clients than the built-in iPadOS 17 list for now: with all of them (14 clients, each priming its own pipelines) the
   # host's GPU memory took the phone to swap and it stopped answering for minutes. The list grows as the plugin's iPadOS 27
-  # gaps close (the command line wins over the built-in value).
-  "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent",
+  # gaps close (the command line wins over the built-in value). The wallpaper takes the poster extensions (*Poster*) and
+  # SBRendererService, PaperBoardUI's renderer, whose NeutrinoCore device asserts without a Metal device.
+  "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService",
   "-v",
 ]
 
