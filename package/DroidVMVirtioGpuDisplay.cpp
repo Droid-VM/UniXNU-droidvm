@@ -21,6 +21,9 @@ volatile uint32_t droidvm_virtio_present_wait = 1;
 volatile uint64_t droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us;
 // Swaps shown although the GPU work before them had not finished in 2 s (a torn frame rather than a stopped display).
 volatile uint64_t droidvm_virtio_present_late;
+// The last resource create() refused: which check (1 arguments, 2 prepare, 3 longer than the memory, 4 a segment, 5 the host),
+// its status, then length, stride, width, height, the segments described so far and the segment that failed (address, length).
+volatile uint64_t droidvm_virtio_display_create_fail[10], droidvm_virtio_display_create_fails;
 // The scanout's refresh rate in Hz from the device's EDID (its first detailed timing), 0 without one: the VM's display setting
 // (crosvm's refresh-rate), which the display reports to the compositor (LegacyDisplayProbe.cpp, native_legacy_refresh_hz).
 volatile uint32_t droidvm_virtio_display_refresh_hz;
@@ -72,17 +75,25 @@ bool release(Resource &r) {
     OSSafeReleaseNULL(r.memory); r = {}; return true;
 }
 // surface: the memory is a compositor surface, whose last page is all its own (the boot framebuffer's is not known to be).
+IOReturn refused(unsigned check, IOReturn status, IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height,
+                 uint32_t count = 0, uint64_t pa = 0, uint64_t length = 0) {
+    const uint64_t fail[10] = {check, uint32_t(status), memory ? memory->getLength() : 0, stride, width, height, count, pa, length, 0};
+    for (unsigned i = 0; i < 10; ++i) droidvm_virtio_display_create_fail[i] = fail[i];
+    droidvm_virtio_display_create_fails = droidvm_virtio_display_create_fails + 1;
+    return status;
+}
 IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height, bool surface = false) {
     if (!width || width > 16384 || !height || height > 16384 || stride < uint64_t(width) * 4 ||
-        stride % 4 || stride > 65536 || memory->getLength() < stride * height) return kIOReturnBadArgument;
+        stride % 4 || stride > 65536 || memory->getLength() < stride * height)
+        return refused(1, kIOReturnBadArgument, memory, stride, width, height);
     r.memory = memory; memory->retain(); r.stride = stride; r.width = width; r.height = height;
     IOReturn status = memory->prepare(kIODirectionOut);
-    if (status) { OSSafeReleaseNULL(r.memory); return status; }
+    if (status) { OSSafeReleaseNULL(r.memory); return refused(2, status, memory, stride, width, height); }
     r.prepared = true;
     uint64_t bytes = stride * height, described = bytes;
     if (droidvm_virtio_display_blob) {
         bytes = described = (bytes + 4095) & ~4095ULL;
-        if (bytes > memory->getLength()) { release(r); return kIOReturnBadArgument; }
+        if (bytes > memory->getLength()) { refused(3, kIOReturnBadArgument, memory, stride, width, height); release(r); return kIOReturnBadArgument; }
         // The host may import the blob as an image of these dimensions, and its driver asks for more memory than stride x
         // height: Turnip lays the last level of a LINEAR image out over rows to a multiple of 4, which its 16x4 blits may
         // over-fetch (freedreno fd6_layout.c). It refused a 1024x1366 blob 8 KiB short of 1368 rows, and that frame took the
@@ -96,7 +107,10 @@ IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32
         uint64_t pa = memory->getPhysicalSegment(offset, &length);
         if (length > described - offset) length = described - offset;
         if (!pa || !length || length > UINT32_MAX || count == MaxEntries ||
-            (droidvm_virtio_display_blob && ((pa | length) & 4095))) { release(r); return kIOReturnBadArgument; }
+            (droidvm_virtio_display_blob && ((pa | length) & 4095))) {
+            refused(4, kIOReturnBadArgument, memory, stride, width, height, count, pa, length);
+            release(r); return kIOReturnBadArgument;
+        }
         entries[count++] = {pa, uint32_t(length), 0}; offset += length;
     }
     if (bytes > described) {
@@ -127,6 +141,7 @@ IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32
         }
     }
     if (status) {
+        refused(5, status, memory, stride, width, height, count, reply.type, bytes);
         // A valid error to CREATE means the resource doesn't exist. A transport failure is
         // ambiguous, so leave both the resource id and prepared pages owned until reboot.
         if (!created && ready() && reply.type >= 0x1200) r.id = 0;
