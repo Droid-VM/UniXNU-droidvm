@@ -36,6 +36,9 @@
 //                                       looks up (SBHScreenTypeForCurrentDevice) and its inputs (the effective device class, home
 //                                       button type, artwork subtype, corner radius, and the main screen's reference bounds and scale,
 //                                       which outside SpringBoard come from UIKit's main screen as printed)
+//   gfxprobe wired [N]                  where the kernel's wired memory is (mach_memory_info, as zprint reads it; root's host port
+//                                       is the privileged one): the N (default 40) largest allocation sites and tags, the zones in
+//                                       all, and vm_statistics64's wired, free, active, inactive and compressor pages
 //   gfxprobe sync PATH...               F_FULLFSYNC each file, then sync(): a file staged into the Data overlay (export.py put)
 //                                       reaches the store before the VM stops (vm.sh stop is no clean shutdown)
 //   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
@@ -194,6 +197,8 @@
 #import <spawn.h>
 #import <sys/wait.h>
 #import <mach/mach.h>
+#import <mach/mach_host.h>
+#import <mach_debug/mach_debug.h>
 #import <stdatomic.h>
 #import <os/lock.h>
 #import <sys/mman.h>
@@ -1783,6 +1788,49 @@ static int motionProbe(unsigned seconds) {
 }
 
 // `gfxprobe ioreg CLASS`: every service of CLASS, its properties and its children's classes (the guest has no ioreg).
+// mach_memory_info's site flags (xnu osfmk/mach/vm_statistics.h, kernel private): the low byte is the site's type.
+enum { SiteType = 0xff, SiteTag = 0, SiteKmod = 1, SiteKernel = 2, SiteCounter = 3, SiteWired = 0x100, SiteZone = 0x800,
+       SiteZoneView = 0x1000 };
+static int wiredMemory(unsigned top) {
+    mach_zone_name_array_t names = NULL; mach_zone_info_array_t zones = NULL; mach_memory_info_array_t sites = NULL;
+    mach_msg_type_number_t nameCount = 0, zoneCount = 0, siteCount = 0;
+    kern_return_t kr = mach_memory_info(mach_host_self(), &names, &nameCount, &zones, &zoneCount, &sites, &siteCount);
+    if (kr != KERN_SUCCESS) { printf("mach_memory_info: %s (%d)\n", mach_error_string(kr), kr); return 1; }
+    uint64_t zoneBytes = 0;
+    for (mach_msg_type_number_t i = 0; i < zoneCount; ++i) zoneBytes += zones[i].mzi_cur_size;
+    // Each site's size; a zone's own rows (SiteZone, SiteZoneView) are in the zones' total. The wired total adds the rows the
+    // kernel counts as wired (SiteWired), as zprint does.
+    unsigned *order = calloc(siteCount, sizeof *order);
+    unsigned rows = 0; uint64_t total = 0;
+    for (mach_msg_type_number_t i = 0; i < siteCount; ++i) {
+        if (!sites[i].size || (sites[i].flags & (SiteZone | SiteZoneView))) continue;
+        if (sites[i].flags & SiteWired) total += sites[i].size;
+        order[rows++] = i;
+    }
+    for (unsigned a = 0; a < rows; ++a)
+        for (unsigned b = a + 1; b < rows; ++b)
+            if (sites[order[b]].size > sites[order[a]].size) { unsigned t = order[a]; order[a] = order[b]; order[b] = t; }
+    printf("sites %u (wired %.1f MiB), zones %u (%.1f MiB)\n", siteCount, total / 1048576.0, zoneCount, zoneBytes / 1048576.0);
+    static const char *const kinds[] = {"tag", "kmod", "kernel", "counter"};
+    for (unsigned r = 0; r < rows && r < top; ++r) {
+        const mach_memory_info_t *m = &sites[order[r]];
+        const unsigned type = m->flags & SiteType;
+        printf("%9.1f MiB  peak %9.1f  %-7s%s tag %3u  %s%s%#llx\n", m->size / 1048576.0, m->peak / 1048576.0,
+               type < 4 ? kinds[type] : "?", (m->flags & SiteWired) ? " wired" : "      ", m->tag,
+               m->name[0] ? m->name : "", m->name[0] ? " " : "", (unsigned long long)m->site);
+    }
+    vm_statistics64_data_t vm = {};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count) == KERN_SUCCESS) {
+        const double page = vm_kernel_page_size / 1048576.0;
+        printf("pages of %lu bytes: wired %.1f MiB, free %.1f, active %.1f, inactive %.1f, compressor %.1f, purgeable %.1f\n",
+               (unsigned long)vm_kernel_page_size, vm.wire_count * page, vm.free_count * page, vm.active_count * page,
+               vm.inactive_count * page, vm.compressor_page_count * page, vm.purgeable_count * page);
+    }
+    free(order);
+    return 0;
+}
+
 static int mobileGestalt(int count, char **keys) {
     static const char *const screen[] = {"main-screen-scale", "main-screen-width", "main-screen-height", "main-screen-class",
         "main-screen-pitch", "DisplayExtendedProperties", "ArtworkTraits", "ArtworkDeviceSubType", "ArtworkDeviceScaleFactor",
@@ -2176,6 +2224,8 @@ int main(int argc, char **argv) {
             return setOrientation(strtol(argv[2], NULL, 0));
         if (argc >= 2 && !strcmp(argv[1], "orient-follow"))
             return followOrientation();
+        if (argc >= 2 && !strcmp(argv[1], "wired"))
+            return wiredMemory(argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 40);
         if (argc >= 2 && !strcmp(argv[1], "sbscreen"))
             return springBoardScreen();
         if (argc >= 2 && !strcmp(argv[1], "mg"))

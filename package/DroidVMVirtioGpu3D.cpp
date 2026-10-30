@@ -171,6 +171,8 @@ volatile uint64_t droidvm_virtgpu_slow_count, droidvm_virtgpu_finished_blocked;
 volatile uint32_t droidvm_virtgpu_finished_trylock;
 // The physically contiguous pieces a guest blob's pages come in, at most (KiB; see guestPages).
 volatile uint32_t droidvm_virtgpu_chunk_kib = 256;
+// Guest blobs whose pages, or the rest of them, came as ordinary pages because no 64 KiB contiguous piece was free, and their bytes.
+volatile uint64_t droidvm_virtgpu_scattered_blobs, droidvm_virtgpu_scattered_bytes;
 }
 namespace DroidVMVirtioGpu {
 namespace {
@@ -360,6 +362,11 @@ IOReturn contextInit(Client *c, const droidvm_virtgpu_context_init &in, droidvm_
 // A guest blob's pages: wired and zeroed, physically contiguous in chunks of at most ContiguousLimit (halved down to 64 KiB
 // while an allocation fails), so a blob of any size the host is told about in few entries (one per page refused blobs above
 // 16 MiB). Several chunks become one IOMultiMemoryDescriptor.
+// Where not even 64 KiB is free in one run, the rest of the blob is ordinary wired pages: a contiguous allocation that fails
+// returns at once, which the VM never sees as a shortage, while an ordinary one waits for the pageout daemon to compress and
+// reclaim inactive pages (and memorystatus raises the pressure level). At 2048x2732 the contiguous pieces ran out with 2 GB of
+// active and inactive memory in the guest, and every later blob was refused (kIOReturnNoMemory): processes using Metal died.
+// One entry a page then, well inside MaxBlobEntries (256 MiB of pages).
 // In physically contiguous pieces of droidvm_virtgpu_chunk_kib (256 KiB), larger only as far as the blob's entries need
 // (MaxBlobEntries, one per piece at worst). Pieces of ContiguousLimit (4 MiB) took 0.2-3.7 s a blob once the VM had run a while:
 // the kernel finds so long a run of free pages only by scanning, and moving, its memory -- with the client's lock held, so every
@@ -372,11 +379,24 @@ IOMemoryDescriptor *guestPages(uint64_t bytes) {
     if (chunk < 0x10000 || chunk > ContiguousLimit) chunk = ContiguousLimit;
     while (chunk < ContiguousLimit && (bytes + chunk - 1) / chunk > MaxBlobEntries) chunk <<= 1;
     uint32_t count = 0; uint64_t offset = 0;
+    bool scattered = false;
     while (offset < bytes) {
-        const uint64_t length = bytes - offset < chunk ? bytes - offset : chunk;
-        IOBufferMemoryDescriptor *piece = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-            IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), length, ~uint64_t(4095));
-        if (!piece && chunk > 0x10000) { chunk >>= 1; continue; }
+        uint64_t length = bytes - offset < chunk ? bytes - offset : chunk;
+        IOBufferMemoryDescriptor *piece = nullptr;
+        if (!scattered) {
+            piece = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+                IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), length, ~uint64_t(4095));
+            if (!piece && chunk > 0x10000) { chunk >>= 1; continue; }
+            if (!piece) scattered = true;
+        }
+        if (scattered) {
+            length = bytes - offset;
+            piece = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, length, 4096);
+            if (piece) {
+                droidvm_virtgpu_scattered_blobs = droidvm_virtgpu_scattered_blobs + 1;
+                droidvm_virtgpu_scattered_bytes = droidvm_virtgpu_scattered_bytes + length;
+            }
+        }
         if (!piece || count == most) { if (piece) piece->release(); break; }
         bzero(piece->getBytesNoCopy(), length);
         chunks[count++] = piece; offset += length;
