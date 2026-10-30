@@ -31,6 +31,17 @@ volatile uint64_t droidvm_virtio_display_hold_late, droidvm_virtio_display_hold_
 volatile uint64_t droidvm_virtio_offer_gap_hist[41], droidvm_virtio_offer_gaps[2], droidvm_virtio_offer_refused;
 // The surfaces the display keeps prepared (wired) for the host: how many, and their bytes.
 volatile uint64_t droidvm_virtio_display_wired[2];
+// 1: a swap completes for the compositor once its scanout and flush are posted -- the host's copy is queued on the GPU -- rather than
+// once the host answers that the copy is done (about 2.8 ms later, 9.5 at p90). CoreAnimation keeps at most two swaps in flight and
+// waits for the oldest to complete before it submits a third (IOMFBDisplay::can_update_, swap_wait_timeout): with completion after
+// the copy, a swap's trip (the encoding thread's 3 ms, the GPU's 6.5, the copy's 2.8) left 2.7 ms of the two refresh periods, and a
+// slow GPU frame made CoreAnimation skip a refresh (130 ms of 4 s of page swipes waiting there). Page swipes: 98 fps against 82, in
+// one boot. The compositor draws into this frame's surface again three frames later (three framebuffers), which the guest GPU
+// runs after the two frames before it: of 1400 host copies, none began after a second guest frame had begun drawing (the copy
+// starts 2 ms after the frame's GPU work at p50, 12 at most, and runs before the guest's work, at a higher priority). 0:
+// completion after the answer, as before (an A/B switch, written in guest memory). Frames whose flush failed after: post_failures.
+volatile uint32_t droidvm_virtio_complete_on_post = 1;
+volatile uint64_t droidvm_virtio_completed_on_post, droidvm_virtio_post_failures;
 uint64_t lastOfferUs;
 // 1: a frame's scanout and flush are posted and collected while the next frame's GPU work is awaited (the worker's Flight);
 // 0: each frame waits for its flush before the next is taken, as before (an A/B switch, written in guest memory).
@@ -257,7 +268,8 @@ void worker(void *, wait_result_t) {
     // a frame costs the longer of the two rather than their sum (5.3 ms of GPU work and 6.1 ms of flush a 2048x2732 frame, one
     // after the other, held page swipes to 72 fps). It completes (land()) before the next frame is posted, or when no frame
     // follows it, so one flush at most is in flight and frames complete in order.
-    struct Flight { Frame frame; Posted posted; uint64_t sample, waited, flushBegin; uint32_t mode, collected; IOReturn result; bool drawn; };
+    struct Flight { Frame frame; Posted posted; uint64_t sample, waited, flushBegin; uint32_t mode, collected; IOReturn result; bool drawn,
+                    completed; };
     Flight flight = {};
     bool inFlight = false;
     // The frame in flight's replies, waited for (block) or as far as the device has returned them: true once all are in.
@@ -290,7 +302,8 @@ void worker(void *, wait_result_t) {
             droidvm_virtio_display_frames = droidvm_virtio_display_frames + 1;
             native_legacy_frame_observed(2, 0, 0, 0, f.width, f.height);
         }
-        native_legacy_gpu_complete(f.display, result);
+        if (!flight.completed) native_legacy_gpu_complete(f.display, result);
+        else if (result) droidvm_virtio_post_failures = droidvm_virtio_post_failures + 1;
         f.memory->release(); f.display->release();
         return true;
     };
@@ -346,8 +359,13 @@ void worker(void *, wait_result_t) {
             Posted posted = {};
             status = r ? present(*r, droidvm_virtio_present_pipeline ? &posted : nullptr) : kIOReturnIOError;
             if (!status && posted.count) {
-                flight = {frame, posted, sample, waited, flushBegin, mode, 0, kIOReturnSuccess, drawn};
+                flight = {frame, posted, sample, waited, flushBegin, mode, 0, kIOReturnSuccess, drawn, false};
                 inFlight = true;
+                if (droidvm_virtio_complete_on_post) {
+                    native_legacy_gpu_complete(frame.display, kIOReturnSuccess);
+                    flight.completed = true;
+                    droidvm_virtio_completed_on_post = droidvm_virtio_completed_on_post + 1;
+                }
             } else {
                 // Refused before the host had it, or presented synchronously: complete it here as before.
                 // The sample's fence is the swap's work number, and retired the same once that work was drawn.
