@@ -100,7 +100,11 @@ kernel_args = [
   "offline-legacy-register=1",
   "offline-legacy-gop=1",
   "offline-legacy-phase=4",
-  "offline-legacy-unit-scale=1",
+  # Two scanout pixels per point, as upstream's boards: iPadOS 27's QuartzCore runs any panel taller than 1080 pixels (and every
+  # panel of a virtual device) at @2x whatever display-scale says (-[CADisplayMode preferredScale]), so the VM's display is
+  # 2048x2732, the 12.9-inch iPad's 1024x1366 points. At one pixel per point (1024x1366) SpringBoard saw 512x683 points and laid the
+  # home screen out as an iPad mini's.
+  "offline-legacy-unit-scale=2",
   "offline-legacy-pm=1",
   "offline-legacy-validate=1",
   "offline-legacy-transfer=1",
@@ -143,5 +147,6 @@ ipad_identity = true
 unique_chip_id = "required"
 chip_id = "8142"                     # iPad17,3 (the OS profile's [ipsw] chip_id 33090)
 # The J820's identity from the IPSW's own device tree (unixnu ipsw fetch DeviceTree, copied to .cache/firmware here).
-tool_args = ["--dynamic", "--boot-video-mib", "8", "--reclaim-memory", "--display-gamut", "sRGB",
+# --boot-video-mib: DarwinBoot's BLT-only boot screen in RAM, 2048x2732 at 4 bytes a pixel (21.3 MiB).
+tool_args = ["--dynamic", "--boot-video-mib", "24", "--reclaim-memory", "--display-gamut", "sRGB",
              "--identity-tree", ".cache/firmware/DeviceTree.j820ap.im4p", "--kernel-ctrr-to-be-enabled", "0"]
