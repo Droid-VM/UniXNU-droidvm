@@ -37,7 +37,8 @@
 // droidvm_export_data to file <path> at `offset`, creating it root-owned with mode `total` (truncated when offset is 0),
 // only under /private/var/ngpu/; kind 6 lists a whole tree as kind 1 lists a directory, "<d_type> <size> <path below
 // <path>>\n" lines depth-first (a regular file's size, 0 for anything else), from entry offset (total = entries listed):
-// one request where kind 1 and a size read per file took thousands, for the unified log's uuidtext.
+// one request where kind 1 and a size read per file took thousands, for the unified log's uuidtext; kind 7 reads a stackshot
+// (droidvm_export_stackshot) from offset (total = its size).
 struct droidvm_export {
 	volatile uint32_t request, done;
 	uint32_t kind;
@@ -295,6 +296,39 @@ static int droidvm_export_process(proc_t p, void *argument) {
 	return PROC_RETURNED;
 }
 
+// Kind 7: a stackshot (kcdata, as spindump's) of the process whose pid `path` holds (-1: every process), every thread's kernel
+// and user frames and what it waits on: taken at offset 0 into a buffer of its own, which later offsets read on. For a guest
+// whose user space no longer runs a tool -- spindump that stopped making its report, an ssh session that never got its shell.
+extern kern_return_t stack_snapshot_from_kernel(int pid, void *buf, uint32_t size, uint64_t flags, uint64_t delta_since_timestamp,
+    uint32_t pagetable_mask, unsigned *bytes_traced);
+#define DROIDVM_STACKSHOT_BYTES (8u << 20)
+static char *droidvm_stackshot;
+static unsigned droidvm_stackshot_used;
+static int droidvm_export_stackshot(const char *path, uint64_t offset, uint64_t *length, uint64_t *total) {
+	if (offset == 0) {
+		if (!droidvm_stackshot) droidvm_stackshot = kalloc_data(DROIDVM_STACKSHOT_BYTES, Z_WAITOK | Z_ZERO);
+		if (!droidvm_stackshot) return ENOMEM;
+		int pid = -1;
+		const char *text = path;
+		bool negative = *text == '-';
+		if (negative) text++;
+		if (*text >= '0' && *text <= '9') for (pid = 0; *text >= '0' && *text <= '9'; text++) pid = pid * 10 + (*text - '0');
+		if (negative) pid = -pid;
+		droidvm_stackshot_used = 0;
+		// STACKSHOT_KCDATA_FORMAT | STACKSHOT_THREAD_WAITINFO | STACKSHOT_NO_IO_STATS | STACKSHOT_GET_DQ
+		const uint64_t flags = 0x10000 | 0x1000000 | 0x800000 | 0x01;
+		if (stack_snapshot_from_kernel(pid, droidvm_stackshot, DROIDVM_STACKSHOT_BYTES, flags, 0, 0, &droidvm_stackshot_used) != KERN_SUCCESS)
+			return EIO;
+	}
+	if (offset > droidvm_stackshot_used) return EINVAL;
+	uint64_t count = droidvm_stackshot_used - offset;
+	if (count > DROIDVM_EXPORT_BYTES) count = DROIDVM_EXPORT_BYTES;
+	memcpy(droidvm_export_data, droidvm_stackshot + offset, (size_t)count);
+	*length = count;
+	*total = droidvm_stackshot_used;
+	return 0;
+}
+
 void droidvm_export_poll(void) {
 	if (!droidvm_export_buffer()) return;
 	uint32_t request = __atomic_load_n(&droidvm_export_box.request, __ATOMIC_ACQUIRE);
@@ -323,6 +357,8 @@ void droidvm_export_poll(void) {
 		length = cursor.used;
 		total = cursor.count;
 		status = 0;
+	} else if (droidvm_export_box.kind == 7) {
+		status = droidvm_export_stackshot(path, droidvm_export_box.offset, &length, &total);
 	} else if (droidvm_export_box.kind == 5) {
 		status = droidvm_export_write(path, droidvm_export_box.offset, droidvm_export_box.length, droidvm_export_box.total);
 		length = status ? 0 : droidvm_export_box.length;

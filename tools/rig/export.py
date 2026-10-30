@@ -9,6 +9,7 @@
   export.py kill PID [SIGNAL]                      (default 9; launchd restarts what it keeps alive)
   export.py mem PID ADDRESS [LENGTH]               (hex dump of a process's user memory)
   export.py put LOCAL /private/var/ngpu/... [MODE]  (write a file, root-owned, default mode 0644; only under /private/var/ngpu/)
+  export.py stackshot PID|-1 OUTPUT                (the guest kernel's stackshot, kcdata; decode with stackshot.py)
 
 The request is written into droidvm_export_box through crosvm's /proc/<pid>/mem; the droidvm-monitor worker answers
 within ~100 ms. Paths are in the guest's namespace (Data is mounted at /private/var)."""
@@ -95,7 +96,7 @@ def request(kind, path, offset=0, length=0, total=0, payload=b''):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=['ls', 'tree', 'cat', 'get', 'ps', 'kill', 'mem', 'put'])
+    parser.add_argument('command', choices=['ls', 'tree', 'cat', 'get', 'ps', 'kill', 'mem', 'put', 'stackshot'])
     parser.add_argument('path', nargs='?', default='')
     parser.add_argument('output', nargs='?')
     parser.add_argument('length', nargs='?')
@@ -130,6 +131,18 @@ def main():
                 break
             sys.stdout.write(body.decode(errors='replace'))
             first += listed
+    elif args.command == 'stackshot':   # stackshot PID|-1 OUTPUT: the guest kernel's kcdata stackshot (kind 7)
+        if not args.output:
+            sys.exit('stackshot needs a PID (-1: every process) and an OUTPUT file')
+        with open(args.output, 'wb') as out:
+            offset = 0
+            while True:
+                body, total = request(7, args.path or '-1', offset)
+                out.write(body)
+                offset += len(body)
+                if not body or offset >= total:
+                    break
+        print(f'{args.output}: {offset} bytes')
     elif args.command == 'cat':
         body, total = request(0, args.path, args.offset)
         sys.stdout.buffer.write(body)
