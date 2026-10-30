@@ -21,6 +21,9 @@ volatile uint32_t droidvm_virtio_present_wait = 1;
 volatile uint64_t droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us;
 // Swaps shown although the GPU work before them had not finished in 2 s (a torn frame rather than a stopped display).
 volatile uint64_t droidvm_virtio_present_late;
+// 1: a frame's scanout and flush are posted and collected while the next frame's GPU work is awaited (the worker's Flight);
+// 0: each frame waits for its flush before the next is taken, as before (an A/B switch, written in guest memory).
+volatile uint32_t droidvm_virtio_present_pipeline = 1;
 // The last resource create() refused: which check (1 arguments, 2 prepare, 3 longer than the memory, 4 a segment, 5 the host),
 // its status, then length, stride, width, height, the segments described so far and the segment that failed (address, length).
 volatile uint64_t droidvm_virtio_display_create_fail[10], droidvm_virtio_display_create_fails;
@@ -165,8 +168,27 @@ uint32_t refreshFromEdid() {
     const uint32_t down = (t[5] | (t[7] >> 4) << 8) + (t[6] | (t[7] & 15) << 8);
     return clock && across && down ? uint32_t((clock + uint64_t(across) * down / 2) / (uint64_t(across) * down)) : 0;
 }
-IOReturn present(Resource &r) {
+// A frame's scanout and flush posted, not waited for (blob resources): their tickets, collected by land() in the worker.
+struct Posted { uint32_t tickets[2]; uint32_t count; };
+IOReturn present(Resource &r, Posted *posted = nullptr) {
     IOReturn status;
+    if (posted && droidvm_virtio_display_blob) {
+        // The host takes the control queue's commands in order, so the flush follows its scanout without waiting for it.
+        posted->count = 0;
+        if (activeResource != r.id) {
+            struct { Header h; Rect rect; uint32_t scanout, id, width, height, format, padding, strides[4], offsets[4]; }
+                scanout = {{0x10d, 0, 0, 0, 0, {}}, {0, 0, r.width, r.height}, 0, r.id, r.width, r.height, 2, 0, {uint32_t(r.stride)}, {}};
+            status = DroidVMVirtioGpu::post(&scanout, sizeof scanout, nullptr, 0, sizeof(Header), true, &posted->tickets[posted->count]);
+            if (status) return status;
+            posted->count++;
+            activeResource = r.id;
+        }
+        struct { Header h; Rect rect; uint32_t id, padding; } flush = {{0x104, 0, 0, 0, 0, {}}, {0, 0, r.width, r.height}, r.id, 0};
+        status = DroidVMVirtioGpu::post(&flush, sizeof flush, nullptr, 0, sizeof(Header), true, &posted->tickets[posted->count]);
+        if (!status) posted->count++;
+        return status;
+    }
+    if (posted) posted->count = 0;
     if (!droidvm_virtio_display_blob) {
         struct { Header h; Rect rect; uint64_t offset; uint32_t id, padding; }
             transfer = {{0x105, 0, 0, 0, 0, {}}, {0, 0, r.width, r.height}, 0, r.id, 0};
@@ -213,12 +235,49 @@ void worker(void *, wait_result_t) {
     if (status) { droidvm_virtio_display_last_status = status; droidvm_virtio_display_state = 3; return; }
     droidvm_virtio_display_state = 2;
     unsigned idle = 100;
+    // The frame whose scanout and flush are posted: the host shows it while this thread waits for the next frame's GPU work, so
+    // a frame costs the longer of the two rather than their sum (5.3 ms of GPU work and 6.1 ms of flush a 2048x2732 frame, one
+    // after the other, held page swipes to 72 fps). It completes (land()) before the next frame is posted, or when no frame
+    // follows it, so one flush at most is in flight and frames complete in order.
+    struct Flight { Frame frame; Posted posted; uint64_t sample, waited, flushBegin; uint32_t mode; bool drawn; };
+    Flight flight = {};
+    bool inFlight = false;
+    auto land = [&]() -> bool {
+        IOReturn result = kIOReturnSuccess;
+        for (uint32_t i = 0; i < flight.posted.count; ++i) {
+            Header reply = {};
+            const IOReturn one = DroidVMVirtioGpu::wait(flight.posted.tickets[i], 5000000, &reply, sizeof reply);
+            if (one && !result) result = one;
+        }
+        inFlight = false;
+        const Frame &f = flight.frame;
+        droidvm_virtio_present_samples[flight.sample % 64] = {flight.sample + 1, uint32_t(f.work), uint32_t(flight.drawn ? f.work : 0),
+            flight.mode, uint32_t(result), flight.waited, nowUs() - flight.flushBegin};
+        droidvm_virtio_display_last_status = result;
+        if (!ready()) {
+            droidvm_virtio_display_state = 3;
+            IOLog("virtio-gpu: scanout stopped with outstanding DMA, status %x\n", result);
+            return false;
+        }
+        if (!result) {
+            droidvm_virtio_display_frames = droidvm_virtio_display_frames + 1;
+            native_legacy_frame_observed(2, 0, 0, 0, f.width, f.height);
+        }
+        native_legacy_gpu_complete(f.display, result);
+        f.memory->release(); f.display->release();
+        return true;
+    };
     for (;;) {
         IOLockLock(frameLock);
         Frame frame = pending; pending = {};
         bool showBoot = (!compositor && idle >= 100) || bootDirty;
         bootDirty = false;
         IOLockUnlock(frameLock);
+        if (!frame.memory && inFlight) {
+            // No frame behind the one in flight: complete it now rather than when the next comes.
+            if (!land()) return;
+            continue;
+        }
         if (frame.memory) {
             const uint32_t mode = droidvm_virtio_present_wait;
             const uint64_t begin = nowUs();
@@ -237,28 +296,37 @@ void worker(void *, wait_result_t) {
             if (busy) droidvm_virtio_present_busy = droidvm_virtio_present_busy + 1;
             droidvm_virtio_present_wait_us = droidvm_virtio_present_wait_us + waited;
             Resource *r = surface(frame);
+            // The frame before completes first: its flush ran on the host while this frame's GPU work was awaited.
+            if (inFlight && !land()) return;
             const uint64_t flushBegin = nowUs();
-            status = r ? present(*r) : kIOReturnIOError;
-            // The sample's fence is the swap's work number, and retired the same once that work was drawn.
-            droidvm_virtio_present_samples[sample % 64] = {sample + 1, uint32_t(frame.work), uint32_t(drawn ? frame.work : 0), mode,
-                uint32_t(status), waited, nowUs() - flushBegin};
-            droidvm_virtio_display_last_status = status;
-            if (!ready()) {
-                // An unacknowledged display DMA is not a completed frame. Keep this swap and its
-                // references; recovery must quiesce the GPU before it can retire them. CPU
-                // fallback would also race the writer.
-                droidvm_virtio_display_state = 3;
-                IOLog("virtio-gpu: scanout stopped with outstanding DMA, status %x\n", status);
-                return;
+            Posted posted = {};
+            status = r ? present(*r, droidvm_virtio_present_pipeline ? &posted : nullptr) : kIOReturnIOError;
+            if (!status && posted.count) {
+                flight = {frame, posted, sample, waited, flushBegin, mode, drawn};
+                inFlight = true;
+            } else {
+                // Refused before the host had it, or presented synchronously: complete it here as before.
+                // The sample's fence is the swap's work number, and retired the same once that work was drawn.
+                droidvm_virtio_present_samples[sample % 64] = {sample + 1, uint32_t(frame.work), uint32_t(drawn ? frame.work : 0), mode,
+                    uint32_t(status), waited, nowUs() - flushBegin};
+                droidvm_virtio_display_last_status = status;
+                if (!ready()) {
+                    // An unacknowledged display DMA is not a completed frame. Keep this swap and its
+                    // references; recovery must quiesce the GPU before it can retire them. CPU
+                    // fallback would also race the writer.
+                    droidvm_virtio_display_state = 3;
+                    IOLog("virtio-gpu: scanout stopped with outstanding DMA, status %x\n", status);
+                    return;
+                }
+                if (!status) {
+                    droidvm_virtio_display_frames = droidvm_virtio_display_frames + 1;
+                    native_legacy_frame_observed(2, 0, 0, 0, frame.width, frame.height);
+                }
+                // The display workloop serializes this callback with offer(), so gpuRequest has
+                // been recorded before completion even if the host answered immediately.
+                native_legacy_gpu_complete(frame.display, status);
+                frame.memory->release(); frame.display->release();
             }
-            if (!status) {
-                droidvm_virtio_display_frames = droidvm_virtio_display_frames + 1;
-                native_legacy_frame_observed(2, 0, 0, 0, frame.width, frame.height);
-            }
-            // The display workloop serializes this callback with offer(), so gpuRequest has
-            // been recorded before completion even if the host answered immediately.
-            native_legacy_gpu_complete(frame.display, status);
-            frame.memory->release(); frame.display->release();
         } else if (showBoot && ready()) {
             status = present(boot); idle = 0;
             droidvm_virtio_display_last_status = status;
