@@ -182,6 +182,11 @@ volatile uint32_t droidvm_virtgpu_fence_poll_us = 100;
 volatile uint64_t droidvm_virtgpu_scattered_blobs, droidvm_virtgpu_scattered_bytes;
 // Display holds (see hold()): taken, ended, ended because their connection closed, refused (too many open).
 volatile uint64_t droidvm_virtgpu_holds_stats[4];
+// Guest memory the clients' blobs hold now: bytes of pages this driver allocated, bytes of the callers' own pages it wired
+// (CREATE_BLOB_USER), and how many blobs of each; and the same per client slot, with the process that made the connection.
+volatile uint64_t droidvm_virtgpu_live[4];
+struct DroidVMClientMemory { char name[16]; uint64_t pageBytes, userBytes; };
+DroidVMClientMemory droidvm_virtgpu_client_memory[64];
 }
 namespace DroidVMVirtioGpu {
 namespace {
@@ -216,6 +221,7 @@ struct Client {
     uint64_t sequence;                 // fenced submissions made
     uint64_t holds[HoldsPerClient];    // its display holds not yet ended (gClientsLock)
     uint32_t holdCount;
+    uint32_t slot;                     // its index in gClients (droidvm_virtgpu_client_memory)
     Pending pending[MaxPending];
     uint64_t nextFence[MaxRings], completed[MaxRings];
 };
@@ -252,7 +258,12 @@ Client *client(void *connection, bool create) {
                 if (found->lock) IOLockFree(found->lock);
                 if (found->fenceLock) IOLockFree(found->fenceLock);
                 IODelete(found, Client, 1); found = nullptr;
-            } else { gClients[empty] = found; count(0); }
+            } else {
+                gClients[empty] = found; count(0);
+                found->slot = uint32_t(empty);
+                DroidVMClientMemory &memory = droidvm_virtgpu_client_memory[empty];
+                memcpy(memory.name, found->name, sizeof memory.name); memory.pageBytes = memory.userBytes = 0;
+            }
         }
     }
     IOLockUnlock(gClientsLock);
@@ -309,6 +320,17 @@ IOReturn submitCommand(Client *c, const void *command, uint32_t size) {
     IOReturn status = post(&submit, sizeof submit, command, size, sizeof reply, false, &ticket);
     return status ? status : wait(ticket, 5000000, &reply, sizeof reply);
 }
+// A blob's guest memory, counted while it lives (droidvm_virtgpu_live, droidvm_virtgpu_client_memory).
+void countPages(Client *c, const Resource &r, int64_t sign) {
+    if (!r.pages || r.hostVisible) return;
+    const uint64_t bytes = (r.size + 4095) & ~uint64_t(4095);
+    __atomic_add_fetch(&droidvm_virtgpu_live[r.wired ? 1 : 0], uint64_t(sign * int64_t(bytes)), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&droidvm_virtgpu_live[r.wired ? 3 : 2], uint64_t(sign), __ATOMIC_RELAXED);
+    if (c && c->slot < 64) {
+        uint64_t &slot = r.wired ? droidvm_virtgpu_client_memory[c->slot].userBytes : droidvm_virtgpu_client_memory[c->slot].pageBytes;
+        __atomic_add_fetch(&slot, uint64_t(sign * int64_t(bytes)), __ATOMIC_RELAXED);
+    }
+}
 void dropPages(Resource &r) {
     if (r.pages && r.wired) r.pages->complete();
     if (r.pages) r.pages->release();
@@ -324,6 +346,7 @@ void releaseResource(Client *c, Resource &r) {
     }
     (void)unref(r.id);
     // The host has dropped its import of the pages with the resource; only then do they go back.
+    countPages(c, r, -1);
     dropPages(r);
 }
 void queryCapsets() {
@@ -511,6 +534,7 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
     if (entries) IODeleteData(entries, Entry, entryCapacity);
     if (status) { dropPages(r); return status; }
     c->resources[c->resourceCount++] = r;
+    countPages(c, r, 1);
     out.handle = r.handle; out.resource_id = r.id; count(2);
     return kIOReturnSuccess;
 }

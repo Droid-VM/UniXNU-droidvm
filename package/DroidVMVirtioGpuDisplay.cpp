@@ -29,6 +29,8 @@ volatile uint64_t droidvm_virtio_display_hold_late, droidvm_virtio_display_hold_
 // their total (us): the frame rate while something animates, without the idle time between gestures. And swaps refused because
 // one was still waiting for the worker.
 volatile uint64_t droidvm_virtio_offer_gap_hist[41], droidvm_virtio_offer_gaps[2], droidvm_virtio_offer_refused;
+// The surfaces the display keeps prepared (wired) for the host: how many, and their bytes.
+volatile uint64_t droidvm_virtio_display_wired[2];
 uint64_t lastOfferUs;
 // 1: a frame's scanout and flush are posted and collected while the next frame's GPU work is awaited (the worker's Flight);
 // 0: each frame waits for its flush before the next is taken, as before (an A/B switch, written in guest memory).
@@ -84,7 +86,11 @@ template <typename T> IOReturn send(T &cmd) {
 }
 bool release(Resource &r) {
     if (r.id && unref(r.id)) return false;
-    if (r.prepared) r.memory->complete(kIODirectionOut);
+    if (r.prepared) {
+        r.memory->complete(kIODirectionOut);
+        droidvm_virtio_display_wired[0] = droidvm_virtio_display_wired[0] - 1;
+        droidvm_virtio_display_wired[1] = droidvm_virtio_display_wired[1] - r.memory->getLength();
+    }
     OSSafeReleaseNULL(r.memory); r = {}; return true;
 }
 // surface: the memory is a compositor surface, whose last page is all its own (the boot framebuffer's is not known to be).
@@ -103,6 +109,8 @@ IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32
     IOReturn status = memory->prepare(kIODirectionOut);
     if (status) { OSSafeReleaseNULL(r.memory); return refused(2, status, memory, stride, width, height); }
     r.prepared = true;
+    droidvm_virtio_display_wired[0] = droidvm_virtio_display_wired[0] + 1;
+    droidvm_virtio_display_wired[1] = droidvm_virtio_display_wired[1] + memory->getLength();
     uint64_t bytes = stride * height, described = bytes;
     if (droidvm_virtio_display_blob) {
         bytes = described = (bytes + 4095) & ~4095ULL;
