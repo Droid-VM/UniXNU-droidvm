@@ -29,6 +29,13 @@
 //                                       (default 3) busiest processes: what the guest's vCPUs run during an animation
 //   gfxprobe display                    what CoreAnimation makes of the main display: CADisplay's refresh rates, minimum frame
 //                                       duration, modes and VRR, as QuartzCore answers them (KVC, each key that answers)
+//   gfxprobe mg [KEY...]                MobileGestalt's answers (MGCopyAnswer) to KEY, by default the main screen's: its scale,
+//                                       size, class, the per-display extended properties QuartzCore takes the display's scale from
+//                                       (DisplayExtendedProperties[i] DisplayScale before main-screen-scale) and the artwork traits
+//   gfxprobe sbscreen                   what SpringBoard picks its home screen layout from: the screen type SpringBoardHome
+//                                       looks up (SBHScreenTypeForCurrentDevice) and its inputs (the effective device class, home
+//                                       button type, artwork subtype, corner radius, and the main screen's reference bounds and scale,
+//                                       which outside SpringBoard come from UIKit's main screen as printed)
 //   gfxprobe sync PATH...               F_FULLFSYNC each file, then sync(): a file staged into the Data overlay (export.py put)
 //                                       reaches the store before the VM stops (vm.sh stop is no clean shutdown)
 //   gfxprobe msl SOURCE OUT [OPTIONS]   compile Metal source with the system's own front end (MTLCompiler, request 13, as Metal's
@@ -1776,6 +1783,55 @@ static int motionProbe(unsigned seconds) {
 }
 
 // `gfxprobe ioreg CLASS`: every service of CLASS, its properties and its children's classes (the guest has no ioreg).
+static int mobileGestalt(int count, char **keys) {
+    static const char *const screen[] = {"main-screen-scale", "main-screen-width", "main-screen-height", "main-screen-class",
+        "main-screen-pitch", "DisplayExtendedProperties", "ArtworkTraits", "ArtworkDeviceSubType", "ArtworkDeviceScaleFactor",
+        "DeviceClassNumber", "ProductType", "HWModelStr", "IsVirtualDevice"};
+    void *library = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
+    CFTypeRef (*copyAnswer)(CFStringRef, CFDictionaryRef) = library ? dlsym(library, "MGCopyAnswer") : NULL;
+    if (!copyAnswer) { printf("no MGCopyAnswer\n"); return 1; }
+    if (!count) { count = sizeof screen / sizeof *screen; keys = (char **)screen; }
+    for (int i = 0; i < count; ++i) {
+        CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+        CFTypeRef answer = copyAnswer(key, NULL);
+        printf("%s = %s\n", keys[i], answer ? [(id)answer description].UTF8String : "(none)");
+        if (answer) CFRelease(answer);
+        CFRelease(key);
+    }
+    return 0;
+}
+
+static int springBoardScreen(void) {
+    static const char *const frameworks[] = {"Frameworks/UIKit.framework/UIKit", "PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+        "PrivateFrameworks/SpringBoardFoundation.framework/SpringBoardFoundation",
+        "PrivateFrameworks/SpringBoardHome.framework/SpringBoardHome"};
+    for (unsigned i = 0; i < sizeof frameworks / sizeof *frameworks; ++i) {
+        char path[160];
+        snprintf(path, sizeof path, "/System/Library/%s", frameworks[i]);
+        if (!dlopen(path, RTLD_NOW)) printf("dlopen %s: %s\n", path, dlerror());
+    }
+    long (*deviceClass)(void) = dlsym(RTLD_DEFAULT, "SBFEffectiveDeviceClass");
+    long (*homeButton)(void) = dlsym(RTLD_DEFAULT, "SBFEffectiveHomeButtonType");
+    long (*subtype)(void) = dlsym(RTLD_DEFAULT, "SBFEffectiveArtworkSubtype");
+    double (*cornerRadius)(void) = dlsym(RTLD_DEFAULT, "SBFEffectiveDisplayCornerRadius");
+    long (*screenType)(void) = dlsym(RTLD_DEFAULT, "SBHScreenTypeForCurrentDevice");
+    if (deviceClass) printf("SBFEffectiveDeviceClass = %ld\n", deviceClass());
+    if (homeButton) printf("SBFEffectiveHomeButtonType = %ld\n", homeButton());
+    if (subtype) printf("SBFEffectiveArtworkSubtype = %ld\n", subtype());
+    if (cornerRadius) printf("SBFEffectiveDisplayCornerRadius = %g\n", cornerRadius());
+    id screen = [NSClassFromString(@"UIScreen") valueForKey:@"mainScreen"];
+    for (NSString *key in @[@"bounds", @"scale", @"nativeBounds", @"nativeScale", @"_referenceBounds", @"displayConfiguration"]) {
+        @try {
+            printf("UIScreen %s = %s\n", key.UTF8String, [[screen valueForKey:key] description].UTF8String);
+        } @catch (NSException *e) {
+            printf("UIScreen %s: %s\n", key.UTF8String, e.reason.UTF8String);
+        }
+    }
+    fflush(stdout);
+    if (screenType) printf("SBHScreenTypeForCurrentDevice = %ld\n", screenType());
+    return 0;
+}
+
 static int ioregDump(const char *className) {
     io_object_t iterator = 0;
     if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(className), &iterator) != KERN_SUCCESS) return 1;
@@ -2120,6 +2176,10 @@ int main(int argc, char **argv) {
             return setOrientation(strtol(argv[2], NULL, 0));
         if (argc >= 2 && !strcmp(argv[1], "orient-follow"))
             return followOrientation();
+        if (argc >= 2 && !strcmp(argv[1], "sbscreen"))
+            return springBoardScreen();
+        if (argc >= 2 && !strcmp(argv[1], "mg"))
+            return mobileGestalt(argc - 2, argv + 2);
         if (argc >= 3 && !strcmp(argv[1], "ioreg"))
             return ioregDump(argv[2]);
         if (argc >= 2 && !strcmp(argv[1], "motion"))
