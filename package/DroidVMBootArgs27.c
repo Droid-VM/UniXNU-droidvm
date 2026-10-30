@@ -26,6 +26,11 @@ char PE_builtin_boot_args[] =
     // Apple's research VM and publishes no audio device but the Null one. Not for everyone: SpringBoard's backlight state machine
     // then waits on panel hardware and its watchdog kills SpringBoard.
     "owner-hide-vmm=audiomxd "
+    // memory pressure (the warning that has Turnip's freed-BO cache, the Metal plugin's held imports and Apple's frameworks give
+    // their caches back) below 1280 MiB of available memory rather than XNU's 848 at 6 GiB: the GPU's memory is wired guest
+    // memory, and the guest ran out of free pages and paged its files in through the seed disk's polled reads with 1.1-1.3 GiB
+    // still counted available, never reaching the warning
+    "memorystatus_pressure_threshold_mb=1280 "
     // the processes besides the render server that get the accelerator's user client and a native Metal device, as on iPadOS 17
     // (DroidVMBootArgs.c), and iPadOS 27's wallpaper renderer (SBRendererService, PaperBoardUI): the launch policy writes the
     // plugin's NativeAdrenoMetal.clients from it at every boot
