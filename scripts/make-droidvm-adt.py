@@ -91,6 +91,9 @@ def read_adt(blob, offset=0):
 # The /product properties of the identity tree a virtual machine does not have: the exclaves of Apple's SoCs, and the panel's
 # gamut, which --display-gamut sets.
 IDENTITY_PRODUCT_DROPPED = {'name', 'AAPL,phandle', 'exclaves-enabled', 'has-exclaves', 'artwork-display-gamut'}
+# The /product/audio properties of the identity tree kept: acoustic-id names the audio server's tunings folder
+# (/Library/Audio/Tunings/AID<n>, MobileGestalt's AcousticID). The rest describe the original's microphones and DSP.
+IDENTITY_AUDIO_KEPT = ('acoustic-id',)
 
 
 def device_tree_bytes(path):
@@ -134,12 +137,16 @@ def identity_of(path):
     target and board names, and the /product properties MobileGestalt and the frameworks read (product-id, artwork, feature
     classes)."""
     (root, children), _ = read_adt(device_tree_bytes(path))
-    product = next((props for props, _ in children if props.get('name', b'').rstrip(b'\0') == b'product'), None)
+    named = lambda nodes, name: next(((props, kids) for props, kids in nodes  # noqa: E731
+                                      if props.get('name', b'').rstrip(b'\0') == name), (None, []))
+    product, product_children = named(children, b'product')
     if product is None or 'model' not in root or 'target-type' not in root:
         raise SystemExit(f'{path}: not a device tree with a model, a target-type and /product')
+    audio = named(product_children, b'audio')[0] or {}
     return {'model': root['model'], 'target-type': root['target-type'],
             'board': root.get('compatible', b'').split(b'\0')[0] + b'\0',
-            'product': [(key, value) for key, value in product.items() if key not in IDENTITY_PRODUCT_DROPPED]}
+            'product': [(key, value) for key, value in product.items() if key not in IDENTITY_PRODUCT_DROPPED],
+            'audio': [(key, audio[key]) for key in IDENTITY_AUDIO_KEPT if key in audio]}
 
 
 def empty_nvram_proxy():
@@ -515,7 +522,8 @@ def main():
                             ('product-id', bytes.fromhex('e9fefef6e6f9d12a5ba1a2551866cbbd749f0ec3'))]
                            if args.ipad_identity and not identity else [])],
              # the audio server reads /product/audio (the original also sets supports-always-listening)
-             [node('audio', [('wireless-splitter', struct.pack('<I', 1))])] if args.ipad_identity else []),
+             [node('audio', [('wireless-splitter', struct.pack('<I', 1)), *(identity['audio'] if identity else [])])]
+             if args.ipad_identity else []),
         node('arm-io', [('device_type', b'arm-io\0'),
                         ('#address-cells', struct.pack('<I', 2)),
                         ('#size-cells', struct.pack('<I', 2)),

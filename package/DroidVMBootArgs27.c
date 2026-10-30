@@ -21,6 +21,11 @@ char PE_builtin_boot_args[] =
     // service manager (ownervisor: ssh on port 2222 and the debug shell), both started by the launch policy (DroidVMLaunchPolicy.c)
     "owner-app-cryptex=1 "
     "owner-service-manager=1 "
+    // the hypervisor hidden from the audio server (fork patches/xnu-12377/zzyd-owner-hide-vmm.patch: kern.hv_vmm_present 0 for the
+    // processes named): MobileGestalt answers IsVirtualDevice from it, and in a virtual device iPadOS 27's VirtualAudio expects
+    // Apple's research VM and publishes no audio device but the Null one. Not for everyone: SpringBoard's backlight state machine
+    // then waits on panel hardware and its watchdog kills SpringBoard.
+    "owner-hide-vmm=audiomxd "
     // the processes besides the render server that get the accelerator's user client and a native Metal device, as on iPadOS 17
     // (DroidVMBootArgs.c): the launch policy writes the plugin's NativeAdrenoMetal.clients from it at every boot
     "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,com.apple.WebKit.*,Preferences,MetalCheck,app_ios,"
