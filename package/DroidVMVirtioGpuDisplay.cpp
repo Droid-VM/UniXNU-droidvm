@@ -12,6 +12,8 @@ extern "C" void native_legacy_gpu_complete(void *, int);
 extern "C" void native_legacy_frame_observed(unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" uint64_t droidvm_virtgpu_submitted(void);
 extern "C" bool droidvm_virtgpu_finished(uint64_t);
+extern "C" uint64_t droidvm_virtgpu_holds(void);
+extern "C" bool droidvm_virtgpu_held(uint64_t, uint64_t *);
 extern "C" {
 volatile uint32_t droidvm_virtio_display_state, droidvm_virtio_display_blob, droidvm_virtio_display_last_status;
 volatile uint64_t droidvm_virtio_display_frames, droidvm_virtio_display_boot_frames, droidvm_virtio_display_resources;
@@ -21,6 +23,13 @@ volatile uint32_t droidvm_virtio_present_wait = 1;
 volatile uint64_t droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us;
 // Swaps shown although the GPU work before them had not finished in 2 s (a torn frame rather than a stopped display).
 volatile uint64_t droidvm_virtio_present_late;
+// Swaps whose display holds (commits not yet submitted) had not all ended in 200 ms, and the time swaps waited for them (us).
+volatile uint64_t droidvm_virtio_display_hold_late, droidvm_virtio_display_hold_wait_us;
+// Swaps offered by the time since the one before (1 ms buckets, the last for 40 ms and longer); of those under 50 ms, how many and
+// their total (us): the frame rate while something animates, without the idle time between gestures. And swaps refused because
+// one was still waiting for the worker.
+volatile uint64_t droidvm_virtio_offer_gap_hist[41], droidvm_virtio_offer_gaps[2], droidvm_virtio_offer_refused;
+uint64_t lastOfferUs;
 // 1: a frame's scanout and flush are posted and collected while the next frame's GPU work is awaited (the worker's Flight);
 // 0: each frame waits for its flush before the next is taken, as before (an A/B switch, written in guest memory).
 volatile uint32_t droidvm_virtio_present_pipeline = 1;
@@ -44,8 +53,9 @@ struct Resource {
     bool prepared, usable;
 };
 // work: the virtio GPU's fenced submissions made before the swap (droidvm_virtgpu_submitted). The frame is drawn once they have
-// finished.
-struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height; uint64_t work; };
+// finished. holds: the display holds taken before the swap (droidvm_virtgpu_holds): commits whose work was not submitted yet, which
+// the frame waits for, its work then the larger of the two.
+struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height; uint64_t work, holds; };
 // The compositor's surfaces: more than it keeps in flight, since during an animation it presents from a larger set than at rest
 // (8 entries were recreated on almost every frame of a page drag).
 Resource resources[32], boot;
@@ -239,16 +249,25 @@ void worker(void *, wait_result_t) {
     // a frame costs the longer of the two rather than their sum (5.3 ms of GPU work and 6.1 ms of flush a 2048x2732 frame, one
     // after the other, held page swipes to 72 fps). It completes (land()) before the next frame is posted, or when no frame
     // follows it, so one flush at most is in flight and frames complete in order.
-    struct Flight { Frame frame; Posted posted; uint64_t sample, waited, flushBegin; uint32_t mode; bool drawn; };
+    struct Flight { Frame frame; Posted posted; uint64_t sample, waited, flushBegin; uint32_t mode, collected; IOReturn result; bool drawn; };
     Flight flight = {};
     bool inFlight = false;
-    auto land = [&]() -> bool {
-        IOReturn result = kIOReturnSuccess;
+    // The frame in flight's replies, waited for (block) or as far as the device has returned them: true once all are in.
+    auto collect = [&](bool block) -> bool {
         for (uint32_t i = 0; i < flight.posted.count; ++i) {
+            if (flight.collected & (1u << i)) continue;
             Header reply = {};
-            const IOReturn one = DroidVMVirtioGpu::wait(flight.posted.tickets[i], 5000000, &reply, sizeof reply);
-            if (one && !result) result = one;
+            IOReturn one = kIOReturnSuccess;
+            if (block) one = DroidVMVirtioGpu::wait(flight.posted.tickets[i], 5000000, &reply, sizeof reply);
+            else if (!DroidVMVirtioGpu::poll(flight.posted.tickets[i], &one, &reply, sizeof reply)) return false;
+            flight.collected |= 1u << i;
+            if (one && !flight.result) flight.result = one;
         }
+        return true;
+    };
+    auto land = [&]() -> bool {
+        collect(true);
+        const IOReturn result = flight.result;
         inFlight = false;
         const Frame &f = flight.frame;
         droidvm_virtio_present_samples[flight.sample % 64] = {flight.sample + 1, uint32_t(f.work), uint32_t(flight.drawn ? f.work : 0),
@@ -267,6 +286,11 @@ void worker(void *, wait_result_t) {
         f.memory->release(); f.display->release();
         return true;
     };
+    // While the next frame waits for its holds or its GPU work: the frame in flight completes as soon as its flush is back, not
+    // after that wait -- its swap's completion may be what the next frame's work waits for (a commit that returned before its
+    // submission: the render server's next frame can wait for the last swap to retire, and the two would wait for each other).
+    // False: the display stopped.
+    auto landEarly = [&]() -> bool { return !inFlight || !collect(false) || land(); };
     for (;;) {
         IOLockLock(frameLock);
         Frame frame = pending; pending = {};
@@ -281,11 +305,23 @@ void worker(void *, wait_result_t) {
         if (frame.memory) {
             const uint32_t mode = droidvm_virtio_present_wait;
             const uint64_t begin = nowUs();
+            uint64_t order = 0;
+            bool held = droidvm_virtgpu_held(frame.holds, &order);
+            while (!held && nowUs() - begin < 200000) {
+                if (!landEarly()) return;
+                if (nowUs() - begin < 50) IODelay(5);
+                else delay_for_interval(100, NSEC_PER_USEC);
+                held = droidvm_virtgpu_held(frame.holds, &order);
+            }
+            if (!held) droidvm_virtio_display_hold_late = droidvm_virtio_display_hold_late + 1;
+            else if (order > frame.work) frame.work = order;
+            droidvm_virtio_display_hold_wait_us = droidvm_virtio_display_hold_wait_us + (nowUs() - begin);
             bool drawn = droidvm_virtgpu_finished(frame.work);
             const bool busy = !drawn;
             while (mode && !drawn && nowUs() - begin < 2000000) {
                 // GPU work: sleep, so the vCPU goes idle, but in steps of 100 us: IOSleep's 1 ms added half a millisecond
                 // a frame on average to a display that paces the compositor (offered -> done 14-16 ms of a 17-19 ms frame).
+                if (!landEarly()) return;
                 delay_for_interval(100, NSEC_PER_USEC);
                 drawn = droidvm_virtgpu_finished(frame.work);
             }
@@ -302,7 +338,7 @@ void worker(void *, wait_result_t) {
             Posted posted = {};
             status = r ? present(*r, droidvm_virtio_present_pipeline ? &posted : nullptr) : kIOReturnIOError;
             if (!status && posted.count) {
-                flight = {frame, posted, sample, waited, flushBegin, mode, drawn};
+                flight = {frame, posted, sample, waited, flushBegin, mode, 0, kIOReturnSuccess, drawn};
                 inFlight = true;
             } else {
                 // Refused before the host had it, or presented synchronously: complete it here as before.
@@ -349,8 +385,14 @@ extern "C" void droidvm_virtio_gpu_display_start(void) {
     if (started) return; started = true;
     if (!DroidVMVirtioGpu::start()) return;
     DroidVMVirtioGpu::selftest3D();
-    droidvm_virtio_display_refresh_hz = refreshFromEdid();
-    IOLog("virtio-gpu: scanout refresh %u Hz (EDID)\n", droidvm_virtio_display_refresh_hz);
+    // The refresh rate: droidvm-display-hz (30 to 240) when given, as the macOS board's DroidVMDisplay takes it, else the EDID's.
+    // An EDID detailed timing carries a pixel clock of at most 655.35 MHz, so crosvm advertises 2048x2732 at 110 Hz although the
+    // VM's display runs at 120, and the compositor paced its frames at 110.
+    unsigned hz = 0;
+    PE_parse_boot_argn("droidvm-display-hz", &hz, sizeof hz);
+    const uint32_t edidHz = refreshFromEdid();
+    droidvm_virtio_display_refresh_hz = hz >= 30 && hz <= 240 ? hz : edidHz;
+    IOLog("virtio-gpu: scanout refresh %u Hz (EDID %u Hz)\n", droidvm_virtio_display_refresh_hz, edidHz);
     unsigned blob = 1; PE_parse_boot_argn("droidvm-virtio-gpu-blob", &blob, sizeof blob);
     droidvm_virtio_display_blob = blob && ((DroidVMVirtioGpu::features() & 0x48) == 0x48);
     frameLock = IOLockAlloc(); if (!frameLock) { droidvm_virtio_display_state = 3; return; }
@@ -371,10 +413,18 @@ extern "C" void droidvm_virtio_gpu_display_start(void) {
 extern "C" bool droidvm_virtio_gpu_offer(void *display, IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height) {
     if (droidvm_virtio_display_state != 2 || !DroidVMVirtioGpu::ready()) return false;
     IOLockLock(frameLock);
+    const uint64_t now = nowUs();
+    if (lastOfferUs) {
+        const uint64_t gap = now - lastOfferUs;
+        droidvm_virtio_offer_gap_hist[gap / 1000 < 40 ? gap / 1000 : 40] = droidvm_virtio_offer_gap_hist[gap / 1000 < 40 ? gap / 1000 : 40] + 1;
+        if (gap < 50000) { droidvm_virtio_offer_gaps[0] = droidvm_virtio_offer_gaps[0] + 1; droidvm_virtio_offer_gaps[1] = droidvm_virtio_offer_gaps[1] + gap; }
+    }
+    lastOfferUs = now;
     bool accepted = !pending.memory;
+    if (!accepted) droidvm_virtio_offer_refused = droidvm_virtio_offer_refused + 1;
     if (accepted) {
         auto service = static_cast<IOService *>(display);
-        memory->retain(); service->retain(); pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted()};
+        memory->retain(); service->retain(); pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted(), droidvm_virtgpu_holds()};
         compositor = true;
         IOLockWakeup(frameLock, &pending, true);
     }

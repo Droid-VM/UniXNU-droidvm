@@ -180,11 +180,16 @@ volatile uint64_t droidvm_virtgpu_rs_fences[3], droidvm_virtgpu_rs_fence_hist[10
 volatile uint32_t droidvm_virtgpu_fence_poll_us = 100;
 // Guest blobs whose pages, or the rest of them, came as ordinary pages because no 64 KiB contiguous piece was free, and their bytes.
 volatile uint64_t droidvm_virtgpu_scattered_blobs, droidvm_virtgpu_scattered_bytes;
+// Display holds (see hold()): taken, ended, ended because their connection closed, refused (too many open).
+volatile uint64_t droidvm_virtgpu_holds_stats[4];
 }
 namespace DroidVMVirtioGpu {
 namespace {
 enum : uint32_t { MaxClients = 64, MaxRings = 64, MaxPending = 256, FirstContext = 16, ContiguousLimit = 4u << 20,
-                  MaxBlobEntries = (HugeRequest - sizeof(CreateBlob)) / sizeof(Entry) };
+                  MaxBlobEntries = (HugeRequest - sizeof(CreateBlob)) / sizeof(Entry),
+                  // The display hold: an op of this board's own beyond DroidVMVirtgpuABI.h's (NativeAdreno's tunnel passes any op
+                  // of its range here). In: the ticket to end, or 0 to take a hold; out: the ticket.
+                  OpHold = DROIDVM_VIRTGPU_OPS, HoldRing = 64, HoldsPerClient = 8 };
 struct Resource {
     uint32_t handle, id;
     uint64_t size;
@@ -209,12 +214,17 @@ struct Client {
     Resource *resources;
     Closed *closed;
     uint64_t sequence;                 // fenced submissions made
+    uint64_t holds[HoldsPerClient];    // its display holds not yet ended (gClientsLock)
+    uint32_t holdCount;
     Pending pending[MaxPending];
     uint64_t nextFence[MaxRings], completed[MaxRings];
 };
 Client *gClients[MaxClients];
 IOLock *gClientsLock;
 uint64_t gSubmittedOrder;              // every client's fenced submissions made: the latest Pending::order
+// Display holds taken, and the last of a run that have all ended; each ended run's gSubmittedOrder when it ended, and which
+// tickets have ended (by ticket, HoldRing apart: a later ticket in a slot only answers more work, never less). gClientsLock.
+uint64_t gHoldsTaken, gHoldsEnded, gHoldOrder[HoldRing], gHoldEnded[HoldRing];
 uint32_t gNextContext = FirstContext;
 uint64_t gCapsetMask;
 uint32_t gCapsetBytes[64];   // each capset's size (GET_CAPSET_INFO)
@@ -601,15 +611,77 @@ IOReturn closeResource(Client *c, uint32_t handle) {
 }
 }
 }
+namespace DroidVMVirtioGpu {
+namespace {
+// gClientsLock held: the ticket ended; the run of ended tickets grows, and each ticket it passes answers the work submitted now.
+void endHold(uint64_t ticket) {
+    gHoldEnded[ticket % HoldRing] = ticket;
+    while (gHoldEnded[(gHoldsEnded + 1) % HoldRing] == gHoldsEnded + 1) {
+        const uint64_t next = gHoldsEnded + 1;
+        __atomic_store_n(&gHoldOrder[next % HoldRing], __atomic_load_n(&gSubmittedOrder, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+        __atomic_store_n(&gHoldsEnded, next, __ATOMIC_RELEASE);
+    }
+}
+// A display hold. The render server's Metal plugin returns from CoreAnimation's commitAndWaitUntilSubmitted before the work is
+// submitted: its encoding thread translates the frame's last calls and submits them a few milliseconds later, and CoreAnimation
+// meanwhile swaps the surface and goes on with the next frame. So the commit takes a hold first and ends it once the work is
+// submitted, and a swap waits for every hold taken before it to end, then for the work submitted by then (droidvm_virtgpu_held):
+// the display waits for the submission instead of the compositor. Waiting in the commit held each frame's rendering thread in
+// the encoding thread's last few milliseconds (a page swipe at 2048x2732: a quarter of the thread's time, 90 fps of 120).
+IOReturn hold(Client *c, uint64_t ticket, uint64_t &answer) {
+    IOReturn status = kIOReturnSuccess;
+    IOLockLock(gClientsLock);
+    if (!ticket) {
+        if (c->holdCount == HoldsPerClient || gHoldsTaken - gHoldsEnded >= HoldRing / 2) {
+            status = kIOReturnBusy; droidvm_virtgpu_holds_stats[3] = droidvm_virtgpu_holds_stats[3] + 1;
+        } else {
+            answer = c->holds[c->holdCount++] = __atomic_add_fetch(&gHoldsTaken, 1, __ATOMIC_ACQ_REL);
+            droidvm_virtgpu_holds_stats[0] = droidvm_virtgpu_holds_stats[0] + 1;
+        }
+    } else {
+        uint32_t i = 0;
+        while (i < c->holdCount && c->holds[i] != ticket) ++i;
+        if (i == c->holdCount) status = kIOReturnBadArgument;
+        else {
+            c->holds[i] = c->holds[--c->holdCount];
+            endHold(ticket);
+            answer = ticket;
+            droidvm_virtgpu_holds_stats[1] = droidvm_virtgpu_holds_stats[1] + 1;
+        }
+    }
+    IOLockUnlock(gClientsLock);
+    return status;
+}
+}
+}
+// For the display: the holds taken so far (a swap waits for them), and whether every hold up to `holds` has ended, with the work
+// submitted when they had (the swap's work is at least that).
+extern "C" uint64_t droidvm_virtgpu_holds(void) {
+    return __atomic_load_n(&DroidVMVirtioGpu::gHoldsTaken, __ATOMIC_ACQUIRE);
+}
+extern "C" bool droidvm_virtgpu_held(uint64_t holds, uint64_t *order) {
+    using namespace DroidVMVirtioGpu;
+    if (__atomic_load_n(&gHoldsEnded, __ATOMIC_ACQUIRE) < holds) return false;
+    *order = __atomic_load_n(&gHoldOrder[holds % HoldRing], __ATOMIC_ACQUIRE);
+    return true;
+}
 extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t task, const void *in, size_t inSize, void *out, size_t outSize) {
     using namespace DroidVMVirtioGpu;
     if (!ready()) return kIOReturnNotReady;
-    if (op >= DROIDVM_VIRTGPU_OPS) { count(7); return kIOReturnUnsupported; }
+    if (op > OpHold) { count(7); return kIOReturnUnsupported; }
     Client *c = client(connection, true);
     if (!c) return kIOReturnNoResources;
     auto fixed = [&](size_t inBytes, size_t outBytes, bool variableIn = false) {
         return (variableIn ? inSize >= inBytes : inSize == inBytes) && outSize == outBytes && (!inBytes || in) && (!outBytes || out);
     };
+    if (op == OpHold) {   // takes only gClientsLock: the hold's end comes from a thread other than the client's submitting one
+        if (!fixed(sizeof(uint64_t), sizeof(uint64_t))) return kIOReturnBadArgument;
+        uint64_t ticket, answer = 0;
+        memcpy(&ticket, in, sizeof ticket);
+        const IOReturn status = hold(c, ticket, answer);
+        memcpy(out, &answer, sizeof answer);
+        return status;
+    }
     if (op == DROIDVM_VIRTGPU_WAIT_FENCE) {   // sleeps; takes the client's fence lock only to look
         if (!fixed(sizeof(droidvm_virtgpu_wait_fence), 0)) return kIOReturnBadArgument;
         return waitFence(c, *static_cast<const droidvm_virtgpu_wait_fence *>(in));
@@ -724,6 +796,9 @@ extern "C" void droidvm_virtgpu_close(void *connection) {
     if (!c) return;
     IOLockLock(gClientsLock);
     for (uint32_t i = 0; i < MaxClients; ++i) if (gClients[i] == c) gClients[i] = nullptr;
+    for (uint32_t i = 0; i < c->holdCount; ++i) endHold(c->holds[i]);   // a swap waits for no hold of a process that is gone
+    droidvm_virtgpu_holds_stats[2] = droidvm_virtgpu_holds_stats[2] + c->holdCount;
+    c->holdCount = 0;
     IOLockUnlock(gClientsLock);
     IOLockLock(c->lock);
     drain(c, 5000000);

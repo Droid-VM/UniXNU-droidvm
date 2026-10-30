@@ -105,6 +105,11 @@ kernel_args = [
   # 2048x2732, the 12.9-inch iPad's 1024x1366 points. At one pixel per point (1024x1366) SpringBoard saw 512x683 points and laid the
   # home screen out as an iPad mini's.
   "offline-legacy-unit-scale=2",
+  # The display's refresh rate, 120 Hz as the VM's display runs (the EDID cannot carry 2048x2732 above 110 Hz), and CoreAnimation
+  # rendering a frame ahead (CA_FORCE_TRIPLE_BUFFERED_LATENCY, set by the Metal plugin in the render server): as the macOS board's
+  # DroidVMDisplay and WindowServer take them (Droid-VM/macOS-DroidVM droidvm-display-hz, ca-triple-buffer).
+  "droidvm-display-hz=120",
+  "ca-triple-buffer=1",
   "offline-legacy-pm=1",
   "offline-legacy-validate=1",
   "offline-legacy-transfer=1",
