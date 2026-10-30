@@ -174,6 +174,11 @@ volatile uint32_t droidvm_virtgpu_finished_trylock;
 // (droidvm_virtgpu_contiguous = 1; 0, the default: ordinary wired pages, one entry a page or run).
 volatile uint32_t droidvm_virtgpu_chunk_kib = 256;
 volatile uint32_t droidvm_virtgpu_contiguous = 0;
+// 1: a guest blob's pages in the calling process's address space (taskPages), not the kernel's; 0: guestPages, as before.
+volatile uint32_t droidvm_virtgpu_in_task = 1;
+// Blob pages taken (droidvm_virtgpu_task_pages[0], bytes [1]) in the calling process's address space, and how often that failed and
+// guestPages served the blob instead ([2]).
+volatile uint64_t droidvm_virtgpu_task_pages[3];
 // Ordinary page allocations for blobs that failed: whole blobs, then 1 MiB pieces (guestPages falls back to the next way).
 volatile uint64_t droidvm_virtgpu_page_failures[2];
 // The render server's fenced submissions, from their EXECBUFFER to the guest seeing the host return them (the host returns a
@@ -206,6 +211,7 @@ struct Resource {
     bool hostVisible;
     IOMemoryDescriptor *pages;         // a guest blob's own pages, or the caller's (CREATE_BLOB_USER)
     bool wired;                        // pages is the caller's memory, prepared (wired) until the blob goes
+    bool prepared;                     // pages is this driver's memory in the caller's task (taskPages), prepared until the blob goes
     IOMemoryDescriptor *window;        // a host blob's range of the pool, once mapped
     IOMemoryMap *map;                  // in the client's task
 };
@@ -341,9 +347,9 @@ void countPages(Client *c, const Resource &r, int64_t sign) {
     }
 }
 void dropPages(Resource &r) {
-    if (r.pages && r.wired) r.pages->complete();
+    if (r.pages && (r.wired || r.prepared)) r.pages->complete();
     if (r.pages) r.pages->release();
-    r.pages = nullptr; r.wired = false;
+    r.pages = nullptr; r.wired = r.prepared = false;
 }
 void releaseResource(Client *c, Resource &r) {
     Header reply = {};
@@ -507,6 +513,21 @@ IOMemoryDescriptor *guestPages(uint64_t bytes) {
     IODelete(chunks, IOMemoryDescriptor *, most);
     return pages;
 }
+// A guest blob's pages in the calling process's own address space: pageable memory there (fresh anonymous memory, zero), wired by
+// prepare() until the blob goes, as a CREATE_BLOB_USER range is. Not the kernel's: the kernel never reads or writes a blob, and
+// with every blob mapped there (guestPages) the clients' 1.8 GB at 2048x2732 (the render server's 1.3 of it) ran the kernel's
+// buffer range out of room -- whole-blob allocations failed with 400 MiB free, then a file pagein could not map its UPL
+// (bindfs_pagein: ubc_upl_map() failed with (3), KERN_NO_SPACE: a panic). Null where that fails; guestPages then serves the blob.
+IOMemoryDescriptor *taskPages(task_t task, uint64_t bytes) {
+    if (!task || task == kernel_task) return nullptr;
+    IOBufferMemoryDescriptor *pages = IOBufferMemoryDescriptor::inTaskWithOptions(task,
+        IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPageable), bytes, 4096);
+    if (!pages) return nullptr;
+    if (pages->prepare() != kIOReturnSuccess) { pages->release(); return nullptr; }
+    droidvm_virtgpu_task_pages[0] = droidvm_virtgpu_task_pages[0] + 1;
+    droidvm_virtgpu_task_pages[1] = droidvm_virtgpu_task_pages[1] + bytes;
+    return pages;
+}
 // A client's own pages for CREATE_BLOB_USER, wired, as NativeAdreno imports them (NativeAdrenoMemory.cpp importRange): through a
 // memory entry of their own (kIOMemoryPersistent), so the owner may unmap its range while the GPU still uses it, and read-only where
 // the owner's mapping cannot be written (a mapped file, constant data; Metal only reads no-copy buffers over such memory).
@@ -555,7 +576,11 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
             if (!r.pages) return kIOReturnVMError;
             r.wired = true;
         } else {
-            r.pages = guestPages(bytes);
+            r.pages = droidvm_virtgpu_in_task ? taskPages(task, bytes) : nullptr;
+            r.prepared = r.pages != nullptr;
+            if (!r.pages && droidvm_virtgpu_in_task && task && task != kernel_task)
+                droidvm_virtgpu_task_pages[2] = droidvm_virtgpu_task_pages[2] + 1;
+            if (!r.pages) r.pages = guestPages(bytes);
             if (!r.pages) { droidvm_virtgpu_last_blob_refused = bytes; return kIOReturnNoMemory; }
         }
         // At most one entry a page (the pages are page aligned), and MaxBlobEntries in all.
@@ -780,7 +805,8 @@ extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t t
         if (fixed(sizeof(droidvm_virtgpu_create_blob), sizeof(droidvm_virtgpu_create_blob_reply), true)) {
             auto blob = static_cast<const droidvm_virtgpu_create_blob *>(in);
             if (blob->cmd_size <= DROIDVM_VIRTGPU_MAX_COMMAND && inSize == sizeof *blob + blob->cmd_size)
-                status = createBlob(c, *blob, static_cast<const uint8_t *>(in) + sizeof *blob, *static_cast<droidvm_virtgpu_create_blob_reply *>(out));
+                status = createBlob(c, *blob, static_cast<const uint8_t *>(in) + sizeof *blob, *static_cast<droidvm_virtgpu_create_blob_reply *>(out),
+                                    task);
         }
         break;
     case DROIDVM_VIRTGPU_CREATE_BLOB_USER:
