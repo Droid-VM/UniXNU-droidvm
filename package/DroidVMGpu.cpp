@@ -310,7 +310,9 @@ bool gPoolCoherent;
 // each bound at the mapping's iova + `offset`. An imported piece is a whole object of its own; a pooled BO is one range of the pool's.
 struct Piece {uint32_t object; uint64_t child, offset, bytes;};
 struct Binding {Piece *pieces; uint32_t count, capacity; bool pooled, coherent;};
-Binding gBindings[NativeAdrenoVmMaxObjects];
+Binding *gBindings;   // NativeAdrenoVm::attach allocates it
+size_t gMappingEnd;   // slots past it were never used since attach
+uint16_t gHandleSlots[4096];   // by handle: the slot it was last found in (a hint, checked)
 
 void dropPieces(Binding &binding, uint64_t iova, bool unbind)
 {
@@ -403,7 +405,10 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *, ArmSmmu4KContextConfig *, A
     if (attached_) return kIOReturnBusy;
     mappings_ = IONewZeroData(Mapping, NativeAdrenoVmMaxObjects);
     if (!mappings_) return kIOReturnNoMemory;
+    if (!gBindings) gBindings = IONewZero(Binding, NativeAdrenoVmMaxObjects);
+    if (!gBindings) {IODeleteData(mappings_, Mapping, NativeAdrenoVmMaxObjects); mappings_ = nullptr; return kIOReturnNoMemory;}
     capacity_ = max_spans;
+    gMappingEnd = 0;
     lower_count_ = upper_count_ = objects_ = 0;
     attached_ = true;
     return kIOReturnSuccess;
@@ -419,8 +424,13 @@ IOReturn NativeAdrenoVm::detach()
 NativeAdrenoVm::Mapping *NativeAdrenoVm::find(uint64_t handle)
 {
     if (!handle || !mappings_) return nullptr;
-    for (size_t i = 0; i < NativeAdrenoVmMaxObjects; ++i)
-        if (mappings_[i].memory && mappings_[i].handle == handle) return &mappings_[i];
+    uint16_t &hint = gHandleSlots[handle % 4096];
+    if (hint < gMappingEnd && mappings_[hint].memory && mappings_[hint].handle == handle) return &mappings_[hint];
+    for (size_t i = 0; i < gMappingEnd; ++i)
+        if (mappings_[i].memory && mappings_[i].handle == handle) {
+            hint = static_cast<uint16_t>(i);
+            return &mappings_[i];
+        }
     return nullptr;
 }
 IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory, unsigned upper, uint64_t iova, unsigned permissions, unsigned writeback,
@@ -436,7 +446,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory, unsigned upper, uint64_
         (iova & 4095) || iova < start || iova - start >= size || memory->bytes() > size - (iova - start))
         return kIOReturnBadArgument;
     if (objects_ >= NativeAdrenoVmMaxObjects || memory->spanCount() > capacity_ - spanCount()) return kIOReturnNoResources;
-    for (size_t i = 0; i < NativeAdrenoVmMaxObjects; ++i) {
+    for (size_t i = 0; i < gMappingEnd; ++i) {
         const Mapping &m = mappings_[i];
         if (m.memory && iova <= m.iova + (m.memory->bytes() - 1) && m.iova <= iova + (memory->bytes() - 1)) return kIOReturnBusy;
     }
@@ -458,6 +468,8 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory, unsigned upper, uint64_
     ++objects_;
     lower_count_ += memory->spanCount();
     *handle = mappings_[index].handle;
+    if (index >= gMappingEnd) gMappingEnd = index + 1;
+    gHandleSlots[*handle % 4096] = static_cast<uint16_t>(index);
     result_.complete = true;
     result_.completed_spans = memory->spanCount();
     return kIOReturnSuccess;
@@ -487,13 +499,12 @@ IOReturn NativeAdrenoVm::describe(uint64_t handle, uint64_t *iova, size_t *bytes
     *bytes = 0;
     *permissions = 0;
     if (!attached_ || poisoned_) return kIOReturnNotReady;
-    for (size_t m = 0; mappings_ && m < NativeAdrenoVmMaxObjects; ++m)
-        if (mappings_[m].memory && mappings_[m].handle == handle) {
-            *iova = mappings_[m].iova;
-            *bytes = mappings_[m].memory->bytes();
-            *permissions = mappings_[m].permissions;
-            return kIOReturnSuccess;
-        }
+    if (const Mapping *m = const_cast<NativeAdrenoVm *>(this)->find(handle)) {
+        *iova = m->iova;
+        *bytes = m->memory->bytes();
+        *permissions = m->permissions;
+        return kIOReturnSuccess;
+    }
     return kIOReturnBadArgument;
 }
 IOReturn NativeAdrenoVm::holdJob(uint64_t handle)
@@ -522,7 +533,7 @@ IOReturn NativeAdrenoVm::invalidateTlb() {return attached_ && !poisoned_ ? kIORe
 IOReturn NativeAdrenoVm::publishMapped()
 {
     if (!attached_ || poisoned_) return kIOReturnNotReady;
-    for (size_t i = 0; i < NativeAdrenoVmMaxObjects; ++i) {
+    for (size_t i = 0; i < gMappingEnd; ++i) {
         const Mapping &m = mappings_[i];
         if (!m.memory || gBindings[i].coherent) continue;
         if (m.memory->publishForDevice(0, m.memory->bytes(), true, distrust_write_combined_)) {poisoned_ = true; return kIOReturnIOError;}
@@ -532,7 +543,7 @@ IOReturn NativeAdrenoVm::publishMapped()
 IOReturn NativeAdrenoVm::acquireImported()
 {
     if (!attached_ || poisoned_) return kIOReturnNotReady;
-    for (size_t i = 0; i < NativeAdrenoVmMaxObjects; ++i) {
+    for (size_t i = 0; i < gMappingEnd; ++i) {
         const Mapping &m = mappings_[i];
         if (!m.memory || !m.memory->imported() || !(m.permissions & ArmSmmu4KWrite) || gBindings[i].coherent) continue;
         if (m.memory->acquireDeviceWrites(0, m.memory->bytes())) {poisoned_ = true; return kIOReturnIOError;}
@@ -544,7 +555,7 @@ IOReturn NativeAdrenoVm::reassertWriteCombined(uint32_t *reset) const
     if (!reset) return kIOReturnBadArgument;
     *reset = 0;
     if (!attached_ || poisoned_) return kIOReturnNotReady;
-    for (size_t i = 0; i < NativeAdrenoVmMaxObjects; ++i) {
+    for (size_t i = 0; i < gMappingEnd; ++i) {
         if (!mappings_[i].memory) continue;
         uint32_t pages = 0;
         const IOReturn status = mappings_[i].memory->reassertWriteCombined(&pages);
@@ -571,7 +582,7 @@ IOReturn NativeAdrenoVm::peekWords(uint64_t iova, uint32_t *out, size_t count) c
 {
     if (!out || !attached_ || poisoned_) return kIOReturnBadArgument;
     for (size_t k = 0; k < count; ++k) out[k] = 0;
-    for (size_t i = 0; i < NativeAdrenoVmMaxObjects; ++i) {
+    for (size_t i = 0; i < gMappingEnd; ++i) {
         const Mapping &m = mappings_[i];
         if (!m.memory || !m.memory->mapping() || iova < m.iova || iova - m.iova >= m.memory->bytes()) continue;
         const size_t offset = size_t(iova - m.iova);
@@ -850,6 +861,21 @@ void gpuThread(void *, wait_result_t)
     }
     reservePool(output_bits);
     native_adreno_io_coherent = gPoolObject && gPoolCoherent ? 1 : 0;
+    if (!gPoolObject) {
+        NativeAdrenoMemory probe;
+        if (!probe.allocate(4096, output_bits, true, 4096, false) && probe.spanCount() == 1) {
+            const droidvm_gpu_range range = {probe.spans()[0].physical, 4096};
+            uint32_t object = 0;
+            bool coherent = false;
+            if (!importRanges(&range, 1, DROIDVM_GPU_IMPORT_COHERENT, &object, &coherent)) {
+                (void)freeObject(object);
+                native_adreno_io_coherent = coherent ? 1 : 0;
+            }
+        }
+        (void)probe.release();
+        IOLog("droidvm-gpu: without a pool, imports are %s; BOs %s\n", native_adreno_io_coherent ? "IO-coherent" : "not coherent",
+              native_adreno_wc_enabled ? "write-combined" : "cacheable");
+    }
     IOReturn status = gVm.attach(nullptr, nullptr, nullptr, nullptr, nullptr, 1u << 20, 0);
     if (!status) status = gRing.attach(nullptr, nullptr, nullptr, 0, 0, nullptr, 0, 0);
     if (!status) status = gSubmit.attach(&gVm, &gRing);
@@ -859,7 +885,8 @@ void gpuThread(void *, wait_result_t)
     // and eight-channel macrotiles (msm's sm8650 UBWC configuration, as sm8550's that sheng states). The VA is the VBO, which
     // NativeAdrenoPublish cuts into the clients' windows from its start (droidvm_gpu_window_base).
     gDeviceInfo = {info.chip_id, info.gmem_bytes, info.gmem_base, info.uche_trap_base, info.va_start, info.va_size,
-                   info.highest_bank_bit ? info.highest_bank_bit : 16, 6, 1, 4, NativeAdrenoDeviceClientIova, 0};
+                   info.highest_bank_bit ? info.highest_bank_bit : 16, 6, 1, 4,
+                   uint32_t(NativeAdrenoDeviceClientIova | (!native_adreno_wc_enabled && native_adreno_io_coherent ? NativeAdrenoDeviceCachedCoherent : 0)), 0};
     if (bootArg("droidvm-gpu-selftest", 0)) selfTest(output_bits);
     status = native_adreno_publish(&gVm, &gSubmit, &gRing, &gClock, &gTimer, &gDeviceInfo, input_bits, output_bits);
     droidvm_gpu_stats[13] = uint32_t(status);

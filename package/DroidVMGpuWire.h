@@ -19,7 +19,7 @@ enum {
     DROIDVM_GPU_DEVICE_ID = 59,           /* virtio device id: crosvm's nonstandard ids count down from 63 */
     DROIDVM_GPU_WIRE_VERSION = 1,
     DROIDVM_GPU_MAX_RANGES = 1024,        /* IMPORT entries per request */
-    DROIDVM_GPU_MAX_IBS = 16,             /* NativeAdrenoAbiMaxBuffers */
+    DROIDVM_GPU_MAX_IBS = 64,             /* NativeAdrenoAbiMaxBuffers */
     DROIDVM_GPU_WAIT_MAX_MS = 4,
 
     DROIDVM_GPU_OP_INFO = 1,
