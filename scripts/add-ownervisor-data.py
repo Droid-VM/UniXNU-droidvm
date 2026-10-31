@@ -92,6 +92,24 @@ def main():
                 if tool.is_file():
                     shutil.copyfile(tool, bin_dir / name)
                     os.chmod(bin_dir / name, 0o755)
+            # The common commands on PATH as bare names: each is a symlink to the trusted multicall binary (toybox, or applebox
+            # for the ones toybox lacks), which dispatches on argv[0]. No new trust -- the resolved Mach-O's CDHash is toybox's or
+            # applebox's. Without these the ssh shell has only `toybox X` / `applebox X` (27's zsh does not fall back to a builtin
+            # ls/grep). A name that is already a real binary (a shell tool, a libimobiledevice link) is left as it is.
+            applets = {name: 'toybox' for name in (
+                'ls find grep egrep fgrep head tail cat cut wc sort uniq comm cmp sed nl tac rev paste fold fmt expand '
+                'stat file strings readelf du df chmod chgrp chown ln link unlink readlink realpath mkdir rmdir mkfifo mv cp rm '
+                'touch truncate install cpio tar xxd od base64 base32 md5sum sha1sum sha256sum sha512sum cksum crc32 shred '
+                'id groups whoami who w date echo env printenv printf pwd sleep timeout time kill killall5 xargs which '
+                'basename dirname true false yes seq factor tee uname hostname getconf tty clear logger nc netcat iconv split'
+            ).split()}
+            # toybox 0.8.x here has no tr/ps; applebox carries these (and a few Apple-only tools) instead.
+            applets.update({name: 'applebox' for name in
+                            'apply chroot getopt hexdump jot logname nice path_helper renice shlock users what whereis'.split()})
+            for name, multicall in applets.items():
+                link = bin_dir / name
+                if not link.exists() and (bin_dir / multicall).is_file():
+                    os.symlink(multicall, link)
             # The services: the debug shell's built-in ones (services.d and enabled markers as its build laid them out) and the
             # board's GPU probe. adrenoprobe is defined but NOT started at boot: it opens AGXDeviceUserClient and submits a GPU
             # self-test that can fault (the known CP register-load AHB fault), and running it at boot, racing the real render
