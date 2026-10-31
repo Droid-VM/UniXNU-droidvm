@@ -8,8 +8,8 @@ iPadOS 17 board's scripts/build-native-legacy-display.py builds them:
     over the virtio-mmio transport (DroidVMVirtioNet.c). IONetworkingFamily-188, the release of the xnu-12377 era (iPadOS 17's is 177),
     has the same twelve sources.
   - the speaker and microphone (DroidVMAudio.cpp, linked under the original IOAudio2Family's classes at attach) over virtio-snd
-    (DroidVMVirtioSnd.c), the battery (DroidVMBattery.cpp, an IOPMPowerSource over crosvm's goldfish battery) and the virtio-media
-    devices (DroidVMVirtioMedia.c).
+    (DroidVMVirtioSnd.c), the battery (DroidVMBattery.cpp, an IOPMPowerSource over crosvm's goldfish battery), the virtio-media
+    devices (DroidVMVirtioMedia.c) and the vCPUs' performance requests to the host (DroidVMCpufreq.c, crosvm's virtual cpufreq).
 
 The transports take their rings and buffers from a region allocated when the device starts (DROIDVM_DEVICE_DYNAMIC,
 DroidVMDmaRegion.h): their static arrays (over 400 KiB) do not fit the native __DATA's slot in the fileset.
@@ -139,7 +139,7 @@ def main():
         obj = command(cpp, source, OUT / f'{name}.o', strict)
         objects.append(stage_late(obj, name) if late else obj)
         sources.append(source)
-    for name in ('DroidVMVirtioNet', 'DroidVMVirtioSnd', 'DroidVMVirtioMedia'):
+    for name in ('DroidVMVirtioNet', 'DroidVMVirtioSnd', 'DroidVMVirtioMedia', 'DroidVMCpufreq'):
         source = ROOT / 'kits/droidvm' / f'{name}.c'
         objects.append(command(c_mach, source, OUT / f'{name}.o', ('-DDROIDVM_DEVICE_DYNAMIC=1',)))
         sources.append(source)
@@ -149,7 +149,7 @@ def main():
     (OUT / 'sources.json').write_text(json.dumps([rel(p) for p in sources], indent=2) + '\n')
     (OUT / 'report.json').write_text(json.dumps(dict(
         ionetworking=dict(tag=IONET_TAG, commit=IONET_COMMIT), objects={rel(p): sha(p) for p in objects}), indent=2) + '\n')
-    print(f'devices: {len(objects)} objects ({IONET_TAG}, ethernet, sound, battery, media)')
+    print(f'devices: {len(objects)} objects ({IONET_TAG}, ethernet, sound, battery, media, cpufreq)')
 
 
 if __name__ == '__main__':
