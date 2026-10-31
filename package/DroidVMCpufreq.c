@@ -18,6 +18,12 @@
 // (default 2000) with none of those. A vCPU going idle keeps its request: the clamp only acts while its thread runs. A vCPU
 // writes only on a change, a few times per frame at most.
 //
+// A thread group with such a thread is interactive (as CLPC treats a group by its work), and its default-class and user-
+// initiated threads ask for the top frequency too (droidvm_cpufreq_tg_boost, 1): they are links of the same frame chain. With
+// the UI classes on the P cluster (below), metal2vulkan's submission thread of the render server, a default-class Rust thread,
+// otherwise ran on an unboosted E vCPU at about 1 GHz and the commit-to-GPU step took 3.8 ms against 1.7 ms. Background and
+// utility threads never ask.
+//
 // droidvm-cpufreq=0 leaves the device alone. droidvm_cpufreq_mode (poke.py; 1 on, 0 off) switches it at run time: off, each vCPU
 // drops its request at its next switch.
 //
@@ -45,10 +51,15 @@
 #define CPUFREQ_MAX_CPUS   8
 
 #define CPUFREQ_CLASSES ((1u << PERFCONTROL_CLASS_UI) | (1u << PERFCONTROL_CLASS_ABOVEUI) | (1u << PERFCONTROL_CLASS_REALTIME))
+// A thread group's state in the first byte of its machine data: seen (its preferred clusters set), interactive (one of its threads
+// of a boosted class has come on).
+#define CPUFREQ_GROUP_SEEN        1
+#define CPUFREQ_GROUP_INTERACTIVE 2
 
 volatile uint32_t droidvm_cpufreq_stage;       // 1 window found, 2 mapped, 3 tables read, 4 callout registered
 volatile uint32_t droidvm_cpufreq_mode = 1;
 volatile uint32_t droidvm_cpufreq_classes = CPUFREQ_CLASSES;
+volatile uint32_t droidvm_cpufreq_tg_boost = 1;   // also an interactive thread group's default and user-initiated threads
 volatile uint32_t droidvm_cpufreq_cpus;
 volatile uint32_t droidvm_cpufreq_fmin[CPUFREQ_MAX_CPUS], droidvm_cpufreq_fmax[CPUFREQ_MAX_CPUS];
 volatile uint64_t droidvm_cpufreq_raises[CPUFREQ_MAX_CPUS], droidvm_cpufreq_drops[CPUFREQ_MAX_CPUS];
@@ -89,13 +100,20 @@ static void cpufreq_csw(perfcontrol_event event, uint32_t cpu, uint64_t timestam
     (void)event; (void)flags; (void)offcore; (void)counters; (void)timeout_ticks;
     const perfcontrol_class_t class = oncore->perfctl_class;
     if (class == PERFCONTROL_CLASS_IDLE) return;
+    const bool boosted = (droidvm_cpufreq_classes >> class) & 1;
     volatile uint8_t *group = oncore->thread_group_data;
-    if (droidvm_cpufreq_p_cluster != UINT32_MAX && group && !*group) {
-        *group = 1;
-        cpufreq_prefer((void *)(uintptr_t)group);
+    uint8_t seen = group ? *group : CPUFREQ_GROUP_INTERACTIVE;
+    if (!seen) {
+        *group = seen = CPUFREQ_GROUP_SEEN;
+        if (droidvm_cpufreq_p_cluster != UINT32_MAX) cpufreq_prefer((void *)(uintptr_t)group);
     }
+    if (boosted && seen != CPUFREQ_GROUP_INTERACTIVE) *group = seen = CPUFREQ_GROUP_INTERACTIVE;
     if (cpu >= droidvm_cpufreq_cpus) return;
-    if (droidvm_cpufreq_mode && ((droidvm_cpufreq_classes >> class) & 1)) {
+    // A thread group with UI work is interactive: its default and user-initiated threads (a render server's GPU submission
+    // thread, an app's frame workers) are links of the same frame chain, wherever the scheduler put them.
+    const bool hot = boosted || (droidvm_cpufreq_tg_boost && group && seen == CPUFREQ_GROUP_INTERACTIVE &&
+                                 (class == PERFCONTROL_CLASS_NONUI || class == PERFCONTROL_CLASS_USER_INITIATED));
+    if (droidvm_cpufreq_mode && hot) {
         cpufreq_state[cpu].hot = timestamp;
         if (!cpufreq_state[cpu].high) cpufreq_set(cpu, true);
     } else if (cpufreq_state[cpu].high && (!droidvm_cpufreq_mode || timestamp - cpufreq_state[cpu].hot > cpufreq_hold)) {
