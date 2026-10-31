@@ -435,6 +435,7 @@ extern void droidvm_snd_start(void);
 extern void droidvm_media_start(void);
 extern int droidvm_battery_attach(void);
 extern void droidvm_cpufreq_attach(void);
+extern void droidvm_sched_trace_attach(void);
 extern void droidvm_rtc_set_calendar(void);
 extern void droidvm_fix_ownervisor_bootstrap(void);
 extern void droidvm_busy_scan(void);
@@ -469,6 +470,7 @@ void native_touch_probe(void) {
     droidvm_media_start();
     droidvm_battery_attach();
     droidvm_cpufreq_attach();
+    droidvm_sched_trace_attach();
     if (!PE_parse_boot_argn("droidvm-monitor", &interval, sizeof(interval)) || !interval)
         return;
     if (kernel_thread_start(droidvm_monitor, NULL, &thread) == KERN_SUCCESS)

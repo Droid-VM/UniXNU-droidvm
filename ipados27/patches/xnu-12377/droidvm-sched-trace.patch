@@ -1,0 +1,39 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -1032,6 +1032,15 @@
+ }
+ 
+ /*
++ * DroidVM: the board's scheduler trace (DroidVMSchedTrace.c), NULL until the board installs it: every context switch, after the
++ * perfcontrol callout (the thread switched from still holds its wait event and block hint), and every wakeup with its waker.
++ */
++extern void (*volatile droidvm_sched_trace_switch)(thread_t old, thread_t new, uint64_t timestamp);
++extern void (*volatile droidvm_sched_trace_wake)(thread_t thread, thread_t waker);
++void (*volatile droidvm_sched_trace_switch)(thread_t old, thread_t new, uint64_t timestamp);
++void (*volatile droidvm_sched_trace_wake)(thread_t thread, thread_t waker);
++
++/*
+  *	Routine:	thread_go
+  *	Purpose:
+  *		Unblock and dispatch thread.
+@@ -1065,6 +1074,9 @@
+ 	assert(ml_get_interrupts_enabled() == false);
+ 
+ 	if (thread_unblock(thread, wresult)) {
++		if (droidvm_sched_trace_wake) {
++			droidvm_sched_trace_wake(thread, self);
++		}
+ #if SCHED_TRACE_THREAD_WAKEUPS
+ 		backtrace(&thread->thread_wakeup_bt[0],
+ 		    (sizeof(thread->thread_wakeup_bt) / sizeof(uintptr_t)), NULL,
+@@ -3469,6 +3481,9 @@
+ 		 * - We do not want to callout if "thread" is NULL.
+ 		 */
+ 		thread_csw_callout(thread, self, processor->last_dispatch);
++		if (droidvm_sched_trace_switch) {
++			droidvm_sched_trace_switch(thread, self, processor->last_dispatch);
++		}
+ 
+ #if KASAN
+ 		if (thread->continuation != NULL) {

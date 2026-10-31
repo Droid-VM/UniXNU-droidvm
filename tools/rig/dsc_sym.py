@@ -25,9 +25,10 @@ class Cache:
         for path in files:
             handle = open(path, 'rb')
             data = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
-            if data[:15] != b'dyld_v1   arm64':
+            # arm64 caches (iPadOS 17) and arm64e ones (iPadOS 27: "dyld_v1  arm64e", dyld_shared_cache_arm64e)
+            if data[:15] not in (b'dyld_v1   arm64', b'dyld_v1  arm64e'):
                 continue
-            if path.name == 'dyld_shared_cache_arm64':
+            if path.name in ('dyld_shared_cache_arm64', 'dyld_shared_cache_arm64e'):
                 self.main = data
             offset, count = struct.unpack_from('<II', data, 0x10)
             for index in range(count):
