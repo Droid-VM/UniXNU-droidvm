@@ -139,12 +139,13 @@ kernel_args = [
   # gaps close (the command line wins over the built-in value). The wallpaper takes the poster extensions (*Poster*) and
   # SBRendererService, PaperBoardUI's renderer, whose NeutrinoCore device asserts without a Metal device.
   "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService",
-  # Debug only: let an entitled debugger (the owner debugserver, com.apple.private.cs.debugger + system-task-ports) get the task
-  # control port of a system process. Without it the DEVELOPMENT AMFI returns KERN_FAILURE from task_for_pid ("AMFI: task_for_pid()
-  # not allowed") even for root with those entitlements and developer mode on, so debugserver cannot attach to backboardd/SpringBoard/
-  # iconservicesagent. A debug facility behind owner trust + ssh; it changes no stock userland. (If the command line ever overflows
-  # BOOT_LINE_LENGTH 1024, move this to the built-in PE_builtin_boot_args in package/DroidVMBootArgs27.c instead.)
-  "amfi_unrestrict_task_for_pid=1",
+  # Debug only: clear the MACF checks the release AMFI/Sandbox impose on an owner debug binary, at the XNU call sites
+  # (patches/xnu-12377 zzye/zzyf). Only a caller carrying the owner entitlement com.apple.private.droidvm.debug is cleared,
+  # and only read is relaxed for files: the ssh debugserver gets a system process's task port (task_for_pid stopped returning
+  # KERN_FAILURE), and the ssh shell reads a sandbox container / data vault's logs. (The stock AMFI ignores its own
+  # amfi_unrestrict_task_for_pid boot-arg, so that one was dropped.) A debug facility behind owner trust + ssh; no stock
+  # userland changes.
+  "owner-debug=1",
   "-v",
 ]
 

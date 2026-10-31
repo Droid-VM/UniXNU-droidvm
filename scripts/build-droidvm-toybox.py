@@ -78,17 +78,18 @@ shutil.copyfile(src / 'toybox', binary)
 binary.chmod(0o755)
 # The debug shell's coreutils read the guest to debug it, so toybox carries the entitlements that let it:
 #  - no-container: an owner tool without it is refused (AMFI launch constraints) when another owner process execs it.
-#  - no-sandbox: run with no seatbelt profile, so no profile denies a read.
-#  - storage-exempt.heritable: read a data vault (UF_DATAVAULT) and any sandbox storage class. A data vault resists root --
-#    even root + no-sandbox gets EPERM on com.apple.geod/Vault, Library/MobileContainerManager, com.apple.pipelined, ... -- so
-#    the debug shell could not read the logs daemons keep in their containers. This blanket read exemption is what diagnosticd/
-#    sysdiagnose hold; it is a debug facility behind owner trust + ssh and changes no stock userland.
+#  - no-sandbox: run with no seatbelt profile.
+#  - com.apple.private.droidvm.debug: the owner debug entitlement the board's XNU checks (patches/xnu-12377 zzyf) to clear the
+#    MACF vnode READ checks (open read-only, read, readdir, lookup, stat, getattr, readlink) for this process, gated by the
+#    owner-debug boot-arg. A data vault (com.apple.geod/Vault, Library/MobileContainerManager, com.apple.pipelined, ...) resists
+#    root, and the stock storage-exempt entitlement did not grant it, so the ssh shell could not read the logs daemons keep in
+#    their containers. A debug facility behind owner trust + ssh; no write path is relaxed and no stock userland changes.
 entitlements = OUT / 'entitlements.plist'
 entitlements.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
                         '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>'
                         '<key>com.apple.private.security.no-container</key><true/>'
                         '<key>com.apple.private.security.no-sandbox</key><true/>'
-                        '<key>com.apple.private.security.storage-exempt.heritable</key><true/></dict></plist>\n')
+                        '<key>com.apple.private.droidvm.debug</key><true/></dict></plist>\n')
 subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'org.droidvm.toybox',
                 '--entitlements', entitlements, binary], check=True)
 detail = subprocess.run(['codesign', '--display', '--verbose=4', binary], capture_output=True, text=True, check=True).stderr
