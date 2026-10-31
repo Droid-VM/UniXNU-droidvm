@@ -281,7 +281,13 @@ def describe(fdt):
     sbsa_uart = pl011[0] if pl011 else None
     if sbsa_uart and not (ARMIO_BASE <= sbsa_uart[0] < sbsa_uart[0] + sbsa_uart[1] <= ARMIO_BASE + ARMIO_SIZE):
         raise SystemExit(f'pl011 window {sbsa_uart[0]:#x}+{sbsa_uart[1]:#x} lies outside the arm-io window')
-    return dict(cpu_regs=[reg for reg, _ in cpus], gic=(dist, dist_size, redist, redist_size),
+    # Each CPU's cluster type from its capacity-dmips-mhz (crosvm --cpu-capacity, the host core under the vCPU), as DarwinBoot
+    # derives it at boot: P for the highest, E below it, P for all when they are equal or one has none. An AMP kernel panics on a
+    # CPU of no cluster type (cluster_type_to_pset_type), so every cpu node carries one.
+    capacities = [cells(fdt[path]['capacity-dmips-mhz'])[0] if 'capacity-dmips-mhz' in fdt[path] else 0 for _, path in cpus]
+    differ = all(capacities) and len(set(capacities)) > 1
+    cluster_types = {reg: ('E' if differ and capacity < max(capacities) else 'P') for (reg, _), capacity in zip(cpus, capacities)}
+    return dict(cpu_regs=[reg for reg, _ in cpus], cluster_types=cluster_types, gic=(dist, dist_size, redist, redist_size),
                 psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size,
                 virtio_mmio=virtio, drm_host_pool=drm_host, media_host_pool=media_host, battery=battery, sbsa_uart=sbsa_uart)
 
@@ -447,7 +453,8 @@ def main():
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
                                    ('reg', struct.pack('<I', reg)),
                                    ('device_type', b'cpu\0'), ('compatible', b'arm,armv8\0'),
-                                   ('timebase-frequency', struct.pack('<I', args.timebase))])
+                                   ('timebase-frequency', struct.pack('<I', args.timebase)),
+                                   ('cluster-type', vm['cluster_types'][reg].encode() + b'\0')])
             for index, reg in enumerate(cpu_regs[:1] if args.dynamic else cpu_regs)]
     identity = identity_of(args.identity_tree) if args.identity_tree else None
     tree = node('device-tree', [

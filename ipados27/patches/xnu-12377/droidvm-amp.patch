@@ -1,0 +1,19 @@
+diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
+--- a/pexpert/pexpert/arm64/BCM2837.h
++++ b/pexpert/pexpert/arm64/BCM2837.h
+@@ -25,6 +25,15 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM64_PMAP_SUBPAGE_L1__ 1
+ 
++/*
++ * DroidVM: the vCPUs run on the host's cores as pinned, and a phone's are big and little (crosvm's --cpu-capacity and
++ * --cpu-cluster put the host's capacities into the FDT; DarwinBoot gives each ADT cpu node a cluster-type, 'P' for the
++ * strongest capacity and 'E' below it). AMP makes the scheduler place by it (CONFIG_SCHED_EDGE follows __AMP__), with
++ * each thread group's preferred cluster per performance-control class set by DroidVMCpufreq.c, as CLPC would. Every cpu
++ * node must carry E, M or P: cluster_type_to_pset_type() panics on the SMP type, so a host of equal cores is one P cluster.
++ */
++#define __ARM_AMP__               1
++
+ /* Native ARMv8.1+ targets select PAN explicitly; the original A53 target has none. */
+ #if defined(XNU_NATIVE_PAN) && XNU_NATIVE_PAN
+ #define __ARM_PAN_AVAILABLE__      1
