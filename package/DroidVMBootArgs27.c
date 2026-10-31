@@ -31,6 +31,10 @@ char PE_builtin_boot_args[] =
     // memory, and the guest ran out of free pages and paged its files in through the seed disk's polled reads with 1.1-1.3 GiB
     // still counted available, never reaching the warning
     "memorystatus_pressure_threshold_mb=1280 "
+    // 40 times the time every other CPU has to enter and to leave the debugger (osfmk/arm/model_dep.c debug_ack_timeout, 240000
+    // timebase ticks: 12.5 ms here): a stackshot takes the debugger, and a vCPU the host keeps off its core longer than that made it
+    // a panic ("Resuming from debugger synchronization failed", osanalyticshelper's stackshot at boot, 2026-11-01)
+    "ml-timeout-debug-ack-scale=40 "
     // the processes besides the render server that get the accelerator's user client and a native Metal device, as on iPadOS 17
     // (DroidVMBootArgs.c), and iPadOS 27's wallpaper renderer (SBRendererService, PaperBoardUI): the launch policy writes the
     // plugin's NativeAdrenoMetal.clients from it at every boot
