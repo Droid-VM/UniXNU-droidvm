@@ -110,6 +110,11 @@ kernel_args = [
   # DroidVMDisplay and WindowServer take them (Droid-VM/macOS-DroidVM droidvm-display-hz, ca-triple-buffer).
   "droidvm-display-hz=120",
   "ca-triple-buffer=1",
+  # The GPU stack's diagnostics, which the Metal plugin read unconditionally before upstream AdrenoMetal a0f0287b put them behind
+  # switches: sheng-diag (the render server's frame trace, the clients' status and telemetry rows, Turnip's pass stamps) and log-gpu
+  # (the GPU stack's NSLog lines and the pipeline journal, pipelines.log). Both on, so the merge alone changes no measurement.
+  "sheng-diag=1",
+  "log-gpu=1",
   "offline-legacy-pm=1",
   "offline-legacy-validate=1",
   "offline-legacy-transfer=1",

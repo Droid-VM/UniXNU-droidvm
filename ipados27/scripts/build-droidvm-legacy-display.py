@@ -412,6 +412,9 @@ extern "C" void droidvm_busy_scan(void) {
 }
 extern "C" {volatile uint32_t native_ufs_dpu_state=0;}
 extern "C" uint32_t native_ufs_dpu_map(unsigned,const uint64_t *,unsigned) {return 0;}
+// GopFramebuffer's swap notes and its wait for the GPU's write before a direct flip (upstream 19ef3a75) import Adreno740's fence
+// counters weakly; this board's GPU driver is not Adreno740's. No counters: both callers then take a swap as written, as before.
+extern "C" bool native_adreno_fences(uint32_t *,uint32_t *) {return false;}
 ''')
 compile_cpp(support, OUT / 'LegacyDisplaySupport27.o')
 # The host's file mailbox (kits/droidvm/DroidVMFileExport.c, tools/rig export.py and crashes.py; a 4 MiB buffer allocated at the
