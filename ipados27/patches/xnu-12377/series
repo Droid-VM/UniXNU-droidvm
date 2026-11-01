@@ -15,3 +15,4 @@ droidvm-native4k-once.patch
 droidvm-pressure-pageable.patch
 droidvm-free-target-bytes.patch
 droidvm-dyld-16k-peek-first.patch
+droidvm-native-pac-user-jop.patch

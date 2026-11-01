@@ -1,0 +1,148 @@
+diff --git a/osfmk/arm64/locore.s b/osfmk/arm64/locore.s
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -911,6 +911,22 @@
+ 
+ .macro EL0_64_VECTOR guest_label
+ 	stp		x0, x1, [sp, #-16]!					// Save x0 and x1 to the exception stack
++#if HAS_NATIVE_PAC
++	/*
++	 * A thread of a task with user JOP disabled (an arm64 executable, not arm64e) ran EL0 with
++	 * the IA, DA and DB keys off (see the exception return): on again before the kernel
++	 * authenticates anything, the user PCB below first.
++	 */
++	mrs		x0, TPIDR_EL1
++	ldr		w1, [x0, TH_ARM_MACHINE_FLAGS]
++	tbz		w1, ARM_MACHINE_THREAD_DISABLE_USER_JOP_SHIFT, 1f
++	mrs		x0, SCTLR_EL1
++	MOV64	x1, (SCTLR_PACIA_ENABLED | SCTLR_PACDA_ENABLED | SCTLR_PACDB_ENABLED)
++	orr		x0, x0, x1
++	msr		SCTLR_EL1, x0
++	isb		sy
++1:
++#endif /* HAS_NATIVE_PAC */
+ #if __ARM_KERNEL_PROTECT__
+ 	mov		x18, #0 						// Zero x18 to avoid leaking data to user SS
+ #endif
+@@ -2071,6 +2087,29 @@
+ Lskip_eret_isb:
+ #endif /* ERET_NEEDS_ISB */
+ 
++#if HAS_NATIVE_PAC
++	/*
++	 * Back to EL0 in a thread of a task with user JOP disabled: the IA, DA and DB keys off, as
++	 * an Apple CPU disables a process's user JOP keys. The architectural keys are one set for
++	 * EL0 and EL1 here (native_pac_keys), and the task's arm64 code signs nothing, so the
++	 * arm64e code of the shared cache it runs must authenticate its unsigned pointers (an
++	 * Objective-C class's ro data, a block's invoke) as a disabled key does: unchanged. IB, the
++	 * return address key, stays on. Nothing below authenticates with the keys turned off.
++	 */
++	mrs		x2, SPSR_EL1
++	and		x2, x2, #(PSR64_MODE_EL_MASK)
++	cmp		x2, #(PSR64_MODE_EL0)
++	b.ne	1f
++	mrs		x2, TPIDR_EL1
++	ldr		w3, [x2, TH_ARM_MACHINE_FLAGS]
++	tbz		w3, ARM_MACHINE_THREAD_DISABLE_USER_JOP_SHIFT, 1f
++	mrs		x2, SCTLR_EL1
++	MOV64	x3, (SCTLR_PACIA_ENABLED | SCTLR_PACDA_ENABLED | SCTLR_PACDB_ENABLED)
++	bic		x2, x2, x3
++	msr		SCTLR_EL1, x2
++	isb		sy
++1:
++#endif /* HAS_NATIVE_PAC */
+ 	/* Restore arm_saved_state64 */
+ 
+ 	// Skip x0, x1 - we're using them
+diff --git a/osfmk/vm/vm_dyld_pager.c b/osfmk/vm/vm_dyld_pager.c
+--- a/osfmk/vm/vm_dyld_pager.c
++++ b/osfmk/vm/vm_dyld_pager.c
+@@ -245,6 +245,7 @@
+ 	mach_vm_size_t          dyld_size[MWL_MAX_REGION_COUNT];
+ #if defined(HAS_APPLE_PAC)
+ 	uint64_t                dyld_a_key;
++	bool                    dyld_jop_disabled;      /* the task runs with user JOP disabled: no pointer is signed */
+ #endif /* defined(HAS_APPLE_PAC) */
+ };
+ 
+@@ -586,7 +587,7 @@
+ 	switch (key) {
+ 	case ptrauth_key_asia:
+ 	case ptrauth_key_asda:
+-		if (arm_user_jop_disabled()) {
++		if (pager->dyld_jop_disabled || arm_user_jop_disabled()) {
+ 			*signedAddr = unsignedAddr;
+ 		} else {
+ 			*signedAddr = (uintptr_t)pmap_sign_user_ptr((void *)unsignedAddr, key, extendedDiscriminator, pager->dyld_a_key);
+@@ -1731,6 +1732,7 @@
+ 	pager->dyld_link_info_size = link_info_size;
+ #if defined(HAS_APPLE_PAC)
+ 	pager->dyld_a_key = (task->map && task->map->pmap && !task->map->pmap->disable_jop) ? task->jop_pid : 0;
++	pager->dyld_jop_disabled = !(task->map && task->map->pmap && !task->map->pmap->disable_jop);
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
+ 	vm_object_reference(backing_object);
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -1230,6 +1230,24 @@
+ 	return false;
+ }
+ 
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if HAS_NATIVE_PAC
++/*
++ * The pager key of the auth mappings of a task with user JOP disabled (task_sign_pointers): its
++ * EL0 runs with the A and D keys off (locore.s), so the auth pointers of its slid pages stay
++ * unsigned, as its own are. Every other pager signs, whatever its key: the architectural keys are
++ * one set for the kernel and every process (native_pac_keys), the shared region's first slide
++ * pager has key 0, and a task's jop_pid only picks its pager.
++ */
++#define SHARED_REGION_UNSIGNED_JOP_KEY   0x6e6f2d6a6f702d00ULL   /* an arbitrary constant no random key takes in practice */
++#define SHARED_REGION_SIGNS_FOR(jop_key) ((jop_key) != SHARED_REGION_UNSIGNED_JOP_KEY)
++#else
++#define SHARED_REGION_UNSIGNED_JOP_KEY   0
++#define SHARED_REGION_SIGNS_FOR(jop_key) 1
++#endif /* HAS_NATIVE_PAC */
++
+ #if __has_feature(ptrauth_calls)
+ 
+ /*
+@@ -1302,7 +1320,7 @@
+ 		 */
+ 		object = si->si_slide_object;
+ 		sr_pager = shared_region_pager_match(object, si->si_start, si,
+-		    use_ptr_auth ? task->jop_pid : 0);
++		    use_ptr_auth ? task->jop_pid : SHARED_REGION_UNSIGNED_JOP_KEY);
+ 		if (sr_pager == MEMORY_OBJECT_NULL) {
+ 			printf("%s(): shared_region_pager_match() failed\n", __func__);
+ 			kr = KERN_FAILURE;
+@@ -3335,7 +3353,7 @@
+ 				discriminator = __builtin_ptrauth_blend_discriminator((void*)(((uintptr_t)uservaddr) + pageOffset), discriminator);
+ 			}
+ 
+-			if (si->si_ptrauth && !arm_user_jop_disabled()) {
++			if (si->si_ptrauth && SHARED_REGION_SIGNS_FOR(jop_key) && !arm_user_jop_disabled()) {
+ #if CONFIG_SPTM
+ 				pmap_batch_sign_user_ptr(rebaseLocation, (void *)value, key, discriminator, jop_key);
+ #else /* CONFIG_SPTM */
+@@ -3554,7 +3572,7 @@
+ 				discriminator = __builtin_ptrauth_blend_discriminator((void*)(((uintptr_t)uservaddr) + pageOffset), discriminator);
+ 			}
+ 
+-			if (si->si_ptrauth && !arm_user_jop_disabled()) {
++			if (si->si_ptrauth && SHARED_REGION_SIGNS_FOR(jop_key) && !arm_user_jop_disabled()) {
+ #if CONFIG_SPTM
+ 				pmap_batch_sign_user_ptr(rebaseLocation, (void *)value, key, discriminator, jop_key);
+ #else /* CONFIG_SPTM */
+@@ -3644,7 +3662,7 @@
+ 					uintptr_t pageOffset = rebaseLocation - page_content;
+ 					discriminator = __builtin_ptrauth_blend_discriminator((void*)(((uintptr_t)uservaddr) + pageOffset), discriminator);
+ 				}
+-				if (si->si_ptrauth && !arm_user_jop_disabled()) {
++				if (si->si_ptrauth && SHARED_REGION_SIGNS_FOR(jop_key) && !arm_user_jop_disabled()) {
+ #if CONFIG_SPTM
+ 					pmap_batch_sign_user_ptr(rebaseLocation, (void *)value, key, discriminator, jop_key);
+ #else /* CONFIG_SPTM */
