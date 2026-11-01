@@ -45,6 +45,14 @@ extern void IOSleep(unsigned milliseconds);
 // points at when motion sensors say which (the device held sideways puts the Home gesture on a side of the panel), and the
 // panel's own bottom when they do not.
 #define DROIDVM_TOUCH_BOTTOM_SNAP 4
+// A finger held still. Apple's digitizer reports every finger on the glass at 120 Hz, never twice at exactly one place (sensor
+// noise), and iPadOS reads a held finger's pause from those reports: SpringBoard tells swipe-up-and-hold (the app switcher) from
+// swipe-up (home) by the finger's speed falling while it is held. The phone's touchscreen filters a still finger's noise away and
+// an unchanged position is no movement to iPadOS, so a held finger was reported as nothing at all, its last movement's speed stood
+// until it lifted, and the switcher could hardly be reached (home every time a synthetic swipe held still; the switcher with a
+// 2 px wobble). While fingers are down and no frame has come for this long (ms), the set is published again with every x one axis
+// unit off (1/30480 of the panel, about 0.07 px) and back the next time, as a digitizer's noise.
+#define DROIDVM_TOUCH_STILL_MS 8
 
 enum { EV_SYN = 0, EV_KEY = 1, EV_ABS = 3 };
 enum { SYN_REPORT = 0, ABS_X = 0, ABS_Y = 1, ABS_Z = 2, ABS_RZ = 5, ABS_MT_SLOT = 0x2f, ABS_MT_POSITION_X = 0x35,
@@ -108,7 +116,8 @@ static unsigned droidvm_input_count;
 // For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 4 motion, 0 left alone), events and frames
 // seen, keyboard reports sent.
 volatile uint32_t droidvm_input_found, droidvm_input_started, droidvm_input_kinds[DROIDVM_INPUT_DEVICES];
-volatile uint64_t droidvm_input_events, droidvm_input_frames, droidvm_input_published, droidvm_input_key_reports;
+volatile uint64_t droidvm_input_events, droidvm_input_frames, droidvm_input_published, droidvm_input_key_reports,
+    droidvm_input_still;   // publications of a held finger set (touch_still)
 char droidvm_input_names[DROIDVM_INPUT_DEVICES][48];
 
 // The motion sensors' latest frame and the orientation it says (DroidVMMotion.c publishes it as kern.droidvm_motion). seq is
@@ -285,8 +294,9 @@ static int32_t input_scale(int32_t value, int32_t min, int32_t span, int32_t axi
     return v < 0 ? 0 : v >= axis ? axis - 1 : (int32_t)v;
 }
 
-// The digitizer's report count when the finger set was last published.
+// The digitizer's report count when the finger set was last published, and when (mach_absolute_time).
 static uint32_t droidvm_published_at;
+static uint64_t droidvm_published_time;
 
 // NativeHidInput reads a published finger set when it is told to (it has no timer for touch): the sink it installs, as with sheng's
 // touch thread (kits/sheng/TouchProbe.cpp). It runs the report on its work loop, from this input thread.
@@ -299,6 +309,7 @@ void native_touch_set_sink(void (*sink)(void *), void *context) {
 
 static void touch_publish(const struct droidvm_finger *fingers, unsigned count) {
     droidvm_published_at = native_touch_hid_reports;
+    droidvm_published_time = mach_absolute_time();
     uint32_t seq = native_touch_seq & ~1u;
     native_touch_seq = seq + 1;
     __asm__ volatile("dmb ish" ::: "memory");
@@ -518,10 +529,28 @@ static void input_poll(struct droidvm_input *d) {
     if (interrupts) input_write32(d, 0x64, interrupts);
 }
 
+// The fingers down, published again a hair off where they are when no frame has come for DROIDVM_TOUCH_STILL_MS (see there).
+// droidvm_order keeps the true positions; only the publication moves.
+static void touch_still(void) {
+    static uint64_t interval;
+    static bool off;
+    if (!interval) nanoseconds_to_absolutetime((uint64_t)DROIDVM_TOUCH_STILL_MS * NSEC_PER_MSEC, &interval);
+    if (!droidvm_order_count || mach_absolute_time() - droidvm_published_time < interval) return;
+    struct droidvm_finger noisy[DROIDVM_TOUCH_FINGERS];
+    off = !off;
+    for (unsigned i = 0; i < droidvm_order_count; ++i) {
+        noisy[i] = droidvm_order[i];
+        if (off) noisy[i].x += noisy[i].x < DROIDVM_TOUCH_AXIS_X - 1 ? 1 : -1;
+    }
+    touch_publish(noisy, droidvm_order_count);
+    droidvm_input_still = droidvm_input_still + 1;
+}
+
 static void droidvm_input_worker(void *parameter, wait_result_t result) {
     (void)parameter; (void)result;
     for (;;) {
         for (unsigned k = 0; k < droidvm_input_count; ++k) input_poll(&droidvm_inputs[k]);
+        touch_still();
         IOSleep(DROIDVM_INPUT_POLL_MS);
     }
 }
