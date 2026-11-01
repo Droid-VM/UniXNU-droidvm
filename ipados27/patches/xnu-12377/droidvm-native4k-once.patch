@@ -1,0 +1,149 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -4747,6 +4747,104 @@
+ 	return 0;
+ }
+ 
++#if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
++/* One preparation of a file at a time, and a second add of the same signature takes the first one's native hashes instead of
++ * reading the file again. At boot two shared regions are set up together and each adds every dyld shared cache file: both
++ * prepared before either had published, and the 5.6 GB cache was read and hashed twice (11.9 GB, about a minute). */
++static LCK_GRP_DECLARE(cs_native4k_grp, "cs_native4k");
++static LCK_MTX_DECLARE(cs_native4k_lock, &cs_native4k_grp);
++static vnode_t cs_native4k_preparing[8];
++unsigned long cs_native4k_reused_blobs = 0;
++
++/* Waits while another thread prepares vp, then marks it as this thread's (false when every mark is in use: then it prepares
++ * unmarked, as before). */
++static bool
++cs_native4k_claim(vnode_t vp)
++{
++	bool claimed = false;
++	lck_mtx_lock(&cs_native4k_lock);
++	for (;;) {
++		unsigned idle = 8;
++		bool busy = false;
++		for (unsigned i = 0; i < 8; i++) {
++			if (cs_native4k_preparing[i] == vp) {
++				busy = true;
++			} else if (cs_native4k_preparing[i] == NULL && idle == 8) {
++				idle = i;
++			}
++		}
++		if (busy) {
++			(void)msleep((caddr_t)cs_native4k_preparing, &cs_native4k_lock, PVFS, "native4k", NULL);
++			continue;
++		}
++		if (idle < 8) {
++			cs_native4k_preparing[idle] = vp;
++			claimed = true;
++		}
++		break;
++	}
++	lck_mtx_unlock(&cs_native4k_lock);
++	return claimed;
++}
++
++static void
++cs_native4k_release(vnode_t vp)
++{
++	lck_mtx_lock(&cs_native4k_lock);
++	for (unsigned i = 0; i < 8; i++) {
++		if (cs_native4k_preparing[i] == vp) {
++			cs_native4k_preparing[i] = NULL;
++		}
++	}
++	lck_mtx_unlock(&cs_native4k_lock);
++	wakeup((caddr_t)cs_native4k_preparing);
++}
++
++/* A published blob of vp with this code directory (same cdhash, hash type and offset) holds the native hashes of the same
++ * verified bytes: copy them into blob, read-only as cs_native4k_prepare leaves its own. False when there is none. */
++static bool
++cs_native4k_reuse(vnode_t vp, struct cs_blob *blob)
++{
++	vm_offset_t storage = 0;
++	vm_size_t size = 0, count = 0;
++	bool copied = false;
++
++	for (int pass = 0; pass < 2 && !copied; pass++) {
++		vnode_lock(vp);
++		for (struct cs_blob *other = UBCINFOEXISTS(vp) ? ubc_get_cs_blobs(vp) : NULL; other != NULL; other = other->csb_next) {
++			if (other->csb_native4k_hashes == NULL || other->csb_hashtype != blob->csb_hashtype ||
++			    other->csb_base_offset != blob->csb_base_offset ||
++			    bcmp(other->csb_cdhash, blob->csb_cdhash, CS_CDHASH_LEN)) {
++				continue;
++			}
++			if (pass == 1 && other->csb_native4k_hashes_size == size && other->csb_native4k_hash_count == count) {
++				memcpy((void *)storage, other->csb_native4k_hashes, size);
++				copied = true;
++			}
++			size = other->csb_native4k_hashes_size;
++			count = other->csb_native4k_hash_count;
++			break;
++		}
++		vnode_unlock(vp);
++		if (pass == 0) {
++			if (size == 0 || kmem_alloc(kernel_map, &storage, size, KMA_KOBJECT | KMA_DATA,
++			    VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS) {
++				return false;
++			}
++		}
++	}
++	if (!copied || mach_vm_protect(kernel_map, storage, size, FALSE, VM_PROT_READ) != KERN_SUCCESS) {
++		kmem_free(kernel_map, storage, size);
++		return false;
++	}
++	blob->csb_native4k_hashes = (const uint8_t *)storage;
++	blob->csb_native4k_hashes_size = size;
++	blob->csb_native4k_hash_count = count;
++	os_atomic_inc(&cs_native4k_reused_blobs, relaxed);
++	return true;
++}
++#endif
++
+ int
+ ubc_cs_blob_add(
+ 	struct vnode    *vp,
+@@ -4772,6 +4870,9 @@
+ 	boolean_t record_mtime = false;
+ 	kern_return_t kr = KERN_DENIED;
+ 	errno_t error = -1;
++#if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
++	bool native4k_claimed = false;
++#endif
+ 
+ #if HAS_APPLE_PAC
+ 	void *signed_entitlements = NULL;
+@@ -4983,9 +5084,14 @@
+ 
+ #if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
+ 	/* Authenticate before publishing the signed object or taking its locks. */
+-	error = cs_native4k_prepare(vp, &tmp_blob);
+-	if (error != 0) {
+-		goto out;
++	if (tmp_blob.csb_hash_pageshift > PAGE_SHIFT) {
++		native4k_claimed = cs_native4k_claim(vp);
++		if (!cs_native4k_reuse(vp, &tmp_blob)) {
++			error = cs_native4k_prepare(vp, &tmp_blob);
++			if (error != 0) {
++				goto out;
++			}
++		}
+ 	}
+ #endif
+ 
+@@ -5203,6 +5309,12 @@
+ 		 */
+ 		error = 0;
+ 	}
++#if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
++	/* Published (or not) now: another add of this file may look. */
++	if (native4k_claimed) {
++		cs_native4k_release(vp);
++	}
++#endif
+ 
+ 	return error;
+ }
