@@ -57,14 +57,17 @@ def fetch(path, out, total):
 
 def time_references(archive):
     """(oldest, end) time references of the archive's timesync files: a boot record (0xbbb0: boot UUID, timebase, boot wall time
-    in ns) and its sync records ('Ts': continuous time in ticks, wall time in ns), in the order logd wrote them."""
-    references = []
+    in ns) and its sync records ('Ts': continuous time in ticks, wall time in ns), in the order logd wrote them. The end is the last
+    record carried a day forward on its boot's timebase: `log show` stops at the archive's end, and logd writes a sync record only now
+    and then (one boot showed nothing after its first two minutes)."""
+    references, timebase = [], (1, 1)
     for path in sorted((archive / 'timesync').glob('*.timesync')):
         data, at, boot = path.read_bytes(), 0, None
         while at + 4 <= len(data):
             if struct.unpack_from('<H', data, at)[0] == 0xbbb0:
                 size = struct.unpack_from('<H', data, at + 2)[0]
                 boot = str(uuid.UUID(bytes=data[at + 8:at + 24])).upper()
+                timebase = struct.unpack_from('<II', data, at + 24)
                 references.append({'UUID': boot, 'ContinuousTime': 0, 'WallTime': struct.unpack_from('<q', data, at + 32)[0]})
                 at += size
             elif data[at:at + 4] == b'Ts \0' and boot:
@@ -75,7 +78,11 @@ def time_references(archive):
                 break
     if not references:
         raise SystemExit(f'{archive}: no timesync records')
-    return references[0], references[-1]
+    day, (numer, denom) = 86400 * 10**9, timebase
+    end = dict(references[-1])
+    end['ContinuousTime'] += day * denom // max(numer, 1)
+    end['WallTime'] += day
+    return references[0], end
 
 
 def main():
