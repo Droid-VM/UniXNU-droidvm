@@ -66,8 +66,10 @@ def main():
     if '--raw' in sys.argv:
         print(text)
         return 1
-    found = re.search(r'Kernel text base:\s+0x([0-9a-f]+)', text)
-    slide = int(found[1], 16) - UNSLID_TEXT if found else 0
+    # A fileset kernel (iPadOS 27) is named at its fileset addresses (fileset-syms.py), slid by the KernelCache slide; the kernel
+    # alone by its text base.
+    found = re.search(r'KernelCache slide:\s+0x([0-9a-f]+)', text) or re.search(r'Kernel text base:\s+0x([0-9a-f]+)', text)
+    slide = (int(found[1], 16) - (0 if found[0].startswith('KernelCache') else UNSLID_TEXT)) if found else 0
     name = symbolizer()
     for line in text.splitlines():
         addresses = [int(a, 16) for a in re.findall(r'0x(fffffff[0-9a-f]{9})', line)]
