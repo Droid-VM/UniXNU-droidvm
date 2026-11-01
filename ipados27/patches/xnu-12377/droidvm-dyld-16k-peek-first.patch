@@ -1,0 +1,69 @@
+diff --git a/osfmk/vm/vm_dyld_pager.c b/osfmk/vm/vm_dyld_pager.c
+--- a/osfmk/vm/vm_dyld_pager.c
++++ b/osfmk/vm/vm_dyld_pager.c
+@@ -1183,6 +1183,33 @@
+ 		}
+ 
+ 		/*
++		 * DroidVM: a 16 KiB fixup page on a 4 KiB kernel needs the page's siblings too. Read them
++		 * first, holding no page of the source: peeked while this page's source page and its
++		 * placeholder in the backing object were held, two threads faulting two parts of one fixup
++		 * page each held its part and slept on the other's, for good (locationd's workers, woken
++		 * together by a render server's death, then every thread that touched those pages).
++		 */
++		if (mwli_page_size > PAGE_SIZE) {
++			vm_object_offset_t page_off = offset + cur_offset;
++			vm_object_offset_t base_off = page_off & ~(vm_object_offset_t)(mwli_page_size - 1);
++			uint32_t part = (uint32_t)((page_off - base_off) / PAGE_SIZE);
++			for (i = 0; i < mwli_page_size / PAGE_SIZE; ++i) {
++				if (i == part) {
++					continue;
++				}
++				kr = dyld_pager_peek(src_top_object, base_off + (vm_object_offset_t)i * PAGE_SIZE,
++				    (char *)fixup_buffer + (vm_offset_t)i * PAGE_SIZE, &fault_info);
++				if (kr != KERN_SUCCESS) {
++					retval = kr;
++					break;
++				}
++			}
++			if (retval != KERN_SUCCESS) {
++				break;
++			}
++		}
++
++		/*
+ 		 * Map the source page in the kernel's virtual address space.
+ 		 * We already hold a reference on the src_top_object.
+ 		 */
+@@ -1330,26 +1357,12 @@
+ 			uint32_t part = (uint32_t)((page_off - base_off) / PAGE_SIZE);
+ 			uint64_t base_userVA = userVA - (uint64_t)(page_off - base_off);
+ 
+-			/* The current page's source is already faulted and still mapped; fill the rest by peeking. */
++			/* The siblings were peeked before this page's source was faulted (above); add the page itself. */
+ 			bcopy((const char *)src_vaddr, (char *)fixup_buffer + (vm_offset_t)part * PAGE_SIZE, PAGE_SIZE);
+-			retval = KERN_SUCCESS;
+-			for (i = 0; i < mwli_page_size / PAGE_SIZE; ++i) {
+-				if (i == part) {
+-					continue;
+-				}
+-				kr = dyld_pager_peek(src_top_object, base_off + (vm_object_offset_t)i * PAGE_SIZE,
+-				    (char *)fixup_buffer + (vm_offset_t)i * PAGE_SIZE, &fault_info);
+-				if (kr != KERN_SUCCESS) {
+-					retval = kr;
+-					break;
+-				}
+-			}
+-			if (retval == KERN_SUCCESS) {
+-				if (fixup_page((vm_offset_t)fixup_buffer, base_userVA, pager) != KERN_SUCCESS) {
+-					retval = KERN_FAILURE;
+-				} else {
+-					bcopy((const char *)fixup_buffer + (vm_offset_t)part * PAGE_SIZE, (char *)dst_vaddr, PAGE_SIZE);
+-				}
++			if (fixup_page((vm_offset_t)fixup_buffer, base_userVA, pager) != KERN_SUCCESS) {
++				retval = KERN_FAILURE;
++			} else {
++				bcopy((const char *)fixup_buffer + (vm_offset_t)part * PAGE_SIZE, (char *)dst_vaddr, PAGE_SIZE);
+ 			}
+ 		} else if (fixup_page(dst_vaddr, userVA, pager) != KERN_SUCCESS) {
+ 			/* KDBG / printf was done under fixup_page() */
