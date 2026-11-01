@@ -1,0 +1,66 @@
+diff --git a/osfmk/vm/vm_pageout.c b/osfmk/vm/vm_pageout.c
+--- a/osfmk/vm/vm_pageout.c
++++ b/osfmk/vm/vm_pageout.c
+@@ -10743,6 +10743,22 @@
+ 
+ #if VM_PRESSURE_EVENTS
+ /*
++ * DroidVM: with the compressor active the levels followed only how much of the pageable memory
++ * was compressed, and none of a guest's GPU memory is pageable: every GPU allocation is wired
++ * guest memory the host's GPU maps. Wired memory grew to 3.5-4.2 GiB of 5.5 at an iPadOS 27
++ * guest's home screen and while apps opened, the pageable pages left fell to 0.8-1 GiB -- below
++ * the soft threshold (1.25 GiB) -- and the level stayed normal: no process, the render server's
++ * GPU caches and Turnip's BO caches among them, was ever asked to give memory back, until a burst
++ * took the last 1 GiB in 150 ms. The page-shortage thresholds the levels use without a compressor
++ * apply here too.
++ */
++static inline boolean_t
++droidvm_pages_below(uint32_t threshold)
++{
++	return memorystatus_get_available_page_count() < threshold;
++}
++
++/*
+  * Upward trajectory.
+  */
+ 
+@@ -10767,7 +10783,8 @@
+ 		}
+ 		return FALSE;
+ 	} else {
+-		return (AVAILABLE_NON_COMPRESSED_MEMORY < VM_PAGE_COMPRESSOR_COMPACT_THRESHOLD) ? 1 : 0;
++		return (AVAILABLE_NON_COMPRESSED_MEMORY < VM_PAGE_COMPRESSOR_COMPACT_THRESHOLD ||
++		       droidvm_pages_below(memorystatus_get_soft_memlimit_page_shortage_threshold())) ? 1 : 0;
+ 	}
+ }
+ 
+@@ -10779,7 +10796,8 @@
+ 		uint32_t available_pages = memorystatus_get_available_page_count();
+ 		return available_pages < memorystatus_get_critical_page_shortage_threshold();
+ 	} else {
+-		return vm_compressor_low_on_space() || (AVAILABLE_NON_COMPRESSED_MEMORY < ((12 * VM_PAGE_COMPRESSOR_SWAP_UNTHROTTLE_THRESHOLD) / 10)) ? 1 : 0;
++		return vm_compressor_low_on_space() || (AVAILABLE_NON_COMPRESSED_MEMORY < ((12 * VM_PAGE_COMPRESSOR_SWAP_UNTHROTTLE_THRESHOLD) / 10)) ||
++		       droidvm_pages_below(memorystatus_get_critical_page_shortage_threshold()) ? 1 : 0;
+ 	}
+ }
+ 
+@@ -10795,7 +10813,8 @@
+ 		uint32_t target_threshold = (((115 * memorystatus_get_soft_memlimit_page_shortage_threshold()) / 100));
+ 		return available_pages > target_threshold;
+ 	} else {
+-		return (AVAILABLE_NON_COMPRESSED_MEMORY > ((12 * VM_PAGE_COMPRESSOR_COMPACT_THRESHOLD) / 10)) ? 1 : 0;
++		return (AVAILABLE_NON_COMPRESSED_MEMORY > ((12 * VM_PAGE_COMPRESSOR_COMPACT_THRESHOLD) / 10) &&
++		       !droidvm_pages_below((115 * memorystatus_get_soft_memlimit_page_shortage_threshold()) / 100)) ? 1 : 0;
+ 	}
+ }
+ 
+@@ -10807,7 +10826,8 @@
+ 		uint32_t target_threshold = (((115 * memorystatus_get_critical_page_shortage_threshold()) / 100));
+ 		return available_pages > target_threshold;
+ 	} else {
+-		return (AVAILABLE_NON_COMPRESSED_MEMORY > ((14 * VM_PAGE_COMPRESSOR_SWAP_UNTHROTTLE_THRESHOLD) / 10)) ? 1 : 0;
++		return (AVAILABLE_NON_COMPRESSED_MEMORY > ((14 * VM_PAGE_COMPRESSOR_SWAP_UNTHROTTLE_THRESHOLD) / 10) &&
++		       !droidvm_pages_below((115 * memorystatus_get_critical_page_shortage_threshold()) / 100)) ? 1 : 0;
+ 	}
+ }
+ #endif /* VM_PRESSURE_EVENTS */

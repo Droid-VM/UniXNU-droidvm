@@ -12,3 +12,4 @@ non-apple-sigp-recover.patch
 droidvm-amp.patch
 droidvm-sched-trace.patch
 droidvm-native4k-once.patch
+droidvm-pressure-pageable.patch
