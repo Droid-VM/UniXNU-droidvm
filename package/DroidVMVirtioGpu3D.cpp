@@ -11,6 +11,7 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
 extern "C" {
 // stage, status, capset gpu id, context type, pool offset, ccmd ret, ccmd gpu id, capset bytes; then the shmem's seqno and response
 // offset, and the first 32 bytes of the response as they were read
@@ -176,9 +177,9 @@ volatile uint32_t droidvm_virtgpu_chunk_kib = 256;
 volatile uint32_t droidvm_virtgpu_contiguous = 0;
 // 1: a guest blob's pages in the calling process's address space (taskPages), not the kernel's; 0: guestPages, as before.
 volatile uint32_t droidvm_virtgpu_in_task = 1;
-// Blob pages taken (droidvm_virtgpu_task_pages[0], bytes [1]) in the calling process's address space, and how often that failed and
-// guestPages served the blob instead ([2]).
-volatile uint64_t droidvm_virtgpu_task_pages[3];
+// Blob pages taken (droidvm_virtgpu_task_pages[0], bytes [1]) in the calling process's address space, how often that failed and
+// guestPages served the blob instead ([2]), and how often their ownership stayed the process's footprint ([3], taskPages).
+volatile uint64_t droidvm_virtgpu_task_pages[4];
 // Ordinary page allocations for blobs that failed: whole blobs, then 1 MiB pieces (guestPages falls back to the next way).
 volatile uint64_t droidvm_virtgpu_page_failures[2];
 // The render server's fenced submissions, from their EXECBUFFER to the guest seeing the host return them (the host returns a
@@ -518,15 +519,73 @@ IOMemoryDescriptor *guestPages(uint64_t bytes) {
 // with every blob mapped there (guestPages) the clients' 1.8 GB at 2048x2732 (the render server's 1.3 of it) ran the kernel's
 // buffer range out of room -- whole-blob allocations failed with 400 MiB free, then a file pagein could not map its UPL
 // (bindfs_pagein: ubc_upl_map() failed with (3), KERN_NO_SPACE: a panic). Null where that fails; guestPages then serves the blob.
-IOMemoryDescriptor *taskPages(task_t task, uint64_t bytes) {
-    if (!task || task == kernel_task) return nullptr;
+// The pages are the process's graphics memory, outside its footprint (purgeable, owned under the graphics ledger tag with no footprint,
+// as the kernel's pages were before they moved into the process): counted in it, the stack's GPU memory put small daemons over their
+// memory limits -- iconservicesagent held 76 MiB of blobs and jetsam ended it at its 15 MB inactive limit after every icon request,
+// so Settings' row icons never came. They still count as memory in use for the system's pressure levels.
+IOMemoryDescriptor *makeTaskPages(task_t task, uint64_t bytes) {
     IOBufferMemoryDescriptor *pages = IOBufferMemoryDescriptor::inTaskWithOptions(task,
-        IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPageable), bytes, 4096);
+        IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPageable) | IOOptionBits(kIOMemoryPurgeable), bytes, 4096);
     if (!pages) return nullptr;
+    if (pages->setOwnership(task, kIOMemoryLedgerTagGraphics, kIOMemoryLedgerFlagNoFootprint) != kIOReturnSuccess)
+        droidvm_virtgpu_task_pages[3] = droidvm_virtgpu_task_pages[3] + 1;
     if (pages->prepare() != kIOReturnSuccess) { pages->release(); return nullptr; }
     droidvm_virtgpu_task_pages[0] = droidvm_virtgpu_task_pages[0] + 1;
     droidvm_virtgpu_task_pages[1] = droidvm_virtgpu_task_pages[1] + bytes;
     return pages;
+}
+// XNU takes memory out of a task's footprint only for kernel_task or an entitled caller (mach_memory_entry_ownership judges by
+// current_task(), and a blob is made on its client's thread: 2195 of 3033 blobs stayed in the footprint), so one kernel thread makes
+// the pages while the client waits in its call (its task cannot go meanwhile): two thread switches a blob.
+struct PagesRequest {
+    task_t task;
+    uint64_t bytes;
+    IOMemoryDescriptor *pages;
+    bool done;
+    PagesRequest *next;
+};
+IOLock *gPagesLock;
+PagesRequest *gPagesHead, *gPagesTail;
+bool gPagesWorker;
+void pagesWorker(void *, wait_result_t) {
+    IOLockLock(gPagesLock);
+    for (;;) {
+        while (!gPagesHead) IOLockSleep(gPagesLock, &gPagesHead, THREAD_UNINT);
+        PagesRequest *r = gPagesHead;
+        gPagesHead = r->next;
+        if (!gPagesHead) gPagesTail = nullptr;
+        IOLockUnlock(gPagesLock);
+        IOMemoryDescriptor *pages = makeTaskPages(r->task, r->bytes);
+        IOLockLock(gPagesLock);
+        r->pages = pages; r->done = true;
+        IOLockWakeup(gPagesLock, r, true);
+    }
+}
+IOMemoryDescriptor *taskPages(task_t task, uint64_t bytes) {
+    if (!task || task == kernel_task) return nullptr;
+    if (!gPagesLock) {
+        IOLock *made = IOLockAlloc();
+        if (made && !OSCompareAndSwapPtr(nullptr, made, reinterpret_cast<void *volatile *>(&gPagesLock))) IOLockFree(made);
+        if (!gPagesLock) return makeTaskPages(task, bytes);
+    }
+    IOLockLock(gPagesLock);
+    if (!gPagesWorker) {
+        thread_t thread;
+        if (kernel_thread_start(pagesWorker, nullptr, &thread) != KERN_SUCCESS) {
+            IOLockUnlock(gPagesLock);
+            return makeTaskPages(task, bytes);
+        }
+        thread_deallocate(thread);
+        gPagesWorker = true;
+    }
+    PagesRequest request = {task, bytes, nullptr, false, nullptr};
+    if (gPagesTail) gPagesTail->next = &request;
+    else gPagesHead = &request;
+    gPagesTail = &request;
+    IOLockWakeup(gPagesLock, &gPagesHead, true);
+    while (!request.done) IOLockSleep(gPagesLock, &request, THREAD_UNINT);
+    IOLockUnlock(gPagesLock);
+    return request.pages;
 }
 // A client's own pages for CREATE_BLOB_USER, wired, as NativeAdreno imports them (NativeAdrenoMemory.cpp importRange): through a
 // memory entry of their own (kIOMemoryPersistent), so the owner may unmap its range while the GPU still uses it, and read-only where
