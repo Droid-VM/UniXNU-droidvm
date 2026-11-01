@@ -24,6 +24,8 @@ IOReturn command(const void *, uint32_t, const void *, uint32_t, void *, uint32_
 IOReturn post(const void *, uint32_t, const void *, uint32_t, uint32_t capacity, bool globalFence, uint32_t *ticket);
 bool poll(uint32_t ticket, IOReturn *result, void *reply = nullptr, uint32_t capacity = 0, uint32_t *actual = nullptr);
 IOReturn wait(uint32_t ticket, uint64_t timeoutUs, void *reply = nullptr, uint32_t capacity = 0, uint32_t *actual = nullptr);
+// The response of `ticket` will not be collected: its slot is freed when the device returns it (or at once if it has).
+void abandon(uint32_t ticket);
 uint32_t resourceId();
 IOReturn unref(uint32_t);
 // vgpu-selftest=1: one DRM context through the host's drm2kgsl at boot (DroidVMVirtioGpu3D.cpp).

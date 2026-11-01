@@ -14,6 +14,9 @@ volatile uint64_t droidvm_virtio_gpu_commands, droidvm_virtio_gpu_errors, droidv
 volatile uint32_t droidvm_virtio_gpu_in_flight, droidvm_virtio_gpu_in_flight_peak;
 // Commands that waited 5 s or more for a free slot, and the longest wait (us): a full queue is backpressure, not a failure.
 volatile uint64_t droidvm_virtio_gpu_slot_waits_long, droidvm_virtio_gpu_slot_wait_max_us;
+// Used-ring elements that named no command in flight even when read again (skipped, not fatal): [0] count, [1] the last one's
+// head, [2] its slot's state, [3] the used index it was read at. [4] commands a closed client left behind (abandon()).
+volatile uint64_t droidvm_virtio_gpu_stray[5];
 }
 namespace DroidVMVirtioGpu {
 namespace {
@@ -103,34 +106,50 @@ bool fail(const char *why) { droidvm_virtio_gpu_state = 3; IOLog("virtio-gpu: %s
 void pause(uint64_t begin) { if (nowUs() - begin < 50) IODelay(5); else delay_for_interval(100, NSEC_PER_USEC); }
 // Takes every command the device has returned off the used ring, in whatever order it returned them (a fenced command comes back
 // when its fence signals). Called with the lock held, by whichever thread is waiting.
+// The element is read only after a barrier that follows the index read: ARM reorders loads, and without one a waiter that saw the
+// new index could take the slot's element from the ring's previous lap -- a command long returned, whose slot was free or done.
+// That stopped the transport for good on 2026-11-01 (every later frame refused, the screen frozen) while a burst of clients ended.
+// An element that still names no command in flight is skipped and counted (droidvm_virtio_gpu_stray), not taken as a dead device.
+bool expected(uint32_t head) {
+    return head < QueueSize && !(head & 1) && (slots[head / 2].state == Posted || slots[head / 2].state == Abandoned);
+}
 void reap() {
     auto used = reinterpret_cast<volatile uint16_t *>(queues[0] + UsedOffset);
-    barrier();
     bool any = false;
-    while (used[1] != consumed) {
-        auto element = reinterpret_cast<volatile Used *>(queues[0] + UsedOffset + 4) + consumed % QueueSize;
-        const uint32_t head = element->id, length = element->length;
-        ++consumed; any = true; lastReturnUs = nowUs();
-        if (head >= QueueSize || (head & 1) || (slots[head / 2].state != Posted && slots[head / 2].state != Abandoned)) {
-            fail("the device returned a descriptor no command is waiting on; DMA buffers retained"); return;
+    for (uint16_t end = used[1]; consumed != end; end = used[1]) {
+        barrier();
+        while (consumed != end) {
+            auto element = reinterpret_cast<volatile Used *>(queues[0] + UsedOffset + 4) + consumed % QueueSize;
+            uint32_t head = element->id, length = element->length;
+            if (!expected(head)) { barrier(); head = element->id; length = element->length; }
+            ++consumed; any = true; lastReturnUs = nowUs();
+            if (!expected(head)) {
+                droidvm_virtio_gpu_stray[0] = droidvm_virtio_gpu_stray[0] + 1;
+                droidvm_virtio_gpu_stray[1] = head;
+                droidvm_virtio_gpu_stray[2] = head < QueueSize ? slots[head / 2].state : 0xff;
+                droidvm_virtio_gpu_stray[3] = uint16_t(consumed - 1);
+                IOLog("virtio-gpu: used element %u names descriptor %u, which no command is waiting on (slot state %u); skipped\n",
+                      uint16_t(consumed - 1), head, unsigned(head < QueueSize ? slots[head / 2].state : 0xff));
+                continue;
+            }
+            Slot &slot = slots[head / 2];
+            auto answer = reinterpret_cast<Header *>(slot.response);
+            const bool errorResponse = answer->type >= 0x1200 && answer->type < 0x1300;
+            IOReturn result = kIOReturnSuccess;
+            if (length < sizeof(Header) || length > slot.capacity ||
+                (!errorResponse && slot.fenced && (!(answer->flags & FlagFence) || answer->fence != slot.fence))) result = kIOReturnIOError;
+            else if (answer->type < 0x1100 || answer->type >= 0x1200) result = kIOReturnIOError;
+            slot.result = result; slot.length = length;
+            droidvm_virtio_gpu_last_response = answer->type;
+            droidvm_virtio_gpu_commands = droidvm_virtio_gpu_commands + 1;
+            if (result) {
+                droidvm_virtio_gpu_errors = droidvm_virtio_gpu_errors + 1;
+                IOLog("virtio-gpu: command %x response %x length %u status %x\n", slot.type, answer->type, length, result);
+            }
+            slot.state = slot.state == Abandoned ? Free : Done;
+            if (hugeOwner == head / 2) hugeOwner = Slots;
+            droidvm_virtio_gpu_in_flight = droidvm_virtio_gpu_in_flight - 1;
         }
-        Slot &slot = slots[head / 2];
-        auto answer = reinterpret_cast<Header *>(slot.response);
-        const bool errorResponse = answer->type >= 0x1200 && answer->type < 0x1300;
-        IOReturn result = kIOReturnSuccess;
-        if (length < sizeof(Header) || length > slot.capacity ||
-            (!errorResponse && slot.fenced && (!(answer->flags & FlagFence) || answer->fence != slot.fence))) result = kIOReturnIOError;
-        else if (answer->type < 0x1100 || answer->type >= 0x1200) result = kIOReturnIOError;
-        slot.result = result; slot.length = length;
-        droidvm_virtio_gpu_last_response = answer->type;
-        droidvm_virtio_gpu_commands = droidvm_virtio_gpu_commands + 1;
-        if (result) {
-            droidvm_virtio_gpu_errors = droidvm_virtio_gpu_errors + 1;
-            IOLog("virtio-gpu: command %x response %x length %u status %x\n", slot.type, answer->type, length, result);
-        }
-        slot.state = slot.state == Abandoned ? Free : Done;
-        if (hugeOwner == head / 2) hugeOwner = Slots;
-        droidvm_virtio_gpu_in_flight = droidvm_virtio_gpu_in_flight - 1;
     }
     if (any) { uint32_t interrupts = rd(0x60) & 3; if (interrupts) wr(0x64, interrupts); }
 }
@@ -298,6 +317,21 @@ bool poll(uint32_t ticket, IOReturn *result, void *reply, uint32_t capacity, uin
     slot.state = Free;
     IOLockUnlock(lock);
     return true;
+}
+// A command whose response nobody will collect (its client closed before it returned): its slot goes back to the queue when the
+// device returns it, or now if it has. Without this every ticket a dying client left behind held its slot for good.
+void abandon(uint32_t ticket) {
+    const uint32_t s = ticket & 0xff;
+    if (s >= Slots || !lock) return;
+    IOLockLock(lock);
+    reap();
+    Slot &slot = slots[s];
+    if (slot.generation == ticket >> 8) {
+        if (slot.state == Posted) slot.state = Abandoned;
+        else if (slot.state == Done) slot.state = Free;
+        droidvm_virtio_gpu_stray[4] = droidvm_virtio_gpu_stray[4] + 1;
+    }
+    IOLockUnlock(lock);
 }
 IOReturn wait(uint32_t ticket, uint64_t timeoutUs, void *reply, uint32_t capacity, uint32_t *actual) {
     const uint64_t begin = nowUs();

@@ -961,6 +961,9 @@ extern "C" void droidvm_virtgpu_close(void *connection) {
     IOLockLock(c->lock);
     drain(c, 5000000);
     if (c->pendingCount) droidvm_virtgpu_closes[3] = droidvm_virtgpu_closes[3] + 1;
+    // Submissions still in flight: nobody will collect them; their slots return to the queue as the device returns them.
+    for (uint32_t i = 0; i < c->pendingCount; ++i) abandon(c->pending[i].ticket);
+    c->pendingCount = 0;
     for (uint32_t i = 0; i < c->resourceCount; ++i) releaseResource(c, c->resources[i]);
     if (c->resources) IODelete(c->resources, Resource, c->resourceCapacity);
     for (uint32_t i = 0; i < c->closedCount; ++i) releaseResource(c, c->closed[i].resource);
