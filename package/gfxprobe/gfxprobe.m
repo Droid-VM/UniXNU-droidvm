@@ -1086,6 +1086,146 @@ static bool tessInside(const float (*corner)[2], int corners, int x, int y, int 
     }
     return true;
 }
+// pitchcheck W H PITCH: a BGRA8 texture over a no-copy buffer whose rows lie PITCH bytes apart -- the app switcher's 610x814
+// snapshot thumbnails come to the render server at 2448-byte rows, which no Adreno linear image lays (its rows are 64-byte
+// aligned), so the runtime gives the texture a shadow image. Read back through a blit and through a render pass that samples
+// it, three times, the CPU rewriting the buffer's texels before the second and the third: every texel must come back.
+static const char *kPitchSource =
+    "#include <metal_stdlib>\nusing namespace metal;\n"
+    "struct V { float4 p [[position]]; float2 uv; };\n"
+    "vertex V pitch_vertex(uint i [[vertex_id]]) { float2 c = float2((i << 1) & 2, i & 2); V v; v.p = float4(c * 2 - 1, 0, 1);"
+    " v.uv = float2(c.x, 1 - c.y); return v; }\n"
+    "fragment float4 pitch_fragment(V v [[stage_in]], texture2d<float> t [[texture(0)]]) {"
+    " constexpr sampler s(filter::nearest); return t.sample(s, v.uv); }\n";
+
+static uint32_t pitchTexel(unsigned x, unsigned y, unsigned round) {
+    // BGRA in memory: blue x, green y (varied by the round), red the high bits of both, alpha opaque.
+    const uint32_t b = x & 0xff, g = (y & 0xff) ^ (round * 0x55), r = ((x >> 8) & 0xf) | (((y >> 8) & 0xf) << 4);
+    return b | g << 8 | r << 16 | 0xffu << 24;
+}
+
+static int pitchCheck(unsigned w, unsigned h, unsigned pitch) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device || pitch < w * 4) { printf("pitch: no device or a pitch below the row\n"); return 1; }
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:@(kPitchSource) options:nil error:&error];
+    if (!library) { printf("pitch: no library: %s\n", error.description.UTF8String); return 1; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [library newFunctionWithName:@"pitch_vertex"];
+    pd.fragmentFunction = [library newFunctionWithName:@"pitch_fragment"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+    if (!state) { printf("pitch: no pipeline: %s\n", error.description.UTF8String); return 1; }
+    const size_t page = (size_t)getpagesize(), length = ((size_t)pitch * h + page - 1) / page * page;
+    uint8_t *memory = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (memory == MAP_FAILED) { printf("pitch: no memory\n"); return 1; }
+    id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:memory length:length options:MTLResourceStorageModeShared deallocator:nil];
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> texture = buffer ? [buffer newTextureWithDescriptor:td offset:0 bytesPerRow:pitch] : nil;
+    if (!texture) { printf("pitch: no texture over the buffer (%ux%u, rows of %u bytes)\n", w, h, pitch); return 1; }
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> copied = [device newTextureWithDescriptor:td], drawn = [device newTextureWithDescriptor:td];
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    uint32_t *texels = malloc((size_t)w * h * 4);
+    int failures = 0;
+    for (unsigned round = 0; round < 3; ++round) {
+        for (unsigned y = 0; y < h; ++y)
+            for (unsigned x = 0; x < w; ++x) ((uint32_t *)(memory + (size_t)y * pitch))[x] = pitchTexel(x, y, round);
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                    toTexture:copied destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = drawn; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 1, 1, 1); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:state];
+        [enc setFragmentTexture:texture atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.error) { printf("pitch round %u: command buffer: %s\n", round, cb.error.description.UTF8String); ++failures; continue; }
+        const char *names[2] = {"blit", "render"};
+        id<MTLTexture> results[2] = {copied, drawn};
+        for (int k = 0; k < 2; ++k) {
+            [results[k] getBytes:texels bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+            unsigned wrong = 0, white = 0, zero = 0, stale = 0, firstX = 0, firstY = 0;
+            for (unsigned y = 0; y < h; ++y)
+                for (unsigned x = 0; x < w; ++x) {
+                    const uint32_t got = texels[(size_t)y * w + x];
+                    if (got == pitchTexel(x, y, round)) continue;
+                    if (!wrong) { firstX = x; firstY = y; }
+                    ++wrong; white += got == 0xffffffffu; zero += got == 0;
+                    stale += round && got == pitchTexel(x, y, round - 1);
+                }
+            printf("pitch %ux%u rows %u round %u %s: %u wrong (white %u, zero %u, earlier round %u)", w, h, pitch, round, names[k], wrong,
+                   white, zero, stale);
+            if (wrong) printf("; first at %u,%u: %08x, want %08x", firstX, firstY, texels[(size_t)firstY * w + firstX],
+                              pitchTexel(firstX, firstY, round));
+            printf("\n");
+            failures += wrong != 0;
+        }
+    }
+    free(texels);
+    return failures ? 1 : 0;
+}
+
+// ktxdecode PATH: decode an image file (a SplashBoard snapshot's .ktx, ASTC 4x4) through ImageIO into a BGRA8 bitmap and count its
+// colours -- the app switcher showed white cards for snapshots whose ASTC blocks held the apps' dark screens. A process without a
+// Metal device (SpringBoard here) and one with it decode alike only if ImageIO's ASTC decoder needs no GPU.
+static int ktxDecode(const char *path) {
+    void *imageio = dlopen("/System/Library/Frameworks/ImageIO.framework/ImageIO", RTLD_NOW);
+    typedef CFTypeRef (*CreateSource)(CFURLRef, CFDictionaryRef);
+    typedef CGImageRef (*CreateImage)(CFTypeRef, size_t, CFDictionaryRef);
+    typedef CFStringRef (*GetType)(CFTypeRef);
+    typedef size_t (*GetCount)(CFTypeRef);
+    typedef int (*GetStatus)(CFTypeRef);
+    typedef CFArrayRef (*CopyTypes)(void);
+    CreateSource createSource = imageio ? (CreateSource)dlsym(imageio, "CGImageSourceCreateWithURL") : NULL;
+    CreateImage createImage = imageio ? (CreateImage)dlsym(imageio, "CGImageSourceCreateImageAtIndex") : NULL;
+    GetType getType = imageio ? (GetType)dlsym(imageio, "CGImageSourceGetType") : NULL;
+    GetCount getCount = imageio ? (GetCount)dlsym(imageio, "CGImageSourceGetCount") : NULL;
+    GetStatus getStatus = imageio ? (GetStatus)dlsym(imageio, "CGImageSourceGetStatus") : NULL;
+    CopyTypes copyTypes = imageio ? (CopyTypes)dlsym(imageio, "CGImageSourceCopyTypeIdentifiers") : NULL;
+    if (!createSource || !createImage || !getType || !getCount || !getStatus || !copyTypes) { printf("ktx: no ImageIO\n"); return 1; }
+    printf("ktx: Metal device %s\n", MTLCreateSystemDefaultDevice() ? "present" : "absent");
+    CFArrayRef types = copyTypes();
+    printf("ktx: ImageIO reads com.apple.atx: %s\n",
+           types && CFArrayContainsValue(types, CFRangeMake(0, CFArrayGetCount(types)), CFSTR("com.apple.atx")) ? "yes" : "no");
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), false);
+    CGImageRef image = NULL;
+    for (int hinted = 0; hinted < 2 && !image; ++hinted) {
+        const void *keys[1] = {CFSTR("kCGImageSourceTypeIdentifierHint")}, *values[1] = {CFSTR("com.apple.atx")};
+        CFDictionaryRef options = hinted ? CFDictionaryCreate(NULL, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+                                                              &kCFTypeDictionaryValueCallBacks) : NULL;
+        CFTypeRef source = createSource(url, options);
+        CFStringRef type = source ? getType(source) : NULL;
+        printf("ktx: %s source: type %s, %zu images, status %d\n", hinted ? "hinted" : "plain",
+               type ? CFStringGetCStringPtr(type, kCFStringEncodingUTF8) : "(none)", source ? getCount(source) : 0,
+               source ? getStatus(source) : -99);
+        image = source ? createImage(source, 0, options) : NULL;
+    }
+    if (!image) { printf("ktx: %s: no image\n", path); return 1; }
+    const size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+    printf("ktx: %zux%zu, %zu bits a pixel, %zu a component, bitmap info %#x\n", w, h, CGImageGetBitsPerPixel(image),
+           CGImageGetBitsPerComponent(image), (unsigned)CGImageGetBitmapInfo(image));
+    uint32_t *texels = calloc(w * h, 4);
+    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef context = CGBitmapContextCreate(texels, w, h, 8, w * 4, space,
+                                                 (CGBitmapInfo)(kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little));
+    CGContextDrawImage(context, CGRectMake(0, 0, w, h), image);
+    unsigned white = 0, black = 0, clear = 0, other = 0;
+    for (size_t i = 0; i < w * h; ++i) {
+        const uint32_t v = texels[i];
+        if (v == 0xffffffffu) ++white; else if (v == 0xff000000u) ++black; else if (!(v >> 24)) ++clear; else ++other;
+    }
+    printf("ktx: white %u, black %u, transparent %u, other %u; centre %08x\n", white, black, clear, other, texels[(h / 2) * w + w / 2]);
+    return 0;
+}
+
 static int tessCheck(void) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     NSError *error = nil;
@@ -2279,6 +2419,10 @@ int main(int argc, char **argv) {
             return memoryIdle(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0));
         if (argc >= 4 && !strcmp(argv[1], "memcheck"))
             return memoryCheck(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+        if (argc >= 3 && !strcmp(argv[1], "ktxdecode"))
+            return ktxDecode(argv[2]);
+        if (argc >= 5 && !strcmp(argv[1], "pitchcheck"))
+            return pitchCheck((unsigned)strtoul(argv[2], NULL, 0), (unsigned)strtoul(argv[3], NULL, 0), (unsigned)strtoul(argv[4], NULL, 0));
         if (argc >= 4 && !strcmp(argv[1], "msl"))
             return compileMetal(argv[2], argv[3], argc >= 5 ? argv[4] : "-std=metal3.1 --driver-mode=metal -x metal");
         if (argc < 5) {
