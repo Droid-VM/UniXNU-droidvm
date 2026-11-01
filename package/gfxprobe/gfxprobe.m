@@ -1173,6 +1173,57 @@ static int pitchCheck(unsigned w, unsigned h, unsigned pitch) {
     return failures ? 1 : 0;
 }
 
+// spuopen: the motion devices (AppleSPUHIDDevice, DroidVMMotionHid.inc), and on the one that names the sensor processor's plug-in (the device orientation)
+// each step CoreMotion's orientation notifier takes: IOServiceOpen with AppleSPULib's type 'ashd', its Open (selector 4), and
+// IOCreatePlugInInterfaceForService with AppleSPULib's plug-in type. The kern_return_t of each.
+extern kern_return_t IOConnectCallMethod(io_object_t connection, uint32_t selector, const uint64_t *input, uint32_t inputCount,
+                                         const void *inputStruct, size_t inputStructCnt, uint64_t *output, uint32_t *outputCnt,
+                                         void *outputStruct, size_t *outputStructCnt);
+extern kern_return_t IOCreatePlugInInterfaceForService(io_object_t service, CFUUIDRef pluginType, CFUUIDRef interfaceType,
+                                                       void ***theInterface, int32_t *theScore);
+static int spuOpen(void) {
+    io_object_t iterator = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AppleSPUHIDDevice"), &iterator) != KERN_SUCCESS) {
+        printf("no AppleSPUHIDDevice\n");
+        return 1;
+    }
+    CFUUIDRef type = CFUUIDGetConstantUUIDWithBytes(NULL, 0x7a, 0xcf, 0x53, 0x32, 0x1a, 0x35, 0x48, 0x93, 0x87, 0xcb, 0xba, 0x64, 0xe1, 0x88,
+                                                    0x7f, 0xae);
+    CFUUIDRef plugin = CFUUIDGetConstantUUIDWithBytes(NULL, 0xc2, 0x44, 0xe8, 0x58, 0x10, 0x9c, 0x11, 0xd4, 0x91, 0xd4, 0x00, 0x50, 0xe4,
+                                                      0xc6, 0x42, 0x6f);
+    io_object_t service;
+    while ((service = IOIteratorNext(iterator))) {
+        CFTypeRef product = IORegistryEntryCreateCFProperty(service, CFSTR("Product"), NULL, 0);
+        CFTypeRef types = IORegistryEntryCreateCFProperty(service, CFSTR("IOCFPlugInTypes"), NULL, 0);
+        char name[128] = "?";
+        if (product && CFGetTypeID(product) == CFStringGetTypeID()) CFStringGetCString((CFStringRef)product, name, sizeof name, kCFStringEncodingUTF8);
+        printf("%s: IOCFPlugInTypes %s\n", name, types ? "yes" : "no");
+        if (types) {
+            io_object_t connect = 0;
+            kern_return_t kr = IOServiceOpen(service, mach_task_self(), 0x61736864, &connect);
+            printf("  IOServiceOpen 'ashd' %#x\n", kr);
+            if (kr == KERN_SUCCESS) {
+                printf("  selector 4 (Open) %#x\n", IOConnectCallMethod(connect, 4, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL));
+                uint64_t command = 0x20;
+                uint8_t config[8] = {0}, reply[64];
+                size_t replySize = sizeof reply;
+                printf("  selector 6 (SendCommand) %#x, reply %zu bytes\n",
+                       IOConnectCallMethod(connect, 6, &command, 1, config, sizeof config, NULL, NULL, reply, &replySize), replySize);
+                IOServiceClose(connect);
+            }
+            void **interface = NULL;
+            int32_t score = 0;
+            kr = IOCreatePlugInInterfaceForService(service, type, plugin, &interface, &score);
+            printf("  IOCreatePlugInInterfaceForService %#x\n", kr);
+            CFRelease(types);
+        }
+        if (product) CFRelease(product);
+        IOObjectRelease(service);
+    }
+    IOObjectRelease(iterator);
+    return 0;
+}
+
 // ktxdecode PATH: decode an image file (a SplashBoard snapshot's .ktx, ASTC 4x4) through ImageIO into a BGRA8 bitmap and count its
 // colours -- the app switcher showed white cards for snapshots whose ASTC blocks held the apps' dark screens. A process without a
 // Metal device (SpringBoard here) and one with it decode alike only if ImageIO's ASTC decoder needs no GPU.
@@ -2419,6 +2470,8 @@ int main(int argc, char **argv) {
             return memoryIdle(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0));
         if (argc >= 4 && !strcmp(argv[1], "memcheck"))
             return memoryCheck(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+        if (argc >= 2 && !strcmp(argv[1], "spuopen"))
+            return spuOpen();
         if (argc >= 3 && !strcmp(argv[1], "ktxdecode"))
             return ktxDecode(argv[2]);
         if (argc >= 5 && !strcmp(argv[1], "pitchcheck"))
