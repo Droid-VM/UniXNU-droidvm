@@ -1,0 +1,32 @@
+--- a/NativeVirtioBlock.cpp
++++ b/NativeVirtioBlock.cpp
+@@ -534,13 +534,17 @@
+   return true;
+ }
+ 
+-// Waits for slot s, the gate held on entry and return and dropped while waiting: a few short spins (the host often answers
+-// from its page cache within tens of microseconds), then 20 us sleeps. Any reader collects for every slot.
++// Waits for slot s, the gate held on entry and return and dropped while waiting: it looks every 2 us for the first 150 us of
++// the request (a 4 KB read is back in ~80 us; with 32 us of spinning the waiter was mostly asleep when it came back, and woke
++// a timer tick later), then sleeps 20 us at a time so a slow host does not keep a vCPU spinning. Any reader collects for every
++// slot.
+ IOReturn NativeVirtioBlock::waitSlot(unsigned s)
+ {
++  static uint64_t spinTicks;
++  if (!spinTicks) nanoseconds_to_absolutetime(150 * NSEC_PER_USEC, &spinTicks);
+   uint64_t deadline;
+   clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
+-  for (unsigned round = 0;; ++round) {
++  for (;;) {
+     if (!online) return kIOReturnNotReady;
+     if (!collect()) {
+       reset();
+@@ -554,7 +558,7 @@
+       return kIOReturnTimeout;
+     }
+     IOLockUnlock(gate);
+-    IODelay(round < 16 ? 2 : 20);
++    IODelay(mach_absolute_time() - slotPosted[s] < spinTicks ? 2 : 20);
+     IOLockLock(gate);
+   }
+   __atomic_fetch_add(&native_virtio_time[0], mach_absolute_time() - slotPosted[s], __ATOMIC_RELAXED);

@@ -1,0 +1,13 @@
+--- a/NativeVirtioBlock.cpp
++++ b/NativeVirtioBlock.cpp
+@@ -78,7 +78,9 @@
+ constexpr unsigned slotCount = 16;
+ constexpr unsigned batchLimit = 8;      // chunks of one read out at once, leaving slots to other readers
+ constexpr unsigned availableOffset = 1024, usedOffset = 2048, requestOffset = 3072, statusOffset = 3584;
+-constexpr unsigned transferSize = 65536;
++// A request's buffer: 256 KB of data and, verified, one hash block more for the alignment padding. At 64 KB a cold read
++// paid a device round trip (~0.1-0.5 ms) every 60 KB.
++constexpr unsigned transferSize = 262144 + 4096;
+ struct Descriptor { uint64_t address; uint32_t length; uint16_t flags; uint16_t next; };
+ struct Request { uint32_t operation; uint32_t reserved; uint64_t sector; };
+ struct Used { uint32_t id; uint32_t length; };
