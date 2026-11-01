@@ -38,7 +38,8 @@
 // only under /private/var/ngpu/; kind 6 lists a whole tree as kind 1 lists a directory, "<d_type> <size> <path below
 // <path>>\n" lines depth-first (a regular file's size, 0 for anything else), from entry offset (total = entries listed):
 // one request where kind 1 and a size read per file took thousands, for the unified log's uuidtext; kind 7 reads a stackshot
-// (droidvm_export_stackshot) from offset (total = its size).
+// (droidvm_export_stackshot) from offset (total = its size); kind 8 describes the vm_page at address `offset`, given as a
+// stackshot's PageBusy wait context (permuted by vm_kernel_addrperm) when `length` is 1 (DroidVMPageInfo.c; length = bytes).
 struct droidvm_export {
 	volatile uint32_t request, done;
 	uint32_t kind;
@@ -329,6 +330,8 @@ static int droidvm_export_stackshot(const char *path, uint64_t offset, uint64_t 
 	return 0;
 }
 
+extern size_t droidvm_page_info(uint64_t address, bool permuted, char *out, size_t size);
+
 void droidvm_export_poll(void) {
 	if (!droidvm_export_buffer()) return;
 	uint32_t request = __atomic_load_n(&droidvm_export_box.request, __ATOMIC_ACQUIRE);
@@ -359,6 +362,11 @@ void droidvm_export_poll(void) {
 		status = 0;
 	} else if (droidvm_export_box.kind == 7) {
 		status = droidvm_export_stackshot(path, droidvm_export_box.offset, &length, &total);
+	} else if (droidvm_export_box.kind == 8) {
+		length = droidvm_page_info(droidvm_export_box.offset, droidvm_export_box.length == 1, (char *)droidvm_export_data,
+		    DROIDVM_EXPORT_BYTES);
+		total = length;
+		status = 0;
 	} else if (droidvm_export_box.kind == 5) {
 		status = droidvm_export_write(path, droidvm_export_box.offset, droidvm_export_box.length, droidvm_export_box.total);
 		length = status ? 0 : droidvm_export_box.length;

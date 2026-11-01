@@ -492,6 +492,9 @@ compile_c(bootargs_source, OUT / 'DroidVMBootArgs27.o', 'bsd/DEVELOPMENT/kern_ex
 export_source = ROOT / 'kits/droidvm/DroidVMFileExport.c'
 compile_c(export_source, OUT / 'DroidVMFileExport.o', 'bsd/DEVELOPMENT/kern_exec.o.json',
           ('-DDROIDVM_EXPORT_DYNAMIC=1', '-DDROIDVM_EXPORT_BYTES=(4u<<20)'))
+# The mailbox's description of one vm_page (kind 8), with the VM's own flags: its object, pager and file.
+page_info_source = ROOT / 'kits/droidvm/DroidVMPageInfo.c'
+compile_c(page_info_source, OUT / 'DroidVMPageInfo.o', 'osfmk/DEVELOPMENT/vm_dyld_pager.o.json')
 # The virtio GPU (kits/droidvm/DroidVMVirtioGpu*.cpp: transport, the 3D methods over the host's DRM context, and the display the
 # probe offers frames to) and NativeAdreno's face for Metal over it (scripts/build-droidvm-gpu.py, an earlier archive step), as the
 # iPadOS 17 board's display archive takes them. The 3D methods' ABI (DroidVMVirtgpuABI.h) is NativeAdreno's.
@@ -527,13 +530,13 @@ archive = OUT / 'libNativeLegacyDisplay.late.a'
 archive.unlink(missing_ok=True)
 run(['xcrun', 'ar', 'rcs', archive, late, OUT / 'original-bindings.o', OUT / 'original-addresses.o', OUT / 'LegacyDisplayProbe.o',
      OUT / 'LegacyDisplaySupport27.o', gop_late, OUT / 'KeyStoreProbe.o', keyevents_late, OUT / 'DroidVMMonitor27.o',
-     OUT / 'DroidVMFileExport.o', OUT / 'DroidVMClock.o', OUT / 'DroidVMLaunchPolicy.o', OUT / 'DroidVMBootArgs27.o',
+     OUT / 'DroidVMFileExport.o', OUT / 'DroidVMPageInfo.o', OUT / 'DroidVMClock.o', OUT / 'DroidVMLaunchPolicy.o', OUT / 'DroidVMBootArgs27.o',
      *virtio_gpu_objects, *gpu_objects, *hid_objects, *device_objects])
 sources = [ROOT / 'drivers/GopFramebuffer/NativeLegacyDisplay.cpp', ROOT / 'drivers/GopFramebuffer/NativeLegacyRequest.h',
            ROOT / 'drivers/GopFramebuffer/NativeGOPPresenter.cpp', ROOT / 'drivers/GopFramebuffer/NativeGOPWire.h',
            ROOT / 'drivers/GopFramebuffer/NativeHalfCodes.h', source,
            ROOT / 'scripts' / ABI_PATH.name, keystore_source, ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',
-           export_source, clock_source, policy_source, bootargs_source, *virtio_gpu_sources, *gpu_sources, *hid_sources,
+           export_source, page_info_source, clock_source, policy_source, bootargs_source, *virtio_gpu_sources, *gpu_sources, *hid_sources,
            *device_sources]
 (OUT / 'build-report.json').write_text(json.dumps(dict(
     source_sha256={str(p.relative_to(ROOT)): sha(p) for p in sources}, generated_abi_sha256=sha(OUT / 'OriginalLegacyFramebufferABI.h'),
