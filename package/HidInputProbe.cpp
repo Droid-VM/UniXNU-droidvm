@@ -15,6 +15,7 @@ extern "C" IOService *native_hid_input_allocate(void);
 extern "C" IOService *native_hid_touch_allocate(void);
 extern "C" IOService *droidvm_motion_hid_allocate(unsigned kind);
 extern "C" bool droidvm_motion_present(void);
+extern "C" int droidvm_sensor_processor_register(void);
 extern "C" {
 extern kern_return_t OSKextLoadKextWithIdentifier(const char *);
 volatile uint32_t native_hid_stage,native_hid_resource_found;
@@ -194,6 +195,7 @@ void native_hid_input_probe(void) {
                     }
                     // DroidVM: the accelerometer, the gyroscope and the device orientation, as the services locationd and
                     // backboardd look for (DroidVMMotionHid.inc), when the VM has motion sensors (DroidVMVirtioInput.c).
+                    if(started && droidvm_motion_present())droidvm_sensor_processor_register();
                     for(unsigned kind=0;started && kind<3 && droidvm_motion_present();++kind) {
                         IOService *motion=droidvm_motion_hid_allocate(kind);
                         bool motionStarted=motion && motion->metaCast("IOHIDDevice") && motion->init() && motion->attach(resource) && motion->start(resource);

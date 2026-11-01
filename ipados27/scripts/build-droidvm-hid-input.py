@@ -242,7 +242,7 @@ def main():
     for i, (_, d) in enumerate(slots):
         by_diversity.setdefault(d, []).append(i)
     vtables = [n for n, _, k in found if n.startswith('__ZTV') and k != 1 and '9MetaClassE' not in n]
-    require(set(vtables) == {'__ZTV14NativeHidInput', '__ZTV16DroidVMMotionHid'}, f'The owned HID classes: {vtables}')
+    require(set(vtables) == {'__ZTV14NativeHidInput', '__ZTV17AppleSPUHIDDevice'}, f'The owned HID classes: {vtables}')
     # An original method in an owned vtable is bound to the original entry of that slot (a base-class override signs with the
     # discriminator of the introducing IOService declaration, so its own name does not identify the slot); any other import by
     # the slot whose discriminator its name has.

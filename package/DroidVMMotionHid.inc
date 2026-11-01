@@ -35,8 +35,12 @@ enum { DROIDVM_MOTION_ACCELEROMETER, DROIDVM_MOTION_GYROSCOPE, DROIDVM_MOTION_OR
 #define DROIDVM_MOTION_INPUT_REPORT 0
 #endif
 
-class DroidVMMotionHid : public IOHIDDevice {
-    OSDeclareDefaultStructors(DroidVMMotionHid)
+// The class has the name of the iPad's own sensor processor device (AppleSPU.kext's AppleSPUHIDDevice, which the guest's
+// kernelcache does not have): the platform sandbox policy lets SpringBoard open only the services it names ("SpringBoard deny(1)
+// iokit-open-service" for any other), and CoreMotion's orientation notifier in SpringBoard opens the device orientation's
+// (DroidVMSensorProcessor.cpp).
+class AppleSPUHIDDevice : public IOHIDDevice {
+    OSDeclareDefaultStructors(AppleSPUHIDDevice)
     IOWorkLoop *loop = nullptr;
     IOTimerEventSource *timer = nullptr;
     unsigned kind = DROIDVM_MOTION_ACCELEROMETER;
@@ -61,7 +65,7 @@ class DroidVMMotionHid : public IOHIDDevice {
     }
 
     static void tick(OSObject *owner, IOTimerEventSource *source) {
-        DroidVMMotionHid *self = OSDynamicCast(DroidVMMotionHid, owner);
+        AppleSPUHIDDevice *self = OSDynamicCast(AppleSPUHIDDevice, owner);
         if (!self) return;
         // The device sends 50 frames a second; reading at twice that sends each one once.
         source->setTimeoutMS(10);
@@ -143,6 +147,19 @@ public:
         // IOHIDEventDriver's personalities carry HIDDefaultBehavior, and IOHIDFamily's matching wants the device to have it too.
         if (!setProperty("HIDDefaultBehavior", true)) return false;
         setProperty("Built-In", true);
+        // The sensor processor's command channel CoreMotion's orientation notifier opens on this device through AppleSPULib
+        // (DroidVMSensorProcessor.cpp): the plug-in type and the user client IOServiceOpen makes.
+        if (kind == DROIDVM_MOTION_ORIENTATION) {
+            OSDictionary *plugins = OSDictionary::withCapacity(1);
+            OSString *path = OSString::withCString("AppleSPU.kext/PlugIns/AppleSPULib.plugin");
+            if (plugins && path) {
+                plugins->setObject("7ACF5332-1A35-4893-87CB-BA64E1887FAE", path);
+                setProperty("IOCFPlugInTypes", plugins);
+                setProperty("IOUserClientClass", "AppleSPUHIDDeviceUserClient");
+            }
+            OSSafeReleaseNULL(path);
+            OSSafeReleaseNULL(plugins);
+        }
         if (!IOHIDDevice::start(provider)) return false;
         timer = IOTimerEventSource::timerEventSource(this, tick);
         if (!timer || loop->addEventSource(timer) != kIOReturnSuccess) {
@@ -166,11 +183,11 @@ public:
         IOHIDDevice::free();
     }
 };
-OSDefineMetaClassAndStructors(DroidVMMotionHid, IOHIDDevice)
+OSDefineMetaClassAndStructors(AppleSPUHIDDevice, IOHIDDevice)
 #undef DROIDVM_MOTION_VECTOR
 
 extern "C" IOService *droidvm_motion_hid_allocate(unsigned kind) {
-    DroidVMMotionHid *device = new DroidVMMotionHid;
+    AppleSPUHIDDevice *device = new AppleSPUHIDDevice;
     if (device) device->setKind(kind);
     return device;
 }
