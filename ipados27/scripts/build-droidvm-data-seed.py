@@ -6,7 +6,9 @@
 
 As the iPadOS 17 build makes its seed (scripts/build-droidvm-all.py data-base): the IPSW's OS image is attached read-only, the
 fork's prepare-owner-data-fixture.py copies its /private/var into a new 32 MiB APFS volume (whose volume UUID the kernel mounts
-Data by: CONFIG_XNU_OWNER_DATA_VOLUME_UUID), DarwinBoot's packed_ramdisk packs it, seed-data-grow.py makes the container a volatile
+Data by: CONFIG_XNU_OWNER_DATA_VOLUME_UUID) -- case-sensitive and with APFS expanded records, as an iPadOS 27 device's Data is
+(newfs_apfs -e -x; without expanded records APFS refused to mark SplashBoard's compressed app snapshots purgeable, and SplashBoard
+dropped every one, so the app switcher showed blank cards), DarwinBoot's packed_ramdisk packs it, seed-data-grow.py makes the container a volatile
 GIB GiB one, seed-data-skip-setup.py marks Setup done for 24A446, and seed-data-prefs.py adds PREFS. With --plugin, the fork's
 add-gpu-plugin-data.py then stages the Metal plugin (the build directory of build-adreno-metal-plugin.py --target ios27) for the
 render server and the GPU clients, and seed-data-grow.py makes the container STORE_GIB GiB for the persistent Data store
@@ -126,7 +128,8 @@ def main():
     fixture = SCRATCH / 'owner-data-fixture'
     if fixture.exists():
         shutil.rmtree(fixture)
-    run(['python3', root / 'scripts/prepare-owner-data-fixture.py', '--output', fixture, '--launchd-sha256', launchd], cwd=root)
+    run(['python3', root / 'scripts/prepare-owner-data-fixture.py', '--output', fixture, '--launchd-sha256', launchd,
+         '--case-sensitive', '--expanded-records'], cwd=root)
     seed = json.loads((fixture / 'seed.json').read_text())
     work = SCRATCH / 'data'
     if work.exists():
