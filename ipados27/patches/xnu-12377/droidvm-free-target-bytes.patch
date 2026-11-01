@@ -1,0 +1,24 @@
+diff --git a/osfmk/vm/vm_pageout.c b/osfmk/vm/vm_pageout.c
+--- a/osfmk/vm/vm_pageout.c
++++ b/osfmk/vm/vm_pageout.c
+@@ -263,9 +263,17 @@
+ #endif  /* VM_PAGE_FREE_MIN */
+ 
+ #if !XNU_TARGET_OS_OSX
+-#define VM_PAGE_FREE_RESERVED_LIMIT     100
+-#define VM_PAGE_FREE_MIN_LIMIT          1500
+-#define VM_PAGE_FREE_TARGET_LIMIT       2000
++/*
++ * DroidVM: the limits are page counts sized for the 16 KiB pages of the devices this
++ * configuration runs on; a native 4 KiB kernel keeps the same memory free, not the same count
++ * (free target 7.8 MiB and free minimum 5.9 MiB otherwise, a quarter of an iPad's). An iPadOS
++ * guest's GPU memory is wired as it is made, up to 1 GiB a second as an app opens, and drained
++ * the free list to 0 between two runs of the pageout daemon.
++ */
++#define DROIDVM_PAGES_PER_16K           ((16384 / PAGE_SIZE) ? (16384 / PAGE_SIZE) : 1)
++#define VM_PAGE_FREE_RESERVED_LIMIT     (100 * DROIDVM_PAGES_PER_16K)
++#define VM_PAGE_FREE_MIN_LIMIT          (1500 * DROIDVM_PAGES_PER_16K)
++#define VM_PAGE_FREE_TARGET_LIMIT       (2000 * DROIDVM_PAGES_PER_16K)
+ #else /* !XNU_TARGET_OS_OSX */
+ #define VM_PAGE_FREE_RESERVED_LIMIT     1700
+ #define VM_PAGE_FREE_MIN_LIMIT          3500
