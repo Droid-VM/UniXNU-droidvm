@@ -1,0 +1,71 @@
+--- a/NativeVirtioBlock.cpp
++++ b/NativeVirtioBlock.cpp
+@@ -56,6 +56,9 @@
+ volatile uint32_t native_virtio_read_failures = 0;
+ volatile uint64_t native_virtio_sectors = 0;
+ volatile uint64_t native_virtio_mmio_physical = 0;
++// Where a read's time goes (mach_absolute_time units, all devices): [0] the device (notify to used), [1] verification (snapshot,
++// hashes, shift), [2] the copy into the caller's buffer, [3] waiting for the device lock; [4] reads, [5] bytes.
++volatile uint64_t native_virtio_time[6] = {};
+ unsigned char native_virtio_first_sector_sha256[32] = {};
+ __attribute__((noinline)) void native_virtio_read_checkpoint(void *device) {
+   __asm__ volatile("" : : "r"(device) : "memory");
+@@ -429,6 +432,7 @@
+   if (span > transferSize) return kIOReturnBadArgument;
+   IOReturn status = readRawSectors(alignedBegin / 512, span);
+   if (status) return status;
++  const uint64_t verifying = mach_absolute_time();
+   // Snapshot completed DMA before hashing; only this CPU-owned copy is exposed.
+   memcpy(verifiedSnapshot, transferMemory->getBytesNoCopy(), span);
+ #if defined(NATIVE_VERIFIED_BLOCK_INJECT_FAULT) && NATIVE_VERIFIED_BLOCK_INJECT_FAULT
+@@ -445,6 +449,7 @@
+     __atomic_fetch_add(&native_virtio_verified_blocks, 1, __ATOMIC_RELAXED);
+   }
+   memmove(verifiedSnapshot, verifiedSnapshot + (begin - alignedBegin), bytes);
++  native_virtio_time[1] = native_virtio_time[1] + (mach_absolute_time() - verifying);
+   return kIOReturnSuccess;
+ }
+ IOReturn NativeVirtioBlock::readRawSectors(uint64_t sector, uint32_t bytes)
+@@ -469,6 +474,7 @@
+   ++availableIndex;
+   available[1] = availableIndex;
+   dmaBarrier();
++  const uint64_t notified = mach_absolute_time();
+   write32(0x50, 0);
+   auto *used = reinterpret_cast<volatile uint16_t *>(queue + 256);
+   uint64_t deadline;
+@@ -482,6 +488,7 @@
+     dmaBarrier();
+     IODelay(1);
+   }
++  native_virtio_time[0] = native_virtio_time[0] + (mach_absolute_time() - notified);
+   dmaBarrier();
+   auto *element = reinterpret_cast<volatile Used *>(queue + 260) + usedIndex % queueSize;
+   bool valid = used[1] == static_cast<uint16_t>(usedIndex + 1) && element->id == 0 &&
+@@ -536,7 +543,10 @@
+   if (buffer->getDirection() != kIODirectionIn) return kIOReturnNotWritable;
+   uint64_t actual = 0;
+   IOReturn result = kIOReturnNotReady;
++  const uint64_t locking = mach_absolute_time();
+   IOLockLock(gate);
++  native_virtio_time[3] = native_virtio_time[3] + (mach_absolute_time() - locking);
++  native_virtio_time[4] = native_virtio_time[4] + 1;
+   while (online && actual < count * 512) {
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+     constexpr unsigned chunkSize = transferSize - VR_BLOCK_BYTES;
+@@ -546,12 +556,15 @@
+     uint32_t bytes = static_cast<uint32_t>(count * 512 - actual > chunkSize ? chunkSize : count * 512 - actual);
+     result = readSectors(block + actual / 512, bytes);
+     if (result) break;
++    const uint64_t copying = mach_absolute_time();
+     if (buffer->writeBytes(actual, readBuffer(), bytes) != bytes) {
+       result = kIOReturnIOError;
+       break;
+     }
++    native_virtio_time[2] = native_virtio_time[2] + (mach_absolute_time() - copying);
+     actual += bytes;
+   }
++  native_virtio_time[5] = native_virtio_time[5] + actual;
+   IOLockUnlock(gate);
+   completion->action(completion->target, completion->parameter, result, actual);
+   return kIOReturnSuccess;

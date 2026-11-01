@@ -115,6 +115,14 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
             raise SystemExit(f'NativeVirtioBlock.cpp changed: {old_text.splitlines()[0]!r}')
         text = text.replace(old_text, new_text)
     virtio.write_text(text)
+    # The board's own changes to the driver, in order (patches/VirtioMmioBlock, against the text above): how a read spends its
+    # time, and the reads themselves.
+    patches = sorted((ROOT / 'patches/VirtioMmioBlock').glob('*.patch'))
+    for patch in patches:
+        result = subprocess.run(['patch', '--silent', '--forward', '--no-backup-if-mismatch', str(virtio), '-i', str(patch)],
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if result.returncode:
+            raise SystemExit(f'{patch.name} does not apply to NativeVirtioBlock.cpp:\n{result.stdout}')
     obj = tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837'
     record = lambda path: json.loads((obj / path).read_text().strip().rstrip(','))
     cpp, c = record('iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'), record('osfmk/DEVELOPMENT/startup.o.json')
@@ -147,6 +155,8 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
             output = moved
         objects.append(output)
         inputs[str(source)] = compile_helper.sha(source)
+    for patch in patches:
+        inputs[str(patch)] = compile_helper.sha(patch)
     archive = out / 'libDroidVMSourceStorage.a'
     archive.unlink(missing_ok=True)
     subprocess.run(['xcrun', 'ar', 'rcs', archive, *objects], check=True)

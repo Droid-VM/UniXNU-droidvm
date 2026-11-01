@@ -1,0 +1,467 @@
+--- a/NativeVirtioBlock.cpp
++++ b/NativeVirtioBlock.cpp
+@@ -59,6 +59,9 @@
+ // Where a read's time goes (mach_absolute_time units, all devices): [0] the device (notify to used), [1] verification (snapshot,
+ // hashes, shift), [2] the copy into the caller's buffer, [3] waiting for the device lock; [4] reads, [5] bytes.
+ volatile uint64_t native_virtio_time[6] = {};
++// Per disk, in the order they started: its size in sectors and the bytes read from it.
++volatile uint64_t native_virtio_unit_sectors[8] = {}, native_virtio_unit_bytes[8] = {};
++static volatile uint32_t native_virtio_units = 0;
+ unsigned char native_virtio_first_sector_sha256[32] = {};
+ __attribute__((noinline)) void native_virtio_read_checkpoint(void *device) {
+   __asm__ volatile("" : : "r"(device) : "memory");
+@@ -67,7 +70,14 @@
+ 
+ // VirtIO 1.2 MMIO, modern split queue. All numbers here are protocol offsets.
+ namespace {
+-constexpr unsigned queueSize = 8;
++// Several reads in flight. Each request owns a slot: descriptors 3s..3s+2, its header and status in the queue page, a DMA
++// buffer and, verified, a CPU-owned snapshot. The lock guards only the rings and the slot masks; a reader waits for its own
++// slot with the lock dropped while the device works on the others. One request at a time under the lock, polled with
++// IODelay(1), had every page fault of every thread queue behind the others' device round trips (~0.2 ms each, mostly 4 KB).
++constexpr unsigned queueLimit = 64;     // descriptors (a power of two), three per request
++constexpr unsigned slotCount = 16;
++constexpr unsigned batchLimit = 8;      // chunks of one read out at once, leaving slots to other readers
++constexpr unsigned availableOffset = 1024, usedOffset = 2048, requestOffset = 3072, statusOffset = 3584;
+ constexpr unsigned transferSize = 65536;
+ struct Descriptor { uint64_t address; uint32_t length; uint16_t flags; uint16_t next; };
+ struct Request { uint32_t operation; uint32_t reserved; uint64_t sector; };
+@@ -80,27 +90,40 @@
+   OSDeclareDefaultStructors(NativeVirtioBlock)
+   IOMemoryMap *mapping = nullptr;
+   IOBufferMemoryDescriptor *queueMemory = nullptr;
+-  IOBufferMemoryDescriptor *transferMemory = nullptr;
+   IOLock *gate = nullptr;
+   uintptr_t registers = 0;
+   uint64_t queuePhysical = 0;
+-  uint64_t transferPhysical = 0;
+   uint64_t capacity = 0;
+   uint16_t availableIndex = 0;
+   uint16_t usedIndex = 0;
++  unsigned entries = 0, slots = 0, unit = 8;
++  IOBufferMemoryDescriptor *slotMemory[slotCount] = {};
++  uint64_t slotPhysical[slotCount] = {};
++  uint64_t slotPosted[slotCount] = {};
++  uint32_t slotBytes[slotCount] = {}, slotLength[slotCount] = {};
++  uint32_t freeSlots = 0, doneSlots = 0;   // under gate
++  struct Chunk { uint64_t begin, alignedBegin; uint32_t bytes, span; };
++  bool chunkFor(uint64_t sector, uint32_t bytes, Chunk *);
++  unsigned takeSlot();
++  void giveSlot(unsigned);
++  void postSlot(unsigned, uint64_t sector, uint32_t bytes);
++  void notify() { dmaBarrier(); write32(0x50, 0); }
++  bool collect();
++  IOReturn waitSlot(unsigned);
++  IOReturn finishSlot(unsigned, const Chunk &, IOMemoryDescriptor *, uint64_t offset);
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+   struct vr_view verified = {};
+   vm_offset_t verifiedStorage = 0;
+   vm_size_t verifiedStorageBytes = 0;
+-  unsigned char *verifiedSnapshot = nullptr;
++  unsigned char *verifiedSnapshot = nullptr;   // slot 0's snapshot
++  unsigned char *slotSnapshot[slotCount] = {};
+   bool configureVerification();
+-  IOReturn readRawSectors(uint64_t, uint32_t);
+ #endif
+   const void *readBuffer() const {
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+     return verifiedSnapshot;
+ #else
+-    return transferMemory->getBytesNoCopy();
++    return slotMemory[0]->getBytesNoCopy();
+ #endif
+   }
+   bool online = false;
+@@ -190,25 +213,33 @@
+   write32(0x70, 11);
+   if (!(read32(0x70) & 8)) return false;
+   write32(0x30, 0);
+-  if (read32(0x44) || read32(0x34) < queueSize) return false;
++  const uint32_t maximum = read32(0x34);
++  if (read32(0x44) || maximum < 4) return false;
++  for (entries = queueLimit; entries > maximum; entries >>= 1) {}
++  slots = entries / 3 < slotCount ? entries / 3 : slotCount;
+   queueMemory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+     static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous), 4096, 4096);
+-  transferMemory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-    static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous), transferSize, 4096);
+-  if (!queueMemory || !transferMemory) return false;
+-  IOByteCount queueLength = 0, transferLength = 0;
++  if (!queueMemory) return false;
++  IOByteCount queueLength = 0;
+   queuePhysical = queueMemory->getPhysicalSegment(0, &queueLength);
+-  transferPhysical = transferMemory->getPhysicalSegment(0, &transferLength);
+-  if (!queuePhysical || !transferPhysical || queueLength < 4096 || transferLength < transferSize) return false;
++  if (!queuePhysical || queueLength < 4096) return false;
++  for (unsigned s = 0; s < slots; ++s) {
++    slotMemory[s] = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++      static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous), transferSize, 4096);
++    IOByteCount length = 0;
++    if (!slotMemory[s] || !(slotPhysical[s] = slotMemory[s]->getPhysicalSegment(0, &length)) || length < transferSize) return false;
++  }
++  freeSlots = slots == 32 ? ~0U : (1U << slots) - 1;
++  doneSlots = 0;
+   bzero(queueMemory->getBytesNoCopy(), 4096);
+-  // Suppress used-buffer interrupts: this bounded initial transport polls.
+-  *reinterpret_cast<volatile uint16_t *>(static_cast<unsigned char *>(queueMemory->getBytesNoCopy()) + 128) = 1;
++  // Suppress used-buffer interrupts: readers poll for their slots.
++  *reinterpret_cast<volatile uint16_t *>(static_cast<unsigned char *>(queueMemory->getBytesNoCopy()) + availableOffset) = 1;
+   availableIndex = usedIndex = 0;
+   dmaBarrier();
+-  write32(0x38, queueSize);
++  write32(0x38, entries);
+   writeAddress(0x80, queuePhysical);
+-  writeAddress(0x90, queuePhysical + 128);
+-  writeAddress(0xa0, queuePhysical + 256);
++  writeAddress(0x90, queuePhysical + availableOffset);
++  writeAddress(0xa0, queuePhysical + usedOffset);
+   write32(0x44, 1);
+   // Read 64-bit capacity through stable, aligned 32-bit configuration accesses.
+   bool stable = false;
+@@ -412,91 +443,124 @@
+       TRUE, VM_PROT_READ) != KERN_SUCCESS) return false;
+   if (vr_open(reinterpret_cast<const uint8_t *>(verifiedStorage), manifestBytes,
+       key, 1, &vr_xnu_crypto, &verified) != VR_OK || verified.image_bytes != capacity * 512) return false;
+-  verifiedSnapshot = static_cast<unsigned char *>(IOMalloc(transferSize));
+-  if (!verifiedSnapshot) return false;
++  for (unsigned s = 0; s < slots; ++s)
++    if (!(slotSnapshot[s] = static_cast<unsigned char *>(IOMalloc(transferSize)))) return false;
++  verifiedSnapshot = slotSnapshot[0];
+   native_virtio_verified_manifest_pointer = verifiedStorage;
+   native_virtio_verified_key_pointer = reinterpret_cast<uintptr_t>(key);
+   native_virtio_manifest_ready = 1;
+   return true;
+ }
+ 
+-IOReturn NativeVirtioBlock::readSectors(uint64_t sector, uint32_t bytes)
++#endif
++
++// A read's place on the disk: verified, widened to whole hash blocks (span), the asked bytes at begin - alignedBegin.
++bool NativeVirtioBlock::chunkFor(uint64_t sector, uint32_t bytes, Chunk *chunk)
+ {
+-  if (!verifiedSnapshot || !online || !bytes || bytes > transferSize - VR_BLOCK_BYTES ||
+-      (bytes & 511) || sector >= capacity || bytes / 512 > capacity - sector) return kIOReturnBadArgument;
+-  uint64_t begin = sector * 512, end = begin + bytes;
+-  uint64_t alignedBegin = begin & ~static_cast<uint64_t>(VR_BLOCK_BYTES - 1);
++  if (!bytes || (bytes & 511) || sector >= capacity || bytes / 512 > capacity - sector) return false;
++  chunk->begin = sector * 512;
++  chunk->bytes = bytes;
++#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
++  if (!verifiedSnapshot || bytes > transferSize - VR_BLOCK_BYTES) return false;
++  uint64_t end = chunk->begin + bytes;
++  chunk->alignedBegin = chunk->begin & ~static_cast<uint64_t>(VR_BLOCK_BYTES - 1);
+   uint64_t padding = (VR_BLOCK_BYTES - (end & (VR_BLOCK_BYTES - 1))) & (VR_BLOCK_BYTES - 1);
+   if (padding > capacity * 512 - end) padding = capacity * 512 - end;
+-  uint32_t span = static_cast<uint32_t>(end + padding - alignedBegin);
+-  if (span > transferSize) return kIOReturnBadArgument;
+-  IOReturn status = readRawSectors(alignedBegin / 512, span);
+-  if (status) return status;
+-  const uint64_t verifying = mach_absolute_time();
+-  // Snapshot completed DMA before hashing; only this CPU-owned copy is exposed.
+-  memcpy(verifiedSnapshot, transferMemory->getBytesNoCopy(), span);
+-#if defined(NATIVE_VERIFIED_BLOCK_INJECT_FAULT) && NATIVE_VERIFIED_BLOCK_INJECT_FAULT
+-  verifiedSnapshot[0] ^= 1; // Isolated negative input, original disk/signature untouched.
+-#endif
+-  for (uint32_t offset = 0; offset < span; offset += VR_BLOCK_BYTES) {
+-    uint32_t length = span - offset < VR_BLOCK_BYTES ? span - offset : VR_BLOCK_BYTES;
+-    if (vr_verify_block(&verified, alignedBegin / VR_BLOCK_BYTES + offset / VR_BLOCK_BYTES,
+-        verifiedSnapshot + offset, length, &vr_xnu_crypto) != VR_OK) {
+-      __atomic_fetch_add(&native_virtio_integrity_failures, 1, __ATOMIC_RELAXED);
+-      if (!reset()) panic("NativeVirtioBlock: unverified DMA could not be quiesced");
+-      return kIOReturnNotPrivileged;
+-    }
+-    __atomic_fetch_add(&native_virtio_verified_blocks, 1, __ATOMIC_RELAXED);
+-  }
+-  memmove(verifiedSnapshot, verifiedSnapshot + (begin - alignedBegin), bytes);
+-  native_virtio_time[1] = native_virtio_time[1] + (mach_absolute_time() - verifying);
+-  return kIOReturnSuccess;
+-}
+-IOReturn NativeVirtioBlock::readRawSectors(uint64_t sector, uint32_t bytes)
++  chunk->span = static_cast<uint32_t>(end + padding - chunk->alignedBegin);
++  return chunk->span <= transferSize;
+ #else
+-IOReturn NativeVirtioBlock::readSectors(uint64_t sector, uint32_t bytes)
++  chunk->alignedBegin = chunk->begin;
++  chunk->span = bytes;
++  return bytes <= transferSize;
+ #endif
++}
++
++// An idle slot (gate held; waits while every slot is out), or slotCount once the device is offline.
++unsigned NativeVirtioBlock::takeSlot()
++{
++  while (!freeSlots && online) IOLockSleep(gate, &freeSlots, THREAD_UNINT);
++  if (!freeSlots || !online) return slotCount;
++  const unsigned s = static_cast<unsigned>(__builtin_ctz(freeSlots));
++  freeSlots &= ~(1U << s);
++  doneSlots &= ~(1U << s);
++  return s;
++}
++
++void NativeVirtioBlock::giveSlot(unsigned s)
++{
++  freeSlots |= 1U << s;
++  doneSlots &= ~(1U << s);
++  IOLockWakeup(gate, &freeSlots, false);
++}
++
++// Slot s's request for bytes at sector, on the available ring (gate held); notify() hands a batch to the device.
++void NativeVirtioBlock::postSlot(unsigned s, uint64_t sector, uint32_t bytes)
+ {
+-  if (!online || !bytes || bytes > transferSize || (bytes & 511) ||
+-      sector >= capacity || bytes / 512 > capacity - sector) return kIOReturnBadArgument;
+   auto *queue = static_cast<unsigned char *>(queueMemory->getBytesNoCopy());
+   auto *descriptors = reinterpret_cast<Descriptor *>(queue);
+-  auto *request = reinterpret_cast<Request *>(queue + 512);
+-  volatile uint8_t *status = queue + 528;
+-  *request = {0, 0, sector};
+-  *status = 0xff;
+-  descriptors[0] = {queuePhysical + 512, sizeof(Request), 1, 1};
+-  descriptors[1] = {transferPhysical, bytes, 3, 2};
+-  descriptors[2] = {queuePhysical + 528, 1, 2, 0};
+-  auto *available = reinterpret_cast<volatile uint16_t *>(queue + 128);
+-  available[2 + availableIndex % queueSize] = 0;
++  const uint16_t head = static_cast<uint16_t>(3 * s);
++  reinterpret_cast<Request *>(queue + requestOffset)[s] = {0, 0, sector};
++  queue[statusOffset + s] = 0xff;
++  descriptors[head] = {queuePhysical + requestOffset + sizeof(Request) * s, sizeof(Request), 1, static_cast<uint16_t>(head + 1)};
++  descriptors[head + 1] = {slotPhysical[s], bytes, 3, static_cast<uint16_t>(head + 2)};
++  descriptors[head + 2] = {queuePhysical + statusOffset + s, 1, 2, 0};
++  slotBytes[s] = bytes;
++  auto *available = reinterpret_cast<volatile uint16_t *>(queue + availableOffset);
++  available[2 + availableIndex % entries] = head;
+   dmaBarrier();
+   ++availableIndex;
+   available[1] = availableIndex;
++  slotPosted[s] = mach_absolute_time();
++}
++
++// What the device has returned, slot by slot (gate held); false for an element naming no request in flight.
++bool NativeVirtioBlock::collect()
++{
++  auto *queue = static_cast<unsigned char *>(queueMemory->getBytesNoCopy());
++  auto *used = reinterpret_cast<volatile uint16_t *>(queue + usedOffset);
+   dmaBarrier();
+-  const uint64_t notified = mach_absolute_time();
+-  write32(0x50, 0);
+-  auto *used = reinterpret_cast<volatile uint16_t *>(queue + 256);
++  while (used[1] != usedIndex) {
++    dmaBarrier();
++    auto *element = reinterpret_cast<volatile Used *>(queue + usedOffset + 4) + usedIndex % entries;
++    const uint32_t id = element->id, length = element->length;
++    ++usedIndex;
++    const unsigned s = id / 3;
++    if (id % 3 || s >= slots || ((freeSlots | doneSlots) & (1U << s))) return false;
++    doneSlots |= 1U << s;
++    slotLength[s] = length;
++  }
++  return true;
++}
++
++// Waits for slot s, the gate held on entry and return and dropped while waiting: a few short spins (the host often answers
++// from its page cache within tens of microseconds), then 20 us sleeps. Any reader collects for every slot.
++IOReturn NativeVirtioBlock::waitSlot(unsigned s)
++{
+   uint64_t deadline;
+   clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
+-  while (used[1] == usedIndex) {
++  for (unsigned round = 0;; ++round) {
++    if (!online) return kIOReturnNotReady;
++    if (!collect()) {
++      reset();
++      __atomic_fetch_add(&native_virtio_read_failures, 1, __ATOMIC_RELAXED);
++      return kIOReturnIOError;
++    }
++    if (doneSlots & (1U << s)) break;
+     if (mach_absolute_time() >= deadline) {
+       reset();
+       __atomic_fetch_add(&native_virtio_read_failures, 1, __ATOMIC_RELAXED);
+       return kIOReturnTimeout;
+     }
+-    dmaBarrier();
+-    IODelay(1);
++    IOLockUnlock(gate);
++    IODelay(round < 16 ? 2 : 20);
++    IOLockLock(gate);
+   }
+-  native_virtio_time[0] = native_virtio_time[0] + (mach_absolute_time() - notified);
+-  dmaBarrier();
+-  auto *element = reinterpret_cast<volatile Used *>(queue + 260) + usedIndex % queueSize;
+-  bool valid = used[1] == static_cast<uint16_t>(usedIndex + 1) && element->id == 0 &&
+-               element->length >= bytes + 1 && *status == 0;
+-  ++usedIndex;
++  __atomic_fetch_add(&native_virtio_time[0], mach_absolute_time() - slotPosted[s], __ATOMIC_RELAXED);
+   uint32_t interrupts = read32(0x60) & 3;
+   if (interrupts) write32(0x64, interrupts);
+-  if (!valid) {
++  const volatile uint8_t *status = static_cast<unsigned char *>(queueMemory->getBytesNoCopy()) + statusOffset + s;
++  dmaBarrier();
++  if (slotLength[s] < slotBytes[s] + 1 || *status != 0) {
+     reset();
+     __atomic_fetch_add(&native_virtio_read_failures, 1, __ATOMIC_RELAXED);
+     return kIOReturnIOError;
+@@ -505,6 +569,68 @@
+   return kIOReturnSuccess;
+ }
+ 
++// Slot s's data, verified, to buffer at offset (gate not held: the slot is this reader's); without a buffer the asked bytes
++// stay at the start of the slot's snapshot (readBuffer()).
++IOReturn NativeVirtioBlock::finishSlot(unsigned s, const Chunk &chunk, IOMemoryDescriptor *buffer, uint64_t offset)
++{
++#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
++  const uint64_t verifying = mach_absolute_time();
++  unsigned char *snapshot = slotSnapshot[s];
++  // Snapshot completed DMA before hashing; only this CPU-owned copy is exposed.
++  memcpy(snapshot, slotMemory[s]->getBytesNoCopy(), chunk.span);
++#if defined(NATIVE_VERIFIED_BLOCK_INJECT_FAULT) && NATIVE_VERIFIED_BLOCK_INJECT_FAULT
++  snapshot[0] ^= 1; // Isolated negative input, original disk/signature untouched.
++#endif
++  for (uint32_t at = 0; at < chunk.span; at += VR_BLOCK_BYTES) {
++    uint32_t length = chunk.span - at < VR_BLOCK_BYTES ? chunk.span - at : VR_BLOCK_BYTES;
++    if (vr_verify_block(&verified, chunk.alignedBegin / VR_BLOCK_BYTES + at / VR_BLOCK_BYTES,
++        snapshot + at, length, &vr_xnu_crypto) != VR_OK) {
++      __atomic_fetch_add(&native_virtio_integrity_failures, 1, __ATOMIC_RELAXED);
++      IOLockLock(gate);
++      const bool quiesced = reset();
++      IOLockUnlock(gate);
++      if (!quiesced) panic("NativeVirtioBlock: unverified DMA could not be quiesced");
++      return kIOReturnNotPrivileged;
++    }
++    __atomic_fetch_add(&native_virtio_verified_blocks, 1, __ATOMIC_RELAXED);
++  }
++  const unsigned char *data = snapshot + (chunk.begin - chunk.alignedBegin);
++  __atomic_fetch_add(&native_virtio_time[1], mach_absolute_time() - verifying, __ATOMIC_RELAXED);
++  if (!buffer) {
++    memmove(snapshot, data, chunk.bytes);
++    return kIOReturnSuccess;
++  }
++#else
++  const unsigned char *data = static_cast<const unsigned char *>(slotMemory[s]->getBytesNoCopy());
++  if (!buffer) return kIOReturnSuccess;
++#endif
++  const uint64_t copying = mach_absolute_time();
++  if (buffer->writeBytes(offset, data, chunk.bytes) != chunk.bytes) return kIOReturnIOError;
++  __atomic_fetch_add(&native_virtio_time[2], mach_absolute_time() - copying, __ATOMIC_RELAXED);
++  return kIOReturnSuccess;
++}
++
++// The first sector for start(), before any client: through slot 0, left in readBuffer().
++IOReturn NativeVirtioBlock::readSectors(uint64_t sector, uint32_t bytes)
++{
++  Chunk chunk;
++  if (!online || !chunkFor(sector, bytes, &chunk)) return kIOReturnBadArgument;
++  IOLockLock(gate);
++  const unsigned s = takeSlot();
++  IOReturn result = s == 0 ? kIOReturnSuccess : kIOReturnNotReady;
++  if (result == kIOReturnSuccess) {
++    postSlot(s, chunk.alignedBegin / 512, chunk.span);
++    notify();
++    result = waitSlot(s);
++  }
++  IOLockUnlock(gate);
++  if (result == kIOReturnSuccess) result = finishSlot(s, chunk, nullptr, 0);
++  IOLockLock(gate);
++  if (s < slotCount) giveSlot(s);
++  IOLockUnlock(gate);
++  return result;
++}
++
+ bool NativeVirtioBlock::start(IOService *provider)
+ {
+   if (!IOBlockStorageDevice::start(provider) || !provider->getProperty("dma-coherent") ||
+@@ -525,6 +651,8 @@
+   SHA256_Update(&hash, readBuffer(), 512);
+   SHA256_Final(native_virtio_first_sector_sha256, &hash);
+   native_virtio_sectors = capacity;
++  unit = __atomic_fetch_add(&native_virtio_units, 1, __ATOMIC_RELAXED);
++  if (unit < 8) native_virtio_unit_sectors[unit] = capacity;
+   native_virtio_mmio_physical = mapping->getPhysicalAddress();
+   native_virtio_ready = 1;
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+@@ -541,31 +669,52 @@
+   if (!buffer || !completion || !completion->action || !count || block >= capacity ||
+       count > capacity - block || count > UINT64_MAX / 512 || buffer->getLength() < count * 512) return kIOReturnBadArgument;
+   if (buffer->getDirection() != kIODirectionIn) return kIOReturnNotWritable;
+-  uint64_t actual = 0;
+-  IOReturn result = kIOReturnNotReady;
++  const uint64_t total = count * 512;
++  uint64_t actual = 0, next = 0;
++  IOReturn result = kIOReturnSuccess;
+   const uint64_t locking = mach_absolute_time();
+   IOLockLock(gate);
+-  native_virtio_time[3] = native_virtio_time[3] + (mach_absolute_time() - locking);
+-  native_virtio_time[4] = native_virtio_time[4] + 1;
+-  while (online && actual < count * 512) {
++  __atomic_fetch_add(&native_virtio_time[3], mach_absolute_time() - locking, __ATOMIC_RELAXED);
++  __atomic_fetch_add(&native_virtio_time[4], 1, __ATOMIC_RELAXED);
++  if (!online) result = kIOReturnNotReady;
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+-    constexpr unsigned chunkSize = transferSize - VR_BLOCK_BYTES;
++  constexpr unsigned chunkSize = transferSize - VR_BLOCK_BYTES;
+ #else
+-    constexpr unsigned chunkSize = transferSize;
++  constexpr unsigned chunkSize = transferSize;
+ #endif
+-    uint32_t bytes = static_cast<uint32_t>(count * 512 - actual > chunkSize ? chunkSize : count * 512 - actual);
+-    result = readSectors(block + actual / 512, bytes);
+-    if (result) break;
+-    const uint64_t copying = mach_absolute_time();
+-    if (buffer->writeBytes(actual, readBuffer(), bytes) != bytes) {
+-      result = kIOReturnIOError;
+-      break;
++  while (result == kIOReturnSuccess && next < total) {
++    // Up to batchLimit chunks go out together: the first may wait for a slot, the rest take only idle ones. They are
++    // finished in order, each slot given back only once the device has returned it.
++    unsigned taken[batchLimit];
++    Chunk chunks[batchLimit];
++    unsigned n = 0;
++    do {
++      const uint32_t bytes = static_cast<uint32_t>(total - next > chunkSize ? chunkSize : total - next);
++      Chunk chunk;
++      if (!chunkFor(block + next / 512, bytes, &chunk)) { result = kIOReturnBadArgument; break; }
++      const unsigned s = takeSlot();
++      if (s >= slotCount) { result = kIOReturnNotReady; break; }
++      postSlot(s, chunk.alignedBegin / 512, chunk.span);
++      taken[n] = s;
++      chunks[n++] = chunk;
++      next += bytes;
++    } while (next < total && n < batchLimit && freeSlots);
++    if (n) notify();
++    for (unsigned i = 0; i < n; ++i) {
++      IOReturn status = waitSlot(taken[i]);
++      if (status == kIOReturnSuccess && result == kIOReturnSuccess) {
++        IOLockUnlock(gate);
++        status = finishSlot(taken[i], chunks[i], buffer, chunks[i].begin - block * 512);
++        IOLockLock(gate);
++        if (status == kIOReturnSuccess) actual += chunks[i].bytes;
++      }
++      if (status != kIOReturnSuccess && result == kIOReturnSuccess) result = status;
++      giveSlot(taken[i]);
+     }
+-    native_virtio_time[2] = native_virtio_time[2] + (mach_absolute_time() - copying);
+-    actual += bytes;
+   }
+-  native_virtio_time[5] = native_virtio_time[5] + actual;
+   IOLockUnlock(gate);
++  __atomic_fetch_add(&native_virtio_time[5], actual, __ATOMIC_RELAXED);
++  if (unit < 8) __atomic_fetch_add(&native_virtio_unit_bytes[unit], actual, __ATOMIC_RELAXED);
+   completion->action(completion->target, completion->parameter, result, actual);
+   return kIOReturnSuccess;
+ }
+@@ -580,11 +729,14 @@
+ {
+   if (registers && !reset()) panic("NativeVirtioBlock: refusing to free active DMA buffers");
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+-  if (verifiedSnapshot) { IOFree(verifiedSnapshot, transferSize); verifiedSnapshot = nullptr; }
++  for (unsigned s = 0; s < slotCount; ++s)
++    if (slotSnapshot[s]) { IOFree(slotSnapshot[s], transferSize); slotSnapshot[s] = nullptr; }
++  verifiedSnapshot = nullptr;
+   if (verifiedStorage) { kmem_free(kernel_map, verifiedStorage, verifiedStorageBytes); verifiedStorage = 0; }
+ #endif
+   if (queueMemory) { queueMemory->release(); queueMemory = nullptr; }
+-  if (transferMemory) { transferMemory->release(); transferMemory = nullptr; }
++  for (unsigned s = 0; s < slotCount; ++s)
++    if (slotMemory[s]) { slotMemory[s]->release(); slotMemory[s] = nullptr; }
+   if (mapping) { mapping->release(); mapping = nullptr; }
+   if (gate) { IOLockFree(gate); gate = nullptr; }
+   IOBlockStorageDevice::free();
