@@ -91,6 +91,13 @@ def read_adt(blob, offset=0):
 # The /product properties of the identity tree a virtual machine does not have: the exclaves of Apple's SoCs, and the panel's
 # gamut, which --display-gamut sets.
 IDENTITY_PRODUCT_DROPPED = {'name', 'AAPL,phandle', 'exclaves-enabled', 'has-exclaves', 'artwork-display-gamut'}
+# The Metal feature sets of the identity tree's GPU family list (graphics-featureset-fallbacks) a virtual machine leaves out.
+# MobileGestalt answers DeviceSupportsASTC from this list (APPLE2 or MTL2,2 in it), and SplashBoard then writes every app snapshot
+# as ATX, ASTC in the AGX GPU's own texture layout: ImageIO places its blocks with the AGX Metal device's private texture layout
+# and checks the file's watermark against that device's. The guest's GPU is not an AGX, and SpringBoard, which writes and reads
+# the snapshots, has no Metal device at all, so every snapshot failed to decode (status -4) and the app switcher's cards stayed
+# blank. Without APPLE2 the snapshots are PNG, which ImageIO reads on the CPU. The class and the other families stay.
+IDENTITY_FEATURESETS_DROPPED = (b'APPLE2', b'MTL2,2')
 # The /product/audio properties of the identity tree kept: acoustic-id names the audio server's tunings folder
 # (/Library/Audio/Tunings/AID<n>, MobileGestalt's AcousticID). The rest describe the original's microphones and DSP.
 IDENTITY_AUDIO_KEPT = ('acoustic-id',)
@@ -132,6 +139,12 @@ def device_tree_bytes(path):
     return payload
 
 
+def featuresets(value):
+    """graphics-featureset-fallbacks without IDENTITY_FEATURESETS_DROPPED (a NUL-terminated, colon-separated list)."""
+    kept = [name for name in value.rstrip(b'\0').split(b':') if name not in IDENTITY_FEATURESETS_DROPPED]
+    return b':'.join(kept) + b'\0'
+
+
 def identity_of(path):
     """The device identity of an OS's own device tree (the IPSW's DeviceTree, decoded or as its IM4P): the root's model,
     target and board names, and the /product properties MobileGestalt and the frameworks read (product-id, artwork, feature
@@ -145,7 +158,8 @@ def identity_of(path):
     audio = named(product_children, b'audio')[0] or {}
     return {'model': root['model'], 'target-type': root['target-type'],
             'board': root.get('compatible', b'').split(b'\0')[0] + b'\0',
-            'product': [(key, value) for key, value in product.items() if key not in IDENTITY_PRODUCT_DROPPED],
+            'product': [(key, featuresets(value) if key == 'graphics-featureset-fallbacks' else value)
+                        for key, value in product.items() if key not in IDENTITY_PRODUCT_DROPPED],
             'audio': [(key, audio[key]) for key in IDENTITY_AUDIO_KEPT if key in audio]}
 
 
