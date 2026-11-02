@@ -12,6 +12,15 @@
 //   gfxprobe clocks                     mach and POSIX clocks side by side, and a 1 s dispatch timer on uptime, wall and monotonic time
 //   gfxprobe scnotify KEY...            configd tells the SCDynamicStore sessions watching each key that it changed (value untouched)
 //   gfxprobe families                   each GPU family the Metal device answers (supportsFamily:), and the queries a family check uses
+//   gfxprobe msaa [W H DRAWS FRAMES]    the GPU time of one screen-sized pass (default 2048 x 2732, 64 overlapping full-screen
+//                                       triangles, 30 frames) at 1 sample, at 4 into a memoryless multisample target resolved, and
+//                                       at 4 into a private one resolved (TU_DEBUG=gmem or sysmem forces Turnip's render mode)
+//   gfxprobe dontcare [W H]             what an attachment stored DontCare or MultisampleResolve holds after its pass (metal2vulkan
+//                                       hands DONT_CARE only to a driver measured to keep one of Metal's two answers: every
+//                                       texel and sample the earlier one or the one Store keeps): BGRA8 at 1 and 4 samples
+//                                       (resolved and not), RGBA16Float, Depth32Float at 1 and 4, each loaded Clear, Load and
+//                                       DontCare, drawing nothing, the left half or everything; counts per answer, a third
+//                                       answer listed
 //   gfxprobe argbuf                     an argument buffer (a buffer, a texture, a sampler, a constant) encoded by a descriptor-made and a
 //                                       function-made MTLArgumentEncoder, read by a kernel and by a fragment shader
 //   gfxprobe sysctl [NAME...]           sysconf's memory figures and each sysctl (in a sandbox: which the profile refuses)
@@ -1181,6 +1190,222 @@ static int pitchCheck(unsigned w, unsigned h, unsigned pitch) {
     }
     free(texels);
     return failures ? 1 : 0;
+}
+
+// msaa: what multisampling costs on this GPU path (Metal -> metal2vulkan -> Turnip): one pass a frame of DRAWS overlapping
+// full-screen triangles, blended, at 1 sample into the target, at 4 samples into a memoryless multisample texture with a
+// multisample resolve store (iOS apps' usual MSAA: on a tiler the samples never leave tile memory), and at 4 samples into a
+// private multisample texture, resolved. Each set's mean GPU time per frame (the command buffers' GPU start and end).
+static const char *kMsaaSource =
+    "#include <metal_stdlib>\nusing namespace metal;\n"
+    "struct V { float4 p [[position]]; float4 c; };\n"
+    "vertex V msaa_vertex(uint i [[vertex_id]], uint n [[instance_id]]) {"
+    " float2 c = float2((i << 1) & 2, i & 2); float a = n * 0.37; float2 r = float2(cos(a), sin(a));"
+    " float2 p = c * 2 - 1; p = float2(p.x * r.x - p.y * r.y, p.x * r.y + p.y * r.x) * 1.6;"
+    " V v; v.p = float4(p, 0, 1); v.c = float4(fract(n * 0.13), fract(n * 0.29), fract(n * 0.41), 0.08); return v; }\n"
+    "fragment float4 msaa_fragment(V v [[stage_in]]) { return v.c; }\n";
+
+static int msaaProbe(int argc, char **argv) {
+    const NSUInteger w = argc > 0 ? strtoul(argv[0], NULL, 0) : 2048, h = argc > 1 ? strtoul(argv[1], NULL, 0) : 2732;
+    const NSUInteger draws = argc > 2 ? strtoul(argv[2], NULL, 0) : 64, frames = argc > 3 ? strtoul(argv[3], NULL, 0) : 30;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) { printf("msaa: no Metal device\n"); return 1; }
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:@(kMsaaSource) options:nil error:&error];
+    if (!library) { printf("msaa: no library: %s\n", error.description.UTF8String); return 1; }
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> target = [device newTextureWithDescriptor:td];
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    printf("msaa: %lux%lu, %lu blended full-screen triangles a pass, %lu frames; supportsTextureSampleCount 4: %d\n",
+           (unsigned long)w, (unsigned long)h, (unsigned long)draws, (unsigned long)frames, [device supportsTextureSampleCount:4]);
+    const char *names[3] = {"1 sample", "4 samples, memoryless, resolved", "4 samples, private, resolved"};
+    double base = 0;
+    for (int mode = 0; mode < 3; ++mode) {
+        const NSUInteger samples = mode ? 4 : 1;
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [library newFunctionWithName:@"msaa_vertex"];
+        pd.fragmentFunction = [library newFunctionWithName:@"msaa_fragment"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.rasterSampleCount = samples;
+        id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+        if (!state) { printf("  %s: no pipeline: %s\n", names[mode], error.description.UTF8String); continue; }
+        id<MTLTexture> multisample = nil;
+        if (mode) {
+            MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
+            md.textureType = MTLTextureType2DMultisample; md.sampleCount = 4; md.usage = MTLTextureUsageRenderTarget;
+            md.storageMode = mode == 1 ? MTLStorageModeMemoryless : MTLStorageModePrivate;
+            multisample = [device newTextureWithDescriptor:md];
+            if (!multisample) { printf("  %s: no multisample texture\n", names[mode]); continue; }
+        }
+        double total = 0; NSUInteger counted = 0;
+        for (NSUInteger f = 0; f < frames; ++f) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = multisample ? multisample : target;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+            if (multisample) {
+                rp.colorAttachments[0].resolveTexture = target;
+                rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+            } else rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+            [enc setRenderPipelineState:state];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:draws];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.error) { printf("  %s: command buffer: %s\n", names[mode], cb.error.description.UTF8String); break; }
+            if (f < 3) continue;   // warm-up
+            const double gpu = cb.GPUEndTime - cb.GPUStartTime;
+            if (gpu > 0) { total += gpu; counted++; }
+        }
+        const double mean = counted ? total / counted * 1000 : 0;
+        if (!mode) base = mean;
+        printf("  %-34s %7.2f ms GPU a frame%s\n", names[mode], mean,
+               mode && base > 0 ? [NSString stringWithFormat:@" (%.2fx the 1-sample pass)", mean / base].UTF8String : "");
+    }
+    return 0;
+}
+
+// dontcare: each case fills its attachment with the earlier value (a pass cleared to it and stored), then runs the pass under
+// test (the case's load action, no draw or a quad over the left half or the whole target at depth 0.25 in green, stored
+// DontCare, or MultisampleResolve into a resolve texture) and classifies every texel and sample on the GPU: the earlier value,
+// the value Store keeps (green where drawn; elsewhere the clear value under Clear, the earlier one under Load, none under
+// DontCare), or a third. Earlier red / 0.75, clear blue / 0.5.
+static const char *kDontCareSource =
+    "#include <metal_stdlib>\nusing namespace metal;\n"
+    "struct V { float4 p [[position]]; };\n"
+    "vertex V dc_vertex(uint i [[vertex_id]], constant float &right [[buffer(0)]]) {"
+    " float2 c = float2(i & 1 ? right : -1.0, i & 2 ? 1.0 : -1.0); V v; v.p = float4(c, 0.25, 1); return v; }\n"
+    "fragment float4 dc_fragment(V v [[stage_in]]) { return float4(0, 1, 0, 1); }\n"
+    "struct P { float4 e; float4 d; float4 u; uint split; uint known; uint samples; uint pad; };\n"
+    "static void dc_count(float4 v, uint x, constant P &p, device atomic_uint *c) {"
+    " bool drawn = x < p.split; bool known = drawn || p.known != 0; float4 s = drawn ? p.d : p.u;"
+    " uint k = all(abs(v - p.e) < 0.01) ? 0 : (known && all(abs(v - s) < 0.01)) ? 1 : known ? 2 : 3;"
+    " atomic_fetch_add_explicit(&c[k], 1, memory_order_relaxed); }\n"
+    "kernel void dc_color(texture2d<float> t [[texture(0)]], constant P &p [[buffer(0)]], device atomic_uint *c [[buffer(1)]],"
+    " uint2 g [[thread_position_in_grid]]) { if (g.x >= t.get_width() || g.y >= t.get_height()) return; dc_count(t.read(g), g.x, p, c); }\n"
+    "kernel void dc_color_ms(texture2d_ms<float> t [[texture(0)]], constant P &p [[buffer(0)]], device atomic_uint *c [[buffer(1)]],"
+    " uint2 g [[thread_position_in_grid]]) { if (g.x >= t.get_width() || g.y >= t.get_height()) return;"
+    " for (uint s = 0; s < p.samples; ++s) dc_count(t.read(g, s), g.x, p, c); }\n"
+    "kernel void dc_depth(depth2d<float> t [[texture(0)]], constant P &p [[buffer(0)]], device atomic_uint *c [[buffer(1)]],"
+    " uint2 g [[thread_position_in_grid]]) { if (g.x >= t.get_width() || g.y >= t.get_height()) return;"
+    " dc_count(float4(t.read(g), 0, 0, 0), g.x, p, c); }\n"
+    "kernel void dc_depth_ms(depth2d_ms<float> t [[texture(0)]], constant P &p [[buffer(0)]], device atomic_uint *c [[buffer(1)]],"
+    " uint2 g [[thread_position_in_grid]]) { if (g.x >= t.get_width() || g.y >= t.get_height()) return;"
+    " for (uint s = 0; s < p.samples; ++s) dc_count(float4(t.read(g, s), 0, 0, 0), g.x, p, c); }\n";
+
+typedef struct { float e[4], d[4], u[4]; uint32_t split, known, samples, pad; } DontCareParams;
+
+static int dontCareProbe(int argc, char **argv) {
+    const NSUInteger w = argc > 0 ? strtoul(argv[0], NULL, 0) : 1024, h = argc > 1 ? strtoul(argv[1], NULL, 0) : 1024;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) { printf("dontcare: no Metal device\n"); return 1; }
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:@(kDontCareSource) options:nil error:&error];
+    if (!library) { printf("dontcare: no library: %s\n", error.description.UTF8String); return 1; }
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLBuffer> counts = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    struct { const char *name; MTLPixelFormat format; NSUInteger samples; BOOL resolve; } configs[] = {
+        {"BGRA8Unorm 1x DontCare", MTLPixelFormatBGRA8Unorm, 1, NO},
+        {"BGRA8Unorm 4x MultisampleResolve", MTLPixelFormatBGRA8Unorm, 4, YES},
+        {"BGRA8Unorm 4x DontCare", MTLPixelFormatBGRA8Unorm, 4, NO},
+        {"RGBA16Float 1x DontCare", MTLPixelFormatRGBA16Float, 1, NO},
+        {"Depth32Float 1x DontCare", MTLPixelFormatDepth32Float, 1, NO},
+        {"Depth32Float 4x DontCare", MTLPixelFormatDepth32Float, 4, NO},
+    };
+    const MTLLoadAction loads[] = {MTLLoadActionClear, MTLLoadActionLoad, MTLLoadActionDontCare};
+    const char *loadNames[] = {"Clear", "Load", "DontCare"};
+    const float rights[] = {-2, 0, 1};   // no draw, the left half, everything
+    const char *drawNames[] = {"none", "half", "full"};
+    printf("dontcare: %lux%lu\n", (unsigned long)w, (unsigned long)h);
+    unsigned long long allOther = 0;
+    for (size_t ci = 0; ci < sizeof configs / sizeof *configs; ++ci) {
+        const BOOL depth = configs[ci].format == MTLPixelFormatDepth32Float;
+        const NSUInteger samples = configs[ci].samples;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:configs[ci].format width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+        if (samples > 1) { td.textureType = MTLTextureType2DMultisample; td.sampleCount = samples; }
+        id<MTLTexture> target = [device newTextureWithDescriptor:td];
+        id<MTLTexture> resolved = nil;
+        if (configs[ci].resolve) {
+            MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:configs[ci].format width:w height:h mipmapped:NO];
+            rd.usage = MTLTextureUsageRenderTarget; rd.storageMode = MTLStorageModePrivate;
+            resolved = [device newTextureWithDescriptor:rd];
+        }
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [library newFunctionWithName:@"dc_vertex"];
+        pd.rasterSampleCount = samples;
+        if (depth) pd.depthAttachmentPixelFormat = configs[ci].format;
+        else { pd.fragmentFunction = [library newFunctionWithName:@"dc_fragment"]; pd.colorAttachments[0].pixelFormat = configs[ci].format; }
+        id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
+        id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dd];
+        NSString *kernelName = depth ? (samples > 1 ? @"dc_depth_ms" : @"dc_depth") : (samples > 1 ? @"dc_color_ms" : @"dc_color");
+        id<MTLComputePipelineState> classify = [device newComputePipelineStateWithFunction:[library newFunctionWithName:kernelName] error:&error];
+        if (!state || !classify || !target) { printf("  %s: not made: %s\n", configs[ci].name, error.description.UTF8String); continue; }
+        unsigned long long sum[4] = {};
+        char lines[2048] = ""; size_t used = 0;
+        for (int li = 0; li < 3; ++li) for (int di = 0; di < 3; ++di) {
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            for (int pass = 0; pass < 2; ++pass) {   // the earlier value, then the pass under test
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                MTLRenderPassAttachmentDescriptor *a = depth ? (MTLRenderPassAttachmentDescriptor *)rp.depthAttachment
+                                                             : (MTLRenderPassAttachmentDescriptor *)rp.colorAttachments[0];
+                a.texture = target;
+                a.loadAction = pass ? loads[li] : MTLLoadActionClear;
+                if (depth) rp.depthAttachment.clearDepth = pass ? 0.5 : 0.75;
+                else rp.colorAttachments[0].clearColor = pass ? MTLClearColorMake(0, 0, 1, 1) : MTLClearColorMake(1, 0, 0, 1);
+                if (!pass) a.storeAction = MTLStoreActionStore;
+                else if (resolved) { a.resolveTexture = resolved; a.storeAction = MTLStoreActionMultisampleResolve; }
+                else a.storeAction = MTLStoreActionDontCare;
+                id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+                if (pass && rights[di] > -1) {
+                    float right = rights[di];
+                    [enc setRenderPipelineState:state];
+                    [enc setDepthStencilState:depthState];
+                    [enc setVertexBytes:&right length:sizeof right atIndex:0];
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+                }
+                [enc endEncoding];
+            }
+            memset(counts.contents, 0, 16);
+            DontCareParams params = {};
+            if (depth) { params.e[0] = 0.75f; params.d[0] = 0.25f; params.u[0] = loads[li] == MTLLoadActionClear ? 0.5f : 0.75f; }
+            else {
+                const float e[4] = {1, 0, 0, 1}, d[4] = {0, 1, 0, 1}, c[4] = {0, 0, 1, 1};
+                memcpy(params.e, e, sizeof e); memcpy(params.d, d, sizeof d);
+                memcpy(params.u, loads[li] == MTLLoadActionClear ? c : e, sizeof c);
+            }
+            params.split = rights[di] < -1 ? 0 : rights[di] < 0.5 ? (uint32_t)(w / 2) : (uint32_t)w;
+            params.known = loads[li] != MTLLoadActionDontCare;
+            params.samples = (uint32_t)samples;
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:classify];
+            [ce setTexture:target atIndex:0];
+            [ce setBytes:&params length:sizeof params atIndex:0];
+            [ce setBuffer:counts offset:0 atIndex:1];
+            [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.error) { printf("  %s: command buffer: %s\n", configs[ci].name, cb.error.description.UTF8String); break; }
+            const uint32_t *n = counts.contents;
+            for (int k = 0; k < 4; ++k) sum[k] += n[k];
+            used += snprintf(lines + used, sizeof lines - used, "    %-8s %-4s earlier %9u stored %9u other %9u unknown %9u%s\n",
+                             loadNames[li], drawNames[di], n[0], n[1], n[2], n[3], n[2] ? "  <-- a third answer" : "");
+            if (used >= sizeof lines) used = sizeof lines - 1;
+        }
+        allOther += sum[2];
+        printf("  %-34s earlier %10llu stored %10llu other %llu\n%s", configs[ci].name, sum[0], sum[1], sum[2], lines);
+    }
+    printf("dontcare: %s\n", allOther ? "a third answer seen" : "every texel and sample one of Metal's two answers");
+    return allOther ? 2 : 0;
 }
 
 // argbuf: MTLArgumentEncoder as WebKit's WebGPU uses it for every bind group: the argument buffer holds a buffer's address, a
@@ -2835,6 +3060,10 @@ int main(int argc, char **argv) {
             return familiesProbe();
         if (argc >= 2 && !strcmp(argv[1], "argbuf"))
             return argBufferProbe();
+        if (argc >= 2 && !strcmp(argv[1], "msaa"))
+            return msaaProbe(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "dontcare"))
+            return dontCareProbe(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "sysctl"))
             return sysctlProbe(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "ethernet"))
