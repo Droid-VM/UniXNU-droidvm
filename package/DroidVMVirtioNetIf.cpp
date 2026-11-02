@@ -11,9 +11,11 @@
 //
 // The controller sits on a nub of its own carrying "built-in", which IONetworkInterface turns into IOBuiltin, so configd's
 // InterfaceNamer names the interface en0 and IPConfiguration configures it from the Data seed's network service.
+#include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOService.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <mach/kmod.h>
+#include <pexpert/pexpert.h>
 
 extern kmod_info_t g_kernel_kmod_info;
 
@@ -46,12 +48,29 @@ volatile uint32_t droidvm_net_if_stage;
 volatile int droidvm_net_family_status = -1;
 volatile uint64_t droidvm_net_controller;
 IOService *droidvm_ethernet_create(const uint8_t mac[6], IOService *provider);
+IOService *droidvm_wifi_create(const uint8_t mac[6], IOService *provider);
 void droidvm_ethernet_input(IOService *controller, const void *frame, unsigned length);
 int droidvm_net_if_attach(const uint8_t mac[6]);
 void droidvm_net_if_input(const void *frame, unsigned length);
 }
 
-static IOService *droidvm_net_nic;
+static IOService *droidvm_net_nic, *droidvm_net_wifi;
+
+// A built-in nub for a controller: IONetworkInterface turns its "built-in" into IOBuiltin.
+static IOService *droidvm_net_nub(const char *name, IOService *resources) {
+    IOService *nub = OSTypeAlloc(IOService);
+    if (!nub || !nub->init()) {
+        OSSafeReleaseNULL(nub);
+        return nullptr;
+    }
+    nub->setName(name);
+    nub->setProperty("built-in", kOSBooleanTrue);
+    if (!nub->attach(resources)) {
+        nub->release();
+        return nullptr;
+    }
+    return nub;
+}
 
 static IOService *droidvm_net_start_service(const char *class_name, IOService *provider) {
     const OSSymbol *name = OSSymbol::withCString(class_name);
@@ -86,22 +105,30 @@ int droidvm_net_if_attach(const uint8_t mac[6]) {
     droidvm_net_if_stage = 2;
     if (!droidvm_net_start_service("IONetworkStack", resources)) return -1;
     droidvm_net_if_stage = 3;
-    IOService *nub = OSTypeAlloc(IOService);
-    if (!nub || !nub->init()) {
-        OSSafeReleaseNULL(nub);
-        return -1;
-    }
-    nub->setName("droidvm-net");
-    nub->setProperty("built-in", kOSBooleanTrue);
-    if (!nub->attach(resources)) {
-        nub->release();
-        return -1;
-    }
+    IOService *nub = droidvm_net_nub("droidvm-net", resources);
+    if (!nub) return -1;
     droidvm_net_if_stage = 4;
     droidvm_net_nic = droidvm_ethernet_create(mac, nub);
     if (!droidvm_net_nic) return -1;
     droidvm_net_controller = (uintptr_t)droidvm_net_nic;
     droidvm_net_if_stage = 5;
+    // the Wi-Fi interface (DroidVMWifi.inc), after the Ethernet one so the Ethernet keeps the first unit; its address is the device
+    // tree's /chosen/mac-address-wifi0, as an iPad's is (else the virtio one with the top bit of the last byte flipped).
+    // droidvm-wifi=0 leaves it out.
+    uint32_t wifi = 1;
+    PE_parse_boot_argn("droidvm-wifi", &wifi, sizeof wifi);
+    if (wifi) {
+        uint8_t wifi_mac[6];
+        memcpy(wifi_mac, mac, 6);
+        wifi_mac[5] ^= 0x80;
+        if (IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane)) {
+            OSData *address = OSDynamicCast(OSData, chosen->getProperty("mac-address-wifi0"));
+            if (address && address->getLength() == 6) memcpy(wifi_mac, address->getBytesNoCopy(), 6);
+            chosen->release();
+        }
+        if (IOService *wifi_nub = droidvm_net_nub("droidvm-wlan", resources)) droidvm_net_wifi = droidvm_wifi_create(wifi_mac, wifi_nub);
+        droidvm_net_if_stage = droidvm_net_wifi ? 6 : 7;
+    }
     return 0;
 }
 

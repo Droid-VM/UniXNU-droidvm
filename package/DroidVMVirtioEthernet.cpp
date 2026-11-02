@@ -5,19 +5,27 @@
 // configd's InterfaceNamer name en0, so iOS's own network configuration (IPConfiguration's DHCP, routes, DNS) manages it.
 // The virtqueues stay in the transport half (DroidVMVirtioNet.c); this class only adapts them:
 //   outputPacket -> droidvm_net_tx_frame          transport receive poll -> droidvm_ethernet_input -> inputPacket
-// Like the other statically linked IOKit classes here, the object's static initializer is staged for a late call, made by
-// DroidVMVirtioNetIf.cpp together with the family's own.
+// Beside it, as on an iPad with an Ethernet adapter, the Wi-Fi interface (DroidVMWifi.inc, included at the end): a controller of
+// its own with no transport. Like the other statically linked IOKit classes here, the object's static initializer (both
+// controllers') is staged for a late call, made by DroidVMVirtioNetIf.cpp together with the family's own.
+#include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/network/IOEthernetController.h>
 #include <IOKit/network/IOEthernetInterface.h>
 #include <IOKit/network/IONetworkMedium.h>
 #include <IOKit/network/IOOutputQueue.h>
+#include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <net/ethernet.h>
+#include <net/kpi_interface.h>
+#include <pexpert/pexpert.h>
+#include <stdarg.h>
 
 extern "C" {
 int droidvm_net_tx_frame(const void *frame, unsigned length);
 IOService *droidvm_ethernet_create(const uint8_t mac[6], IOService *provider);
 void droidvm_ethernet_input(IOService *controller, const void *frame, unsigned length);
+IOService *droidvm_wifi_create(const uint8_t mac[6], IOService *provider);
 // For the host rig (peek.py): the stack's calls into the controller, and the interface as BSD sees it (unit + 1 once IONetworkStack
 // has attached an ifnet, its flags, and whether the interface came out IOBuiltin). The guest's addresses need no probe: the
 // app's br-wifi proxy shows them on the phone's wlan0.
@@ -27,6 +35,7 @@ volatile uint32_t droidvm_ethernet_unit, droidvm_ethernet_ifflags, droidvm_ether
 
 #define DROIDVM_NET_FRAME 1514
 #define DROIDVM_NET_SPEED (1000ULL * 1000 * 1000)
+#define DROIDVM_WIFI_SPEED (866ULL * 1000 * 1000)
 
 class DroidVMVirtioEthernet : public IOEthernetController {
     OSDeclareDefaultStructors(DroidVMVirtioEthernet)
@@ -162,3 +171,5 @@ IOService *droidvm_ethernet_create(const uint8_t mac[6], IOService *provider) {
 void droidvm_ethernet_input(IOService *controller, const void *frame, unsigned length) {
     static_cast<DroidVMVirtioEthernet *>(controller)->input(frame, length);
 }
+
+#include "DroidVMWifi.inc"

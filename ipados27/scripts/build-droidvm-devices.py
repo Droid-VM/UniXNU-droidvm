@@ -145,7 +145,7 @@ def main():
         source = ROOT / 'kits/droidvm' / f'{name}.c'
         objects.append(command(c_mach, source, OUT / f'{name}.o', ('-DDROIDVM_DEVICE_DYNAMIC=1',)))
         sources.append(source)
-    sources.append(ROOT / 'kits/droidvm/DroidVMDmaRegion.h')
+    sources += [ROOT / 'kits/droidvm/DroidVMDmaRegion.h', ROOT / 'kits/droidvm/DroidVMWifi.inc']
     rel = lambda p: str(p.relative_to(ROOT))  # noqa: E731
     (OUT / 'objects.json').write_text(json.dumps([rel(p) for p in objects], indent=2) + '\n')
     (OUT / 'sources.json').write_text(json.dumps([rel(p) for p in sources], indent=2) + '\n')

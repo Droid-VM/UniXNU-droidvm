@@ -69,6 +69,12 @@ def node(name, properties=(), children=()):
     return result + b''.join(children)
 
 
+def wifi_address(unique_chip_id):
+    """The Wi-Fi interface's address: locally administered (0x02 in the first byte) and stable for one unique chip ID."""
+    seed = (unique_chip_id or 0x4456).to_bytes(8, 'little')
+    return bytes([0x02, 0xd7]) + zlib.crc32(b'wifi' + seed).to_bytes(4, 'big')
+
+
 def bluetooth_address(unique_chip_id):
     """A Bluetooth address for the guest: locally administered (0x02 in the first byte) and stable for one unique chip ID; a
     fixed one without it."""
@@ -496,6 +502,9 @@ def main():
                         *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]
                           if args.unique_chip_id is not None else []),
                         ('osenvironment', b'main\0'),
+                        # the Wi-Fi interface's address (MobileGestalt's WifiAddress, Settings' Wi-Fi Address), which DroidVMWifi.inc's
+                        # controller takes: locally administered and stable for one unique chip ID, as the Bluetooth one is
+                        *([('mac-address-wifi0', wifi_address(args.unique_chip_id))] if args.ipad_identity else []),
                         *([('darwinboot-fdt', struct.pack('<I', 7))] if args.dynamic else []),
                         *([('certificate-production-status', struct.pack('<I', 0)), ('effective-production-status-ap', struct.pack('<I', 0)),
                            ('certificate-security-mode', struct.pack('<I', 1)), ('effective-security-mode-sep', struct.pack('<I', 1))]
@@ -532,12 +541,6 @@ def main():
         node('defaults', [('sleep-disabled', struct.pack('<I', 1)), ('vmm-present', struct.pack('<I', 1)),
                           ('kern.maxvnodes', struct.pack('<I', kernel_memory // 0x10000 + 1024))]),
         node('options', []),
-        # wifid: launchd loads it only where the device tree has a node named wlan (its _LimitLoadToDeviceTree, which launchd asks
-        # through io_device_tree_entry_exists_with_name: IODTFindMatchingEntries from the root). Without it no process could look up
-        # the Wi-Fi manager and every WiFiKit client kept retrying the lookup (Settings 338 times as it started, "bootstrap_look_up of
-        # WiFiManager server failed"); with it wifid answers that there is no Wi-Fi interface. A top-level node, which no bus
-        # publishes: no Wi-Fi driver matches it.
-        *([node('wlan', [])] if args.ipad_identity else []),
         # bluetoothd: the controller it finds by name (IOServiceNameMatching "marconi-bt", then "bluetooth"; a top-level node gets
         # its nub from the platform expert as wlan's does). transport-encoding 10 is iPadOS 27's virtual transport ("HCI Transport
         # is set to virtual"), the one of Apple's own virtual machines: with kern.hv_vmm_present set ("Bluetooth is running inside
@@ -573,6 +576,11 @@ def main():
              [node('intc', [('compatible', b'arm,gic-v3\0'),
                             ('reg', struct.pack('<4Q', dist - ARMIO_BASE, dist_size, redist - ARMIO_BASE, redist_size)),
                             ('redistributor-stride', struct.pack('<Q', GIC_REDIST_STRIDE))]),
+              # The Wi-Fi radio's node, where an iPad has it: launchd loads wifid only where the device tree has a node named wlan
+              # (its _LimitLoadToDeviceTree: io_device_tree_entry_exists_with_name, a recursive IODTFindMatchingEntries), and
+              # MobileGestalt answers wifi (Settings' Wi-Fi item) by IODeviceTree:/arm-io/wlan. No driver matches it: the Wi-Fi
+              # interface is DroidVMWifi.inc's, on a nub of its own.
+              *([node('wlan', [('device_type', b'wlan\0')])] if args.ipad_identity else []),
               *([] if args.dynamic else [
                 *[node('virtio-mmio-%d' % index, [('compatible', b'virtio,mmio\0'),
                                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
