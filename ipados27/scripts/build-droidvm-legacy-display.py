@@ -513,11 +513,28 @@ hid_sources = [ROOT / p for p in json.loads((ROOT / 'build/droidvm-hid-input/sou
 # The network, sound, battery and media devices (build-droidvm-devices.py, an earlier archive step).
 device_objects = [ROOT / p for p in json.loads((ROOT / 'build/droidvm-devices/objects.json').read_text())]
 device_sources = [ROOT / p for p in json.loads((ROOT / 'build/droidvm-devices/sources.json').read_text())]
-# The keystore state service (AppleKeyStoreState) and its probe, unchanged from iPadOS 17.
+# The keystore state service (AppleKeyStoreState) and its probe, as on iPadOS 17: its user client also wraps and unwraps keys for
+# securityd (kits/droidvm/KeyStoreWrap.inc, selectors 10 and 11), compiled from a staged copy with build-arm-driver.py's own command.
+# Without them every keychain add failed (ks_crypt e00002c7 'oe'), and bluetoothd restarted as it began (no LE identity root).
 keystore_source = ROOT / 'kits/droidvm/KeyStoreProbe.cpp'
 compile_cpp(keystore_source, OUT / 'KeyStoreProbe.o')
 print(run(['python3', ROOT / 'scripts/build-arm-driver.py', 'NativeKeyStoreEvents'], text=True), end='')
 keyevents = ROOT / 'build/apple-key-store-state'
+keystore_original = ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp'
+keystore_wrap = ROOT / 'kits/droidvm/KeyStoreWrap.inc'
+keystore_text = keystore_original.read_text()
+for anchor, replacement in (('}  // namespace\n', keystore_wrap.read_text() + '}  // namespace\n'),
+                            ('        default: break;\n', '        case 10: case 11: rc = droidvmWrap(selector, args); break;\n'
+                                                       '        default: break;\n')):
+    require(keystore_text.count(anchor) == 1, 'NativeKeyStoreEvents.cpp no longer has exactly one ' + anchor.strip())
+    keystore_text = keystore_text.replace(anchor, replacement)
+# the same file name: the late static initializer is named after it (__GLOBAL__sub_I_NativeKeyStoreEvents.cpp)
+keystore_staged = keyevents / 'droidvm' / 'NativeKeyStoreEvents.cpp'
+keystore_staged.parent.mkdir(exist_ok=True)
+keystore_staged.write_text(keystore_text)
+keystore_command = json.loads((keyevents / 'compile-command.json').read_text())
+require(keystore_command.count(str(keystore_original)) == 1, 'build-arm-driver.py compiles NativeKeyStoreEvents.cpp once')
+run([str(keystore_staged) if a == str(keystore_original) else a for a in keystore_command], cwd=r['directory'])
 keyevents_late = keyevents / 'NativeKeyStoreEvents.late.o'
 run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
      keyevents / 'NativeKeyStoreEvents.o', keyevents_late])
@@ -535,7 +552,7 @@ run(['xcrun', 'ar', 'rcs', archive, late, OUT / 'original-bindings.o', OUT / 'or
 sources = [ROOT / 'drivers/GopFramebuffer/NativeLegacyDisplay.cpp', ROOT / 'drivers/GopFramebuffer/NativeLegacyRequest.h',
            ROOT / 'drivers/GopFramebuffer/NativeGOPPresenter.cpp', ROOT / 'drivers/GopFramebuffer/NativeGOPWire.h',
            ROOT / 'drivers/GopFramebuffer/NativeHalfCodes.h', source,
-           ROOT / 'scripts' / ABI_PATH.name, keystore_source, ROOT / 'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',
+           ROOT / 'scripts' / ABI_PATH.name, keystore_source, keystore_original, keystore_wrap,
            export_source, page_info_source, clock_source, policy_source, bootargs_source, *virtio_gpu_sources, *gpu_sources, *hid_sources,
            *device_sources]
 (OUT / 'build-report.json').write_text(json.dumps(dict(

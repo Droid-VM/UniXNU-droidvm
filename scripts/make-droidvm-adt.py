@@ -69,6 +69,14 @@ def node(name, properties=(), children=()):
     return result + b''.join(children)
 
 
+def bluetooth_address(unique_chip_id):
+    """A Bluetooth address for the guest: locally administered (0x02 in the first byte) and stable for one unique chip ID; a
+    fixed one without it."""
+    seed = (unique_chip_id or 0x4456).to_bytes(8, 'little')
+    tail = zlib.crc32(b'bluetooth' + seed).to_bytes(4, 'big')
+    return bytes([0x02, 0xd7]) + tail
+
+
 def read_adt(blob, offset=0):
     """An Apple device tree as (properties, children); properties map a name to its bytes. A length's top bit marks a
     template property (newer trees), not part of its size."""
@@ -530,6 +538,13 @@ def main():
         # WiFiManager server failed"); with it wifid answers that there is no Wi-Fi interface. A top-level node, which no bus
         # publishes: no Wi-Fi driver matches it.
         *([node('wlan', [])] if args.ipad_identity else []),
+        # bluetoothd: the controller it finds by name (IOServiceNameMatching "marconi-bt", then "bluetooth"; a top-level node gets
+        # its nub from the platform expert as wlan's does). transport-encoding 10 is iPadOS 27's virtual transport ("HCI Transport
+        # is set to virtual"), the one of Apple's own virtual machines: with kern.hv_vmm_present set ("Bluetooth is running inside
+        # a Virtual Machine, so skipping chip initialization") it runs no BlueTool script and needs no chip. local-mac-address is
+        # what bluetoothd reads as its address (six bytes, not all zero): a locally administered one from the unique chip ID.
+        *([node('bluetooth', [('device_type', b'bluetooth\0'), ('transport-encoding', struct.pack('<I', 10)),
+                              ('local-mac-address', bluetooth_address(args.unique_chip_id))])] if args.ipad_identity else []),
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
                             ('button-names', b'hold\0voldown\0volup\0'),
                             ('home-button-type', struct.pack('<I', 2))])] if args.ipad_identity else []),

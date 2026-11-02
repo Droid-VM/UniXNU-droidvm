@@ -7,10 +7,11 @@
 char PE_builtin_boot_args[] =
     // jobs this guest cannot serve, disabled by the launch policy before launchd starts (DroidVMLaunchPolicy.c): watchdogd has no
     // watchdog backend, identityservicesd, CommCenter, fairplayd and accessoryupdaterd wait for hardware or services there are none of.
-    // bluetoothd finds no Bluetooth controller ("Unable to match bluetooth service in device tree"), exits, and launchd started it
-    // again every 10 seconds; its clients saw the connection interrupted rather than gone, so Settings' Bluetooth item waited for the
-    // controller to activate (its deferred setup holds up every sidebar item after it). Disabled, the activation fails at once.
-    "droidvm-disable-jobs=watchdogd,identityservicesd,CommCenter,fairplayd.A2,accessoryupdaterd,bluetoothd "
+    // Not bluetoothd, though it finds no Bluetooth controller and exits ("Unable to match bluetooth service in device tree"), launchd
+    // starting it again every 10 seconds: disabled, its Mach services are gone, and audiomxd's BTAudioHALPlugin reconnects from its
+    // connection's error handler at once, looking com.apple.BTAudioHALPlugin.xpc up about 1900 times a second, and launchd, which
+    // reads the password file for each failed lookup (no system-proxy persona), spent 90% of a CPU answering it.
+    "droidvm-disable-jobs=watchdogd,identityservicesd,CommCenter,fairplayd.A2,accessoryupdaterd "
     // the deletable system apps of the OS volume's staged_system_apps in /Applications (the bring-up patch's union) and lsd's
     // first-boot semaphore that keeps them registered (DroidVMLaunchPolicy.c)
     "owner-staged-apps=1 "
