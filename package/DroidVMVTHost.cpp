@@ -13,7 +13,8 @@
 //          answers true (esup/ecop: the encoder's, UsingHardwareAcceleratedVideoEncoder).
 //   dsta   the session's format (,fds an ImageDescription with avcC or hvcC): a virtio-media session is opened, its OUTPUT queue set
 //          up and streaming; the guest is told the pixel buffers it should allocate (Dpba, 420v of the coded size) before the
-//          answer.
+//          answer. What the device cannot decode (outside its frame sizes, not 4:2:0) is refused here, and VideoToolbox takes its
+//          software decoder instead: refused later, frame by frame, it would not.
 //   dfrm   a frame (,frm its ID, ,sbf the sample buffer): its NAL units, from length-prefixed to Annex B (the parameter sets
 //          before the first), kept for the worker, which puts it in a free OUTPUT buffer with the frame ID as its timestamp;
 //          answered at once, asynchronous (,inf 1).
@@ -97,7 +98,7 @@ void failed(uint32_t stage, int32_t value) {
 // --- V4L2 over virtio-media (64-bit Linux layouts) ----------------------------------------------------------------------------
 enum : uint32_t {
     IocGFmt = 4, IocSFmt = 5, IocReqbufs = 8, IocQuerybuf = 9, IocQbuf = 15, IocStreamon = 18, IocStreamoff = 19, IocGCtrl = 27,
-    IocSubscribeEvent = 90, IocDecoderCmd = 96,
+    IocSubscribeEvent = 90, IocDecoderCmd = 96, IocEnumFramesizes = 74,
     TypeCaptureMplane = 9, TypeOutputMplane = 10, MemoryMmap = 1,
     EventEos = 2, EventSourceChange = 5,
     BufFlagLast = 0x00100000, BufFlagError = 0x40,
@@ -1520,11 +1521,41 @@ void pixelBufferAttributes(Session *s) {
     delete p;
 }
 
+// What the phone's decoder is not given, so that VideoToolbox decodes it in software instead: a picture outside the coded sizes
+// the device reports (ENUM_FRAMESIZES; Qualcomm's start at 96x96), or a stream that is not 4:2:0, since the CAPTURE queue is
+// NV12 alone (H.264 High 10, 4:2:2 and 4:4:4 profiles, which MediaCodec fails frame by frame; HEVC by the hvcC's chroma format
+// and bit depths: Main 10 comes out as 8-bit NV12, which the 420v pixel buffers VideoToolbox is given want anyway).
+bool decodableFormat(const ImageDescription &d) {
+    Atom record;
+    if (find(d.extensions, d.extensionsSize, cc("avcC"), record)) {
+        if (record.size < 4) return false;
+        const uint8_t profile = record.body[1];
+        return profile == 66 || profile == 77 || profile == 100;   // Baseline, Main, High
+    }
+    if (find(d.extensions, d.extensionsSize, cc("hvcC"), record)) {
+        if (record.size < 23) return false;
+        const uint8_t chroma = record.body[16] & 3, lumaDepth = (record.body[17] & 7) + 8, chromaDepth = (record.body[18] & 7) + 8;
+        return chroma == 1 && lumaDepth <= 10 && chromaDepth <= 10;
+    }
+    return false;
+}
+
+bool decodableSize(Session *s, uint32_t pixelformat) {
+    uint32_t sizes[11] = {0, pixelformat};   // struct v4l2_frmsizeenum: index, pixel_format, type, stepwise, reserved
+    const int r = ioctl(s, IocEnumFramesizes, sizes, sizeof sizes, sizeof sizes);
+    if (r) return true;   // a device that does not say lets the codec decide
+    const uint32_t minWidth = sizes[3], maxWidth = sizes[4], minHeight = sizes[6], maxHeight = sizes[7];
+    const bool fits = s->width >= minWidth && s->width <= maxWidth && s->height >= minHeight && s->height <= maxHeight;
+    if (!fits) trace("%ux%u outside %u..%u x %u..%u", s->width, s->height, minWidth, maxWidth, minHeight, maxHeight);
+    return fits;
+}
+
 int startSession(Session *s, const uint8_t *m, uint32_t n) {
     Param fds;
     ImageDescription d;
     if (!param(m, n, cc(",fds"), fds) || !imageDescription(fds.value, fds.size, d)) return -12902;
     if (d.codec != cc("avc1") && d.codec != cc("hvc1") && d.codec != cc("hev1")) return -12906;
+    if (!decodableFormat(d)) return -12910;   // kVTVideoDecoderUnsupportedDataFormatErr
     if (!parameterSets(s, d)) return -12909;
     teardown(s);
     s->width = d.width;
@@ -1539,6 +1570,7 @@ int startSession(Session *s, const uint8_t *m, uint32_t n) {
     registerSession(s);
     droidvm_media_set_fast(s->device, true);
     s->fast = true;
+    if (!decodableSize(s, d.codec == cc("avc1") ? cc("462H") : cc("CVEH"))) { teardown(s); return -12910; }
     uint32_t subscription[8] = {EventSourceChange, 0, 0, 0, 0, 0, 0, 0};
     r = ioctl(s, IocSubscribeEvent, subscription, sizeof subscription, 0);
     if (r) failed(2, r);
@@ -1619,6 +1651,9 @@ int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
 }  // namespace
 
 extern "C" {
+
+// Whether crosvm gave the guest a virtio-media decoder or encoder: the transport publishes Apple's driver only then.
+bool droidvm_vthost_available(void) { return decoderDevice() != ~0u || encoderDevice() != ~0u; }
 
 void *droidvm_vthost_client_open(void *transport, bool (*send)(void *, const uint8_t *, uint32_t), task_t task, int pid) {
     if (!gTableLock) {

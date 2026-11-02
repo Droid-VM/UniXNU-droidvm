@@ -212,6 +212,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <ImageIO/ImageIO.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
@@ -1675,6 +1676,46 @@ static void vtEncodedFrame(void *refcon, void *frameRefcon, OSStatus status, VTE
                                      key ? " (key)" : "");
     vtEncodedBytes += length;
     ++vtEncoded;
+}
+
+// imgdecode FILE [N]: the image decoded N times through ImageIO (a HEIC's tiles go through CMPhoto and VideoToolbox's HEVC
+// decoder, a JPEG through AppleJPEG or CMPhoto), each time from a new source: its size, the time to a decoded image, the mean
+// of its green channel.
+static int imageDecodeProbe(int argc, char **argv) {
+    if (argc < 1) return 1;
+    const int count = argc >= 2 ? atoi(argv[1]) : 1;
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)argv[0], (CFIndex)strlen(argv[0]), false);
+    const void *keys[1] = {kCGImageSourceShouldCacheImmediately}, *values[1] = {kCFBooleanTrue};
+    CFDictionaryRef options = CFDictionaryCreate(NULL, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    double total = 0;
+    for (int i = 0; i < count; ++i) {
+        const uint64_t begin = mach_absolute_time();
+        CGImageSourceRef source = CGImageSourceCreateWithURL(url, NULL);
+        CGImageRef image = source ? CGImageSourceCreateImageAtIndex(source, 0, options) : NULL;
+        const double ms = (mach_absolute_time() - begin) / 24000.0;
+        total += ms;
+        if (!image) { printf("imgdecode: %d: no image (source %p)\n", i, source); if (source) CFRelease(source); continue; }
+        const size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+        if (i == 0 || i == count - 1) {
+            uint8_t *pixels = calloc(width * height, 4);
+            CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+            CGContextRef context = CGBitmapContextCreate(pixels, width, height, 8, width * 4, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+            CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+            uint64_t sum = 0;
+            for (size_t p = 0; p < width * height; ++p) sum += pixels[p * 4 + 1];
+            printf("imgdecode: %d: %zux%zu %s %.1f ms, mean green %.2f\n", i, width, height,
+                   CFStringGetCStringPtr(CGImageSourceGetType(source), kCFStringEncodingUTF8), ms, (double)sum / (double)(width * height));
+            CGContextRelease(context);
+            CGColorSpaceRelease(space);
+            free(pixels);
+        }
+        CGImageRelease(image);
+        CFRelease(source);
+    }
+    printf("imgdecode: %d decodes, %.1f ms each\n", count, total / count);
+    CFRelease(options);
+    CFRelease(url);
+    return 0;
 }
 
 static int vtEncodeProbe(int argc, char **argv) {
@@ -3405,6 +3446,8 @@ int main(int argc, char **argv) {
             return vtDecodeProbe(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "vtencode"))
             return vtEncodeProbe(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "imgdecode"))
+            return imageDecodeProbe(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "sysctl"))
             return sysctlProbe(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "ethernet"))

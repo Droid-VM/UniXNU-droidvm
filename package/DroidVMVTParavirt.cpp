@@ -23,8 +23,9 @@
 // direction, CaptureEntries slots of CaptureBytes (the length, the direction -- 0 from the guest, 1 to it -- then the message).
 // Each message then goes to the host's side (DroidVMVTHost.cpp: the decoder and encoder over crosvm's virtio-media), whose
 // messages to the guest are queued here. The service is
-// published only with droidvm-vt-paravirt=1, or when root writes 1 to kern.droidvm_vt_paravirt (registered at run time, as
-// DroidVMMotion.c's; it reads the stage): without it VideoToolbox keeps its own codecs. Each process asks once
+// published at boot with droidvm-vt-paravirt=1 (among the board's built-in boot arguments; =0 on the command line turns it off),
+// or when root writes 1 to kern.droidvm_vt_paravirt (registered at run time, as DroidVMMotion.c's; it reads the stage), and only
+// when crosvm gives a virtio-media decoder or encoder: without it VideoToolbox keeps its own codecs. Each process asks once
 // (VTParavirtualizationIsRunningInGuest is a dispatch_once), so only processes started after the write use the channel.
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
@@ -41,6 +42,7 @@ extern kmod_info_t g_kernel_kmod_info;
 static IOBufferMemoryDescriptor *capture;
 extern "C" {
 void *droidvm_vthost_client_open(void *transport, bool (*send)(void *, const uint8_t *, uint32_t), task_t task, int pid);
+bool droidvm_vthost_available(void);
 void droidvm_vthost_client_close(void *host);
 int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint32_t *surfaces, unsigned surfaceCount);
 volatile uint32_t droidvm_vtpv_sent, droidvm_vtpv_dropped;
@@ -315,6 +317,7 @@ DROIDVM_LATE_INIT(DroidVMVTParavirt)
 // Publishes the service on IOResources, once.
 static int publish(void) {
     if (droidvm_vtpv_stage != 1) return droidvm_vtpv_stage == 2 ? 0 : -1;
+    if (!droidvm_vthost_available()) return -1;   // no codec to stand for: VideoToolbox keeps its own
     capture = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut) |
                                                                IOOptionBits(kIOMemoryPhysicallyContiguous),
                                                                CaptureEntries * CaptureBytes, 0x0000fffffffff000ULL);

@@ -32,6 +32,13 @@ char PE_builtin_boot_args[] =
     // kern.hv_vmm_present and, in a virtual machine, makes an adapter only when the WebKitAllowWebGPUOnVMs default is set, so no page
     // had WebGPU; this guest's GPU is the phone's own Adreno, not a paravirtual one.
     "owner-hide-vmm=audiomxd,com.apple.WebKit.GPU "
+    // VideoToolbox's H.264 and HEVC on the phone's codecs: Apple's paravirtualization driver published at boot (DroidVMVTParavirt.cpp;
+    // only when crosvm gives a virtio-media decoder or encoder), the guest kernel playing the host (DroidVMVTHost.cpp). VideoToolbox
+    // asks whether it runs in a guest once per process, so a switch made later reaches only processes started after it (videocodecd
+    // keeps the answer it had). In a guest it also drops the hardware codecs that are not paravirtualized (AVD, AVE: there is no such
+    // hardware here) and relaxes MediaToolbox's screen-protection checks; CMPhoto asks for a paravirtualized JPEG codec, is refused
+    // and keeps its software one
+    "droidvm-vt-paravirt=1 "
     // the timebase userspace sees, Apple's 24 MHz over the host's 19.2 MHz counter (patches/xnu-12377/droidvm-timebase-24mhz.patch):
     // libswift_Concurrency converts Task.sleep and every ContinuousClock deadline to ticks as ns * 3 / 125, and on the host's rate
     // they waited a quarter of the host's uptime (Settings' debounced sidebar updates never arrived)
