@@ -438,6 +438,7 @@ extern void droidvm_snd_start(void);
 extern void droidvm_media_start(void);
 extern int droidvm_battery_attach(void);
 extern int droidvm_software_aes_attach(void);
+extern int droidvm_vt_paravirt_attach(void);
 extern void droidvm_cpufreq_attach(void);
 extern void droidvm_sched_trace_attach(void);
 extern void droidvm_rtc_set_calendar(void);
@@ -475,6 +476,7 @@ void native_touch_probe(void) {
     droidvm_net_start();
     droidvm_snd_start();
     droidvm_media_start();
+    droidvm_vt_paravirt_attach();
     droidvm_battery_attach();
     droidvm_cpufreq_attach();
     droidvm_sched_trace_attach();

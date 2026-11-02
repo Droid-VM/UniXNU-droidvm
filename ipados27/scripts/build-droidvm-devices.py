@@ -10,7 +10,7 @@ iPadOS 17 board's scripts/build-native-legacy-display.py builds them:
   - the speaker and microphone (DroidVMAudio.cpp, linked under the original IOAudio2Family's classes at attach) over virtio-snd
     (DroidVMVirtioSnd.c), the battery (DroidVMBattery.cpp, an IOPMPowerSource over crosvm's goldfish battery), the motion sensors'
     command channel CoreMotion opens as the sensor processor's (DroidVMSensorProcessor.cpp), the virtio-media
-    devices (DroidVMVirtioMedia.c), the vCPUs' performance requests to the host (DroidVMCpufreq.c, crosvm's virtual cpufreq) and
+    devices (DroidVMVirtioMedia.c), VideoToolbox's paravirtualization channel (DroidVMVTParavirt.cpp, Apple's names), the vCPUs' performance requests to the host (DroidVMCpufreq.c, crosvm's virtual cpufreq) and
     the scheduler trace the host reads from guest RAM (DroidVMSchedTrace.c, droidvm-sched-trace.patch).
 
 The transports take their rings and buffers from a region allocated when the device starts (DROIDVM_DEVICE_DYNAMIC,
@@ -136,7 +136,8 @@ def main():
         sources.append(family / f'{stem}.cpp')
     strict = (*lib, *universe, '-isystem', str(include))
     for name, late in (('DroidVMVirtioEthernet', True), ('DroidVMVirtioNetIf', False), ('DroidVMAudio', True),
-                       ('DroidVMBattery', True), ('DroidVMSensorProcessor', True), ('DroidVMSoftwareAES', False)):
+                       ('DroidVMBattery', True), ('DroidVMSensorProcessor', True), ('DroidVMSoftwareAES', False),
+                       ('DroidVMVTParavirt', True)):
         source = ROOT / 'kits/droidvm' / f'{name}.cpp'
         obj = command(cpp, source, OUT / f'{name}.o', strict)
         objects.append(stage_late(obj, name) if late else obj)

@@ -31,6 +31,7 @@ binary = OUT / 'gfxprobe'
 subprocess.run(['xcrun', 'clang', '-target', TARGET, '-isysroot', sdk, '-O2', '-Wall', '-Wextra', '-Werror',
                 '-fno-objc-arc', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface',
                 '-framework', 'QuartzCore', '-framework', 'IOKit', '-framework', 'CoreGraphics', '-framework', 'CoreImage', '-framework', 'CoreMotion',
+                '-framework', 'CoreMedia', '-framework', 'CoreVideo', '-framework', 'VideoToolbox',
                 # `gfxprobe virtgpu`: NativeAdreno's virtio-gpu 3D methods (DroidVMVirtgpuABI.h)
                 '-I', FORK / 'drivers/Adreno740', SOURCE, '-o', binary], check=True)
 entitlements = OUT / 'entitlements.plist'
