@@ -1,0 +1,170 @@
+A 24 MHz timebase for the guest's userspace over the host's architected counter (droidvm-timebase-hz): every kernel read of
+the counter scaled by target/hardware, decrementer values converted back, the target frequency reported, and userspace given
+the timebase through the mach_absolute_time trap. libswift_Concurrency converts Task.sleep deadlines with Apple's 125/3.
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -497,9 +497,15 @@
+  *
+  */
+ 
++extern uint32_t ml_timebase_scale_num, ml_timebase_scale_den;   /* the timebase's scale (below, droidvm-timebase-hz) */
++
+ uint8_t
+ user_timebase_type(void)
+ {
++	/* A scaled timebase is not the counter EL0 would read: userspace takes it through the mach_absolute_time trap. */
++	if (ml_timebase_scale_num != ml_timebase_scale_den) {
++		return USER_TIMEBASE_NONE;
++	}
+ #if HAS_ACNTVCT
+ 	return USER_TIMEBASE_NOSPEC_APPLE;
+ #elif HAS_APPLE_GENERIC_TIMER
+@@ -2467,20 +2473,53 @@
+ #endif
+ 
+ /*
++ * DroidVM: the timebase is the architected counter scaled by num/den (pe_identify_machine.c, droidvm-timebase-hz): 24 MHz over a
++ * 19.2 MHz counter is 5/4. Every kernel read of the counter goes through timebase_from_counter, a decrementer value is converted
++ * back to counter ticks, and userspace takes the timebase through the mach_absolute_time trap (user_timebase_type).
++ */
++uint32_t ml_timebase_scale_num = 1, ml_timebase_scale_den = 1;
++
++static inline bool
++timebase_scaled(void)
++{
++	return ml_timebase_scale_num != ml_timebase_scale_den;
++}
++
++static inline uint64_t
++timebase_from_counter(uint64_t counter)
++{
++	const uint64_t num = ml_timebase_scale_num, den = ml_timebase_scale_den;
++
++	if (__probable(num == den)) {
++		return counter;
++	}
++	return counter / den * num + counter % den * num / den;
++}
++
++/*
+  * Assumes fiq, irq disabled.
+  */
+ void
+ ml_set_decrementer(uint32_t dec_value)
+ {
+ 	cpu_data_t      *cdp = getCpuDatap();
++	uint64_t        counter_value = dec_value;
+ 
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+ 	cdp->cpu_decrementer = dec_value;
+ 
++	if (timebase_scaled()) {
++		/* Counter ticks, rounded up: the timer fires at the deadline or just after it, never before. */
++		counter_value = (counter_value * ml_timebase_scale_den + ml_timebase_scale_num - 1) / ml_timebase_scale_num;
++		if (counter_value > 0x7fffffff) {
++			counter_value = 0x7fffffff;
++		}
++	}
++
+ 	if (cdp->cpu_set_decrementer_func) {
+-		cdp->cpu_set_decrementer_func(dec_value);
++		cdp->cpu_set_decrementer_func((uint32_t)counter_value);
+ 	} else {
+-		__builtin_arm_wsr64(KERNEL_CNTV_TVAL_EL0, (uint64_t)dec_value);
++		__builtin_arm_wsr64(KERNEL_CNTV_TVAL_EL0, counter_value);
+ 	}
+ }
+ 
+@@ -2491,7 +2530,7 @@
+ static inline uint64_t
+ speculative_timebase(void)
+ {
+-	return __builtin_arm_rsr64(KERNEL_CNTVCT_EL0);
++	return timebase_from_counter(__builtin_arm_rsr64(KERNEL_CNTVCT_EL0));
+ }
+ 
+ /**
+@@ -2503,7 +2542,7 @@
+ nonspeculative_timebase(void)
+ {
+ #if   __ARM_ARCH_8_6__
+-	return __builtin_arm_rsr64(KERNEL_CNTVCTSS_EL0);
++	return timebase_from_counter(__builtin_arm_rsr64(KERNEL_CNTVCTSS_EL0));
+ #else
+ 	// ISB required by ARMV7C.b section B8.1.2 & ARMv8 section D6.1.2
+ 	// "Reads of CNT[PV]CT[_EL0] can occur speculatively and out of order relative
+@@ -2620,6 +2659,11 @@
+ 		assert(wide_val == (uint64_t)dec);
+ 	}
+ 
++	/* Back in timebase ticks; a timer already past (TVAL negative) stays as read. */
++	if (timebase_scaled() && (int32_t)dec > 0) {
++		const uint64_t ticks = timebase_from_counter(dec);
++		dec = ticks > 0x7fffffff ? 0x7fffffff : (uint32_t)ticks;
++	}
+ 	return dec;
+ }
+ 
+@@ -2686,7 +2730,8 @@
+ 	 * If the SOC supports it (and it isn't broken), enable
+ 	 * EL0 access to the timebase registers.
+ 	 */
+-	if (user_timebase_type() != USER_TIMEBASE_NONE) {
++	if (user_timebase_type() != USER_TIMEBASE_NONE || timebase_scaled()) {
++		/* Scaled: EL0 keeps the counter (code that reads CNTVCT_EL0 itself sees it unscaled, rather than faulting). */
+ 		cntkctl |= (CNTKCTL_EL1_PL0PCTEN | CNTKCTL_EL1_PL0VCTEN);
+ 	}
+ 
+diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+--- a/pexpert/arm/pe_identify_machine.c
++++ b/pexpert/arm/pe_identify_machine.c
+@@ -31,6 +31,39 @@
+  *
+  * Sets up platform parameters. Returns:    nothing
+  */
++/*
++ * DroidVM: the timebase the guest's userspace is built for, droidvm-timebase-hz (24 MHz, every Apple arm64 SoC's), over an
++ * architected counter that runs at the host's rate (19.2 MHz on Qualcomm SoCs). iOS userspace assumes Apple's rate:
++ * libswift_Concurrency (swift_dispatchEnqueueWithDeadline) converts a ContinuousClock or SuspendingClock deadline to mach ticks as
++ * ns * 3 / 125, so on a 19.2 MHz counter every Task.sleep, debounce and timeout waited until 1.25 times the counter's value, a
++ * quarter of the host's uptime later (Settings' sidebar never took an update: its channel is debounced). The kernel scales every
++ * counter read by target/hardware (machine_routines.c), converts decrementer values back, and reports the target frequency here.
++ */
++extern uint32_t ml_timebase_scale_num, ml_timebase_scale_den;
++static void
++droidvm_virtual_timebase(void)
++{
++	uint32_t target = 0;
++	const uint64_t hardware = gPEClockFrequencyInfo.timebase_frequency_hz;
++
++	if (!PE_parse_boot_argn("droidvm-timebase-hz", &target, sizeof(target)) || target == 0 || hardware == 0 || target == hardware) {
++		return;
++	}
++	uint64_t a = target, b = hardware;
++	while (b != 0) {
++		const uint64_t r = a % b;
++		a = b;
++		b = r;
++	}
++	/* The scaled read (machine_routines.c) multiplies a remainder below den by num: both stay small. */
++	if (target / a > 0xffff || hardware / a > 0xffff) {
++		return;
++	}
++	ml_timebase_scale_num = (uint32_t)(target / a);
++	ml_timebase_scale_den = (uint32_t)(hardware / a);
++	gPEClockFrequencyInfo.timebase_frequency_hz = target;
++}
++
+ void
+ pe_identify_machine(boot_args * bootArgs)
+ {
+@@ -79,6 +112,7 @@
+ 				gPEClockFrequencyInfo.timebase_frequency_hz = *(uint32_t const *)value;
+ 			}
+ 		}
++		droidvm_virtual_timebase();
+ 		gPEClockFrequencyInfo.dec_clock_rate_hz = gPEClockFrequencyInfo.timebase_frequency_hz;
+ 
+ 		/* Find the bus frequency next. */

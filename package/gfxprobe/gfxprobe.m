@@ -9,6 +9,8 @@
 //                                       CGIOSurfaceContextCreate with WebKit's parameters for the format ('BGRA', 'b3a8' RGB10A8,
 //                                       'w30r' RGB10), a red fill and a flush; the bytes of each plane that are not 0 after
 //   gfxprobe user UID VERB ARG...      the verb as that user, without a sandbox (ethernet: what Settings asks before it lists Ethernet)
+//   gfxprobe clocks                     mach and POSIX clocks side by side, and a 1 s dispatch timer on uptime, wall and monotonic time
+//   gfxprobe scnotify KEY...            configd tells the SCDynamicStore sessions watching each key that it changed (value untouched)
 //   gfxprobe families                   each GPU family the Metal device answers (supportsFamily:), and the queries a family check uses
 //   gfxprobe sysctl [NAME...]           sysconf's memory figures and each sysctl (in a sandbox: which the profile refuses)
 //   gfxprobe box PROFILE[:UID] VERB ARG...  the verb inside the named sandbox profile (sandbox_init), e.g. com.apple.WebKit.GPU:501:
@@ -1218,6 +1220,99 @@ static int familiesProbe(void) {
         }
     }
     return 0;
+}
+
+// scnotify KEY...: configd tells every SCDynamicStore session watching each key that it changed (SCDynamicStoreNotifyValue), its value
+// untouched -- what a watcher such as Preferences' Ethernet watcher does on a real change, without bouncing the interface.
+static int scNotify(int count, char **keys) {
+    void *sc = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
+    CFTypeRef (*create)(CFAllocatorRef, CFStringRef, void *, void *) =
+        sc ? (CFTypeRef (*)(CFAllocatorRef, CFStringRef, void *, void *))dlsym(sc, "SCDynamicStoreCreate") : NULL;
+    Boolean (*notify)(CFTypeRef, CFStringRef) = sc ? (Boolean (*)(CFTypeRef, CFStringRef))dlsym(sc, "SCDynamicStoreNotifyValue") : NULL;
+    int (*lastError)(void) = sc ? (int (*)(void))dlsym(sc, "SCError") : NULL;
+    if (!create || !notify) {
+        printf("no SCDynamicStoreCreate/SCDynamicStoreNotifyValue\n");
+        return 1;
+    }
+    CFTypeRef store = create(NULL, CFSTR("gfxprobe"), NULL, NULL);
+    if (!store) {
+        printf("SCDynamicStoreCreate failed: %d\n", lastError ? lastError() : -1);
+        return 1;
+    }
+    int failed = 0;
+    for (int i = 0; i < count; i++) {
+        CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+        Boolean ok = notify(store, key);
+        printf("%s: %s", keys[i], ok ? "notified\n" : "failed ");
+        if (!ok) {
+            printf("%d\n", lastError ? lastError() : -1);
+            failed = 1;
+        }
+        CFRelease(key);
+    }
+    CFRelease(store);
+    return failed;
+}
+
+// clocks: the clocks a timer can be on, side by side (mach absolute and continuous time, the POSIX clocks), and a 1-second dispatch timer
+// on each of dispatch's clocks -- uptime (DISPATCH_TIME_NOW), wall, and monotonic (continuous time, which Swift's ContinuousClock and
+// Task.sleep use) -- with when each fired, or that it had not after 5 seconds.
+#ifndef DISPATCH_MONOTONICTIME_NOW
+#define DISPATCH_MONOTONICTIME_NOW (1ull << 63)   // libdispatch's time_private.h: a time on continuous (monotonic) time
+#endif
+static int clocksProbe(void) {
+    mach_timebase_info_data_t base;
+    mach_timebase_info(&base);
+    uint64_t abs = mach_absolute_time(), cont = mach_continuous_time();
+    printf("timebase %u/%u; mach_absolute_time %llu, mach_continuous_time %llu (continuous - absolute = %.3f s)\n", base.numer, base.denom,
+           (unsigned long long)abs, (unsigned long long)cont, (double)(cont - abs) * base.numer / base.denom / 1e9);
+    static const struct { const char *name; clockid_t id; } clocks[] = {
+        {"CLOCK_REALTIME", CLOCK_REALTIME}, {"CLOCK_MONOTONIC", CLOCK_MONOTONIC}, {"CLOCK_MONOTONIC_RAW", CLOCK_MONOTONIC_RAW},
+        {"CLOCK_UPTIME_RAW", CLOCK_UPTIME_RAW},
+    };
+    for (size_t i = 0; i < sizeof clocks / sizeof *clocks; i++) {
+        struct timespec ts;
+        int r = clock_gettime(clocks[i].id, &ts);
+        printf("  %-20s %s%ld.%09ld\n", clocks[i].name, r ? "failed " : "", (long)ts.tv_sec, ts.tv_nsec);
+    }
+    static const struct { const char *name; dispatch_time_t base; } timers[] = {
+        {"uptime (DISPATCH_TIME_NOW)", DISPATCH_TIME_NOW},
+        {"wall (DISPATCH_WALLTIME_NOW)", DISPATCH_WALLTIME_NOW},
+        {"monotonic (DISPATCH_MONOTONICTIME_NOW)", DISPATCH_MONOTONICTIME_NOW},
+    };
+    enum { count = sizeof timers / sizeof *timers };
+    double *fired = calloc(count, sizeof *fired);
+    dispatch_queue_t queue = dispatch_queue_create("clocks", DISPATCH_QUEUE_SERIAL);
+    const uint64_t start = mach_absolute_time();
+    for (int i = 0; i < count; i++) {
+        fired[i] = -1;
+        dispatch_after(dispatch_time(timers[i].base, NSEC_PER_SEC), queue, ^{
+            fired[i] = (double)(mach_absolute_time() - start) * base.numer / base.denom / 1e9;
+        });
+    }
+    // The deadline as libswift_Concurrency computes it (swift_dispatchEnqueueWithDeadline): CLOCK_MONOTONIC_RAW nanoseconds as ticks
+    // of Apple's 24 MHz (ns * 3 / 125) on the monotonic clock. It fires on time only where the timebase is 125/3.
+    __block double swiftFired = -1;
+    const uint64_t swiftDeadline = ((clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) + NSEC_PER_SEC) * 3 / 125) | DISPATCH_MONOTONICTIME_NOW;
+    dispatch_after(swiftDeadline, queue, ^{
+        swiftFired = (double)(mach_absolute_time() - start) * base.numer / base.denom / 1e9;
+    });
+    sleep(5);
+    dispatch_sync(queue, ^{});
+    if (swiftFired < 0)
+        printf("  1 s timer as Swift computes it (ns * 3 / 125, monotonic): not fired after 5 s\n");
+    else
+        printf("  1 s timer as Swift computes it (ns * 3 / 125, monotonic): fired at %.3f s\n", swiftFired);
+    int failed = swiftFired < 0;
+    for (int i = 0; i < count; i++) {
+        if (fired[i] < 0) {
+            printf("  1 s timer on %s: not fired after 5 s\n", timers[i].name);
+            failed = 1;
+        } else
+            printf("  1 s timer on %s: fired at %.3f s\n", timers[i].name, fired[i]);
+    }
+    free(fired);
+    return failed;
 }
 
 // sysctl [NAME...]: what Mesa's heap estimate reads (sysconf _SC_PHYS_PAGES and _SC_PAGESIZE, the sysctls behind them) and each named
@@ -2605,6 +2700,10 @@ int main(int argc, char **argv) {
             argv[2] = argv[0];
             return main(argc - 2, argv + 2);
         }
+        if (argc >= 2 && !strcmp(argv[1], "clocks"))
+            return clocksProbe();
+        if (argc >= 3 && !strcmp(argv[1], "scnotify"))
+            return scNotify(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "families"))
             return familiesProbe();
         if (argc >= 2 && !strcmp(argv[1], "sysctl"))

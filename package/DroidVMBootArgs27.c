@@ -6,8 +6,11 @@
 // definition replaces); the command line wins, so a switch set here is turned off for one boot with name=0 there.
 char PE_builtin_boot_args[] =
     // jobs this guest cannot serve, disabled by the launch policy before launchd starts (DroidVMLaunchPolicy.c): watchdogd has no
-    // watchdog backend, identityservicesd, CommCenter, fairplayd and accessoryupdaterd wait for hardware or services there are none of
-    "droidvm-disable-jobs=watchdogd,identityservicesd,CommCenter,fairplayd.A2,accessoryupdaterd "
+    // watchdog backend, identityservicesd, CommCenter, fairplayd and accessoryupdaterd wait for hardware or services there are none of.
+    // bluetoothd finds no Bluetooth controller ("Unable to match bluetooth service in device tree"), exits, and launchd started it
+    // again every 10 seconds; its clients saw the connection interrupted rather than gone, so Settings' Bluetooth item waited for the
+    // controller to activate (its deferred setup holds up every sidebar item after it). Disabled, the activation fails at once.
+    "droidvm-disable-jobs=watchdogd,identityservicesd,CommCenter,fairplayd.A2,accessoryupdaterd,bluetoothd "
     // the deletable system apps of the OS volume's staged_system_apps in /Applications (the bring-up patch's union) and lsd's
     // first-boot semaphore that keeps them registered (DroidVMLaunchPolicy.c)
     "owner-staged-apps=1 "
@@ -28,6 +31,10 @@ char PE_builtin_boot_args[] =
     // kern.hv_vmm_present and, in a virtual machine, makes an adapter only when the WebKitAllowWebGPUOnVMs default is set, so no page
     // had WebGPU; this guest's GPU is the phone's own Adreno, not a paravirtual one.
     "owner-hide-vmm=audiomxd,com.apple.WebKit.GPU "
+    // the timebase userspace sees, Apple's 24 MHz over the host's 19.2 MHz counter (patches/xnu-12377/droidvm-timebase-24mhz.patch):
+    // libswift_Concurrency converts Task.sleep and every ContinuousClock deadline to ticks as ns * 3 / 125, and on the host's rate
+    // they waited a quarter of the host's uptime (Settings' debounced sidebar updates never arrived)
+    "droidvm-timebase-hz=24000000 "
     // memory pressure (the warning that has Turnip's freed-BO cache, the Metal plugin's held imports and Apple's frameworks give
     // their caches back) below 1280 MiB of available memory rather than XNU's 848 at 6 GiB: the GPU's memory is wired guest
     // memory, and the guest ran out of free pages and paged its files in through the seed disk's polled reads with 1.1-1.3 GiB

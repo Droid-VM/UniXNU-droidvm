@@ -260,6 +260,171 @@
       "original": "0xfffffe000b431200",
       "native_symbol": "__ZN9IOService20SetProperties_InvokeE5IORPCP15OSMetaClassBasePFiS2_P12OSDictionaryE",
       "evidence": "The same IIG Invoke shape with an OSDictionary argument (OSDictionary::gMetaClass) and message ID 62916f15ea53a7d8, IOService::SetProperties's; the only Invoke of the generated code that casts to OSDictionary. Imported by IOHIDFamily."
+    },
+    {
+      "original": "0xfffffe000acf1174",
+      "native_symbol": "_backtrace",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000acf12a8",
+      "native_symbol": "_backtrace_internal",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000acf4014",
+      "native_symbol": "_clock_delay_until",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000acf438c",
+      "native_symbol": "_clock_interval_to_deadline",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000acf441c",
+      "native_symbol": "_nanoseconds_to_deadline",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000acf44a4",
+      "native_symbol": "_clock_absolutetime_interval_to_deadline",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000acf45c8",
+      "native_symbol": "_rtclock_gettime",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ad43ca4",
+      "native_symbol": "_lck_adaptive_spin_step",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ad57464",
+      "native_symbol": "_recount_current_thread_times",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ad6ac70",
+      "native_symbol": "_perfcontrol_timer_expire",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ad79698",
+      "native_symbol": "_semaphore_timedwait",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000adbe8c4",
+      "native_symbol": "_socd_client_trace",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ae85178",
+      "native_symbol": "_kperf_backtrace_sample",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ae85264",
+      "native_symbol": "_kperf_kcallstack_sample",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ae861c4",
+      "native_symbol": "_kppet_on_cpu",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ae86e40",
+      "native_symbol": "_kperf_thread_scheduling_sample",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ae8734c",
+      "native_symbol": "_kperf_task_snapshot_sample",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000ae9a120",
+      "native_symbol": "_bootprofile_wake_from_sleep",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000aecef54",
+      "native_symbol": "_clock_get_system_microtime",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000aecefd4",
+      "native_symbol": "_clock_get_system_nanotime",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000af28b98",
+      "native_symbol": "_vfs_update_last_completion_time",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000af5fe6c",
+      "native_symbol": "_fseventsf_close",
+      "evidence": "Paired by reference-symbol before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000af6d714",
+      "native_symbol": "_throttle_info_end_io",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000af6da2c",
+      "native_symbol": "_throttle_info_io_will_be_throttled",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b21bed0",
+      "native_symbol": "_kdebug_wake",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b27bbd0",
+      "native_symbol": "_tsleep",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b298adc",
+      "native_symbol": "_memorystatus_freeze_thread_should_run",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b29e1b8",
+      "native_symbol": "_microuptime",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b29ef84",
+      "native_symbol": "_nanotime",
+      "evidence": "Paired by reference-symbol before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b2ac72c",
+      "native_symbol": "_select_nocancel",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b2ada58",
+      "native_symbol": "_pselect_nocancel",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b2bb40c",
+      "native_symbol": "_ttysleep",
+      "evidence": "Paired by reference-symbol before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b41ea9c",
+      "native_symbol": "_os_log_coprocessor_register_with_type",
+      "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
     }
   ],
   "data": [

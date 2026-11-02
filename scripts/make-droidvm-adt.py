@@ -524,6 +524,12 @@ def main():
         node('defaults', [('sleep-disabled', struct.pack('<I', 1)), ('vmm-present', struct.pack('<I', 1)),
                           ('kern.maxvnodes', struct.pack('<I', kernel_memory // 0x10000 + 1024))]),
         node('options', []),
+        # wifid: launchd loads it only where the device tree has a node named wlan (its _LimitLoadToDeviceTree, which launchd asks
+        # through io_device_tree_entry_exists_with_name: IODTFindMatchingEntries from the root). Without it no process could look up
+        # the Wi-Fi manager and every WiFiKit client kept retrying the lookup (Settings 338 times as it started, "bootstrap_look_up of
+        # WiFiManager server failed"); with it wifid answers that there is no Wi-Fi interface. A top-level node, which no bus
+        # publishes: no Wi-Fi driver matches it.
+        *([node('wlan', [])] if args.ipad_identity else []),
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
                             ('button-names', b'hold\0voldown\0volup\0'),
                             ('home-button-type', struct.pack('<I', 2))])] if args.ipad_identity else []),
