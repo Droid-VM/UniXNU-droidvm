@@ -20,8 +20,8 @@
 // This file is the transport: the classes under Apple's names (the platform sandbox lets a process open only the user clients
 // it names, as DroidVMSensorProcessor.cpp's), the buffers, the queue, and a record of every message for the host rig (peek.py):
 // droidvm_vtpv_log, and the first messages whole in a contiguous capture region at droidvm_vtpv_capture_pa (CaptureEntries
-// slots of CaptureBytes: the length, then the message). Nothing answers yet: the host's side, which will run the
-// guest's sessions on crosvm's virtio-media decoder and encoder (DroidVMVirtioMedia.c), is the next step. So the service is
+// slots of CaptureBytes: the length, then the message). Each message then goes to the host's side (DroidVMVTHost.cpp: the
+// decoder over crosvm's virtio-media), whose messages to the guest are queued here. The service is
 // published only with droidvm-vt-paravirt=1, or when root writes 1 to kern.droidvm_vt_paravirt (registered at run time, as
 // DroidVMMotion.c's; it reads the stage): without it VideoToolbox keeps its own codecs. Each process asks once
 // (VTParavirtualizationIsRunningInGuest is a dispatch_once), so only processes started after the write use the channel.
@@ -38,6 +38,12 @@
 
 extern kmod_info_t g_kernel_kmod_info;
 static IOBufferMemoryDescriptor *capture;
+extern "C" {
+void *droidvm_vthost_client_open(void *transport, bool (*send)(void *, const uint8_t *, uint32_t), task_t task, int pid);
+void droidvm_vthost_client_close(void *host);
+int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint32_t *surfaces, unsigned surfaceCount);
+volatile uint32_t droidvm_vtpv_sent, droidvm_vtpv_dropped;
+}
 extern "C" int proc_selfpid(void);
 
 namespace {
@@ -98,6 +104,9 @@ class AppleVideoToolboxParavirtualizationUserClient : public IOUserClient {
     IOSharedDataQueue *queue;
     IOMemoryMap *queueMap;
     uint64_t capacity;
+    IOLock *sendLock;     // the queue has one producer at a time: the guest's thread and the host's workers both send
+    void *host;
+    static bool sendToGuest(void *transport, const uint8_t *bytes, uint32_t size);
 
     IOReturn buffers(uint64_t size, uint64_t *out);
     IOReturn message(uint64_t length, const uint64_t *surfaces, unsigned count, uint64_t *status);
@@ -116,27 +125,34 @@ bool AppleVideoToolboxParavirtualizationUserClient::initWithTask(task_t task, vo
     if (type != 0 || !super::initWithTask(task, token, type, properties)) return false;
     owner = task;
     lock = IOLockAlloc();
-    return lock != nullptr;
+    sendLock = IOLockAlloc();
+    return lock && sendLock;
 }
 
 bool AppleVideoToolboxParavirtualizationUserClient::start(IOService *provider) {
     if (!super::start(provider)) return false;
     droidvm_vtpv_opens = droidvm_vtpv_opens + 1;
+    host = droidvm_vthost_client_open(this, sendToGuest, owner, proc_selfpid());
     return true;
 }
 
 IOReturn AppleVideoToolboxParavirtualizationUserClient::clientClose() {
     droidvm_vtpv_closes = droidvm_vtpv_closes + 1;
+    void *closing = host;
+    host = nullptr;
+    droidvm_vthost_client_close(closing);
     if (!isInactive()) terminate();
     return kIOReturnSuccess;
 }
 
 void AppleVideoToolboxParavirtualizationUserClient::free() {
+    if (host) { droidvm_vthost_client_close(host); host = nullptr; }
     OSSafeReleaseNULL(sendMap);
     OSSafeReleaseNULL(send);
     OSSafeReleaseNULL(queueMap);
     OSSafeReleaseNULL(queue);
     if (lock) IOLockFree(lock);
+    if (sendLock) IOLockFree(sendLock);
     super::free();
 }
 
@@ -204,8 +220,22 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::message(uint64_t length,
         memcpy(slot + 4, bytes, kept);
     }
     droidvm_vtpv_messages = seq + 1;
+    uint32_t ids[MaxSurfaces];
+    for (unsigned i = 0; i < r.surface_count; ++i) ids[i] = r.surfaces[i];
+    if (host) droidvm_vthost_message(host, bytes, uint32_t(length), ids, r.surface_count);
     *status = 0;
     return kIOReturnSuccess;
+}
+
+// A message to the guest, into its queue (whose notification wakes the framework's dequeue loop).
+bool AppleVideoToolboxParavirtualizationUserClient::sendToGuest(void *transport, const uint8_t *bytes, uint32_t size) {
+    auto *self = static_cast<AppleVideoToolboxParavirtualizationUserClient *>(transport);
+    IOLockLock(self->sendLock);
+    const bool sent = self->queue && self->queue->enqueue(const_cast<uint8_t *>(bytes), size);
+    IOLockUnlock(self->sendLock);
+    if (sent) droidvm_vtpv_sent = droidvm_vtpv_sent + 1;
+    else droidvm_vtpv_dropped = droidvm_vtpv_dropped + 1;
+    return sent;
 }
 
 IOReturn AppleVideoToolboxParavirtualizationUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,

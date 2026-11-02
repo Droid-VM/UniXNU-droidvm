@@ -21,10 +21,12 @@
 //                                       (resolved and not), RGBA16Float, Depth32Float at 1 and 4, each loaded Clear, Load and
 //                                       DontCare, drawing nothing, the left half or everything; counts per answer, a third
 //                                       answer listed
-//   gfxprobe vtdecode [hw] [paravirt]   VideoToolbox decodes one 64x64 H.264 IDR frame (embedded): the session's decoder, the
-//                                       frame's status, format and a few luma samples; hw requires a hardware decoder (the
-//                                       paravirtualized one counts); paravirt first publishes the kernel's paravirtualization
-//                                       service (kern.droidvm_vt_paravirt=1, DroidVMVTParavirt.cpp) for this process on
+//   gfxprobe vtdecode [hw] [paravirt] [FILE [N]]
+//                                       VideoToolbox decodes one 64x64 H.264 IDR frame (embedded), or the first N access units
+//                                       of an Annex B H.264 or HEVC FILE: the session's decoder, each frame's status, the first
+//                                       frame's format and a few luma samples, frames out and time; hw requires a hardware
+//                                       decoder (the paravirtualized one counts); paravirt first publishes the kernel's
+//                                       paravirtualization service (kern.droidvm_vt_paravirt=1, DroidVMVTParavirt.cpp)
 //   gfxprobe argbuf                     an argument buffer (a buffer, a texture, a sampler, a constant) encoded by a descriptor-made and a
 //                                       function-made MTLArgumentEncoder, read by a kernel and by a fragment shader
 //   gfxprobe sysctl [NAME...]           sysconf's memory figures and each sysctl (in a sandbox: which the profile refuses)
@@ -1465,26 +1467,56 @@ static const uint8_t kTinyIDR[888] = {
 };
 
 
+static int vtFramesOut, vtFramesFailed;
+
 static void vtDecoded(void *refcon, void *frameRefcon, OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef image,
                       CMTime pts, CMTime duration) {
-    (void)refcon; (void)frameRefcon; (void)pts; (void)duration;
-    printf("vtdecode: frame status %d flags %#x image %p\n", (int)status, (unsigned)flags, image);
-    if (status || !image) return;
+    (void)refcon; (void)frameRefcon; (void)duration;
+    if (status || !image) {
+        if (vtFramesFailed++ < 4) printf("vtdecode: frame %lld status %d flags %#x\n", pts.value, (int)status, (unsigned)flags);
+        return;
+    }
+    if (vtFramesOut++) return;
     CVPixelBufferRef buffer = (CVPixelBufferRef)image;
     const OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    printf("vtdecode: %zux%zu '%.4s' planes %zu IOSurface %u\n", CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer),
-           (const char *)&(OSType){CFSwapInt32HostToBig(format)}, CVPixelBufferGetPlaneCount(buffer),
+    printf("vtdecode: first frame %lld: %zux%zu '%.4s' planes %zu IOSurface %u\n", pts.value, CVPixelBufferGetWidth(buffer),
+           CVPixelBufferGetHeight(buffer), (const char *)&(OSType){CFSwapInt32HostToBig(format)}, CVPixelBufferGetPlaneCount(buffer),
            CVPixelBufferGetIOSurface(buffer) ? IOSurfaceGetID(CVPixelBufferGetIOSurface(buffer)) : 0);
     if (CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly)) return;
     const uint8_t *luma = CVPixelBufferIsPlanar(buffer) ? CVPixelBufferGetBaseAddressOfPlane(buffer, 0) : CVPixelBufferGetBaseAddress(buffer);
     const size_t row = CVPixelBufferIsPlanar(buffer) ? CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) : CVPixelBufferGetBytesPerRow(buffer);
-    if (luma) printf("vtdecode: luma row 8: %u %u %u %u %u %u %u %u\n", luma[8 * row + 0], luma[8 * row + 8], luma[8 * row + 16],
-                     luma[8 * row + 24], luma[8 * row + 32], luma[8 * row + 40], luma[8 * row + 48], luma[8 * row + 56]);
+    const size_t width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer);
+    if (luma) {
+        printf("vtdecode: luma row 8: %u %u %u %u %u %u %u %u\n", luma[8 * row + 0], luma[8 * row + 8], luma[8 * row + 16],
+               luma[8 * row + 24], luma[8 * row + 32], luma[8 * row + 40], luma[8 * row + 48], luma[8 * row + 56]);
+        uint64_t sum = 0;
+        for (size_t y = 0; y < height; ++y) for (size_t x = 0; x < width; ++x) sum += luma[y * row + x];
+        printf("vtdecode: mean luma %.2f\n", (double)sum / (double)(width * height));
+    }
     CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+}
+
+// An Annex B stream's NAL units: [start, end) of each, start codes skipped.
+static size_t vtNalUnits(const uint8_t *d, size_t n, const uint8_t **starts, size_t *sizes, size_t max) {
+    size_t count = 0, i = 0;
+    while (i + 3 <= n && count < max) {
+        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+            const size_t begin = i + 3;
+            size_t j = begin;
+            while (j + 3 <= n && !(d[j] == 0 && d[j + 1] == 0 && (d[j + 2] == 1 || (d[j + 2] == 0 && j + 3 < n && d[j + 3] == 1)))) ++j;
+            if (j + 3 > n) j = n;
+            starts[count] = d + begin;
+            sizes[count++] = j - begin;
+            i = j;
+        } else ++i;
+    }
+    return count;
 }
 
 static int vtDecodeProbe(int argc, char **argv) {
     bool hardware = false;
+    const char *path = NULL;
+    long wanted = 30;
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "hw")) hardware = true;
         else if (!strcmp(argv[i], "paravirt")) {
@@ -1493,14 +1525,39 @@ static int vtDecodeProbe(int argc, char **argv) {
             const int r = sysctlbyname("kern.droidvm_vt_paravirt", NULL, NULL, &one, sizeof one);
             sysctlbyname("kern.droidvm_vt_paravirt", &stage, &size, NULL, 0);
             printf("vtdecode: kern.droidvm_vt_paravirt=1: %s, stage %d\n", r ? strerror(errno) : "ok", stage);
-        }
+        } else if (!path) path = argv[i];
+        else wanted = strtol(argv[i], NULL, 0);
     }
-    const uint8_t *sets[2] = {kTinySPS, kTinyPPS};
-    const size_t sizes[2] = {sizeof kTinySPS, sizeof kTinyPPS};
+    // The stream: the embedded IDR, or a file's NAL units grouped into access units.
+    const uint8_t *nals[4096];
+    size_t sizes[4096], count = 0;
+    NSData *file = nil;
+    bool hevc = false;
+    if (path) {
+        file = [NSData dataWithContentsOfFile:@(path)];
+        if (!file) { printf("vtdecode: cannot read %s\n", path); return 1; }
+        count = vtNalUnits(file.bytes, file.length, nals, sizes, 4096);
+        // HEVC: a VPS (type 32) leads the stream; H.264 has none (its type 7 SPS first).
+        for (size_t i = 0; i < count && i < 4; ++i) if (((nals[i][0] >> 1) & 0x3f) == 32) hevc = true;
+    } else {
+        nals[0] = kTinySPS; sizes[0] = sizeof kTinySPS;
+        nals[1] = kTinyPPS; sizes[1] = sizeof kTinyPPS;
+        nals[2] = kTinyIDR; sizes[2] = sizeof kTinyIDR;
+        count = 3;
+    }
+    const uint8_t *sets[3];
+    size_t setSizes[3], setCount = 0;
+    for (size_t i = 0; i < count && setCount < 3; ++i) {
+        const unsigned type = hevc ? (nals[i][0] >> 1) & 0x3f : nals[i][0] & 0x1f;
+        if (hevc ? (type >= 32 && type <= 34) : (type == 7 || type == 8)) { sets[setCount] = nals[i]; setSizes[setCount++] = sizes[i]; }
+    }
     CMVideoFormatDescriptionRef format = NULL;
-    OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 2, sets, sizes, 4, &format);
-    if (status) { printf("vtdecode: format description %d\n", (int)status); return 1; }
-    printf("vtdecode: hardware decode of H.264 supported: %d\n", VTIsHardwareDecodeSupported(kCMVideoCodecType_H264));
+    OSStatus status = hevc ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, setCount, sets, setSizes, 4, NULL, &format)
+                           : CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, setCount, sets, setSizes, 4, &format);
+    if (status) { printf("vtdecode: format description %d (%zu parameter sets)\n", (int)status, setCount); return 1; }
+    const CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(format);
+    printf("vtdecode: %s %dx%d, %zu NAL units; hardware decode supported: %d\n", hevc ? "HEVC" : "H.264", dimensions.width,
+           dimensions.height, count, VTIsHardwareDecodeSupported(hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264));
     NSDictionary *specification = hardware ? @{(id)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES} : @{};
     NSDictionary *attributes = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
                                  (id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
@@ -1517,29 +1574,53 @@ static int vtDecodeProbe(int argc, char **argv) {
         printf("vtdecode: using a hardware decoder: %d\n", CFBooleanGetValue(usingHardware));
         CFRelease(usingHardware);
     }
-    uint8_t *sample = malloc(4 + sizeof kTinyIDR);
-    const uint32_t length = CFSwapInt32HostToBig((uint32_t)sizeof kTinyIDR);
-    memcpy(sample, &length, 4);
-    memcpy(sample + 4, kTinyIDR, sizeof kTinyIDR);
-    CMBlockBufferRef block = NULL;
-    CMSampleBufferRef buffer = NULL;
-    status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, sample, 4 + sizeof kTinyIDR, kCFAllocatorMalloc, NULL, 0,
-                                                4 + sizeof kTinyIDR, 0, &block);
-    const size_t sampleSize = 4 + sizeof kTinyIDR;
-    if (!status) status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, format, 1, 0, NULL, 1, &sampleSize, &buffer);
-    if (!status) {
-        const uint64_t start = mach_absolute_time();
+    // Access units: a VCL NAL unit that starts a picture (H.264 first_mb_in_slice 0, HEVC first_slice_segment_in_pic_flag)
+    // opens one; each is given as length-prefixed NAL units.
+    const uint64_t start = mach_absolute_time();
+    long frames = 0;
+    size_t i = 0;
+    while (i < count && frames < wanted) {
+        size_t first = i, last = i;
+        bool picture = false;
+        for (; last < count; ++last) {
+            const uint8_t *nal = nals[last];
+            const unsigned type = hevc ? (nal[0] >> 1) & 0x3f : nal[0] & 0x1f;
+            const bool vcl = hevc ? type < 32 : (type >= 1 && type <= 5);
+            const bool starts = vcl && (hevc ? (nal[2] & 0x80) : (nal[1] & 0x80));
+            if (starts && picture) break;
+            if (vcl) picture = true;
+        }
+        i = last;
+        if (!picture) continue;
+        size_t bytes = 0;
+        for (size_t k = first; k < last; ++k) bytes += 4 + sizes[k];
+        uint8_t *sample = malloc(bytes), *at = sample;
+        for (size_t k = first; k < last; ++k) {
+            const uint32_t length = CFSwapInt32HostToBig((uint32_t)sizes[k]);
+            memcpy(at, &length, 4);
+            memcpy(at + 4, nals[k], sizes[k]);
+            at += 4 + sizes[k];
+        }
+        CMBlockBufferRef block = NULL;
+        CMSampleBufferRef buffer = NULL;
+        status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, sample, bytes, kCFAllocatorMalloc, NULL, 0, bytes, 0, &block);
+        CMSampleTimingInfo timing = {CMTimeMake(1, 30), CMTimeMake(frames, 30), kCMTimeInvalid};
+        if (!status) status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, format, 1, 1, &timing, 1, &bytes, &buffer);
         VTDecodeInfoFlags info = 0;
-        status = VTDecompressionSessionDecodeFrame(session, buffer, 0, NULL, &info);
-        VTDecompressionSessionWaitForAsynchronousFrames(session);
-        printf("vtdecode: decode %d (%.1f ms)\n", (int)status, (mach_absolute_time() - start) / 24000.0);
+        if (!status) status = VTDecompressionSessionDecodeFrame(session, buffer, kVTDecodeFrame_EnableAsynchronousDecompression, NULL, &info);
+        if (status) printf("vtdecode: access unit %ld: %d\n", frames, (int)status);
+        if (buffer) CFRelease(buffer);
+        if (block) CFRelease(block);
+        ++frames;
     }
-    if (buffer) CFRelease(buffer);
-    if (block) CFRelease(block);
+    VTDecompressionSessionWaitForAsynchronousFrames(session);
+    const double ms = (mach_absolute_time() - start) / 24000.0;
+    printf("vtdecode: %ld access units in, %d frames out, %d failed, %.1f ms (%.1f fps)\n", frames, vtFramesOut, vtFramesFailed, ms,
+           ms > 0 ? vtFramesOut * 1000.0 / ms : 0.0);
     VTDecompressionSessionInvalidate(session);
     CFRelease(session);
     CFRelease(format);
-    return status ? 1 : 0;
+    return vtFramesOut ? 0 : 1;
 }
 
 // argbuf: MTLArgumentEncoder as WebKit's WebGPU uses it for every bind group: the argument buffer holds a buffer's address, a

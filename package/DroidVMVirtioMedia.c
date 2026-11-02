@@ -67,6 +67,11 @@ struct media_device {
     uint16_t avail[2], used[2];        // our indices into each queue's available and used rings
     lck_mtx_t *lock;                   // one command at a time
     bool up;
+    // The layer above that takes this device's events (DroidVMVTHost.cpp), called with the lock held as each arrives: it must
+    // copy what it needs and return, never issue a command.
+    void (*sink)(void *context, const uint8_t *event, uint32_t size);
+    void *sink_context;
+    volatile uint32_t fast;            // sessions streaming: the event queue is polled every millisecond, not every 50
 };
 
 // Per device: one page per queue (descriptors at 0, the driver ring at 1024, the device ring at 2048), the event buffers,
@@ -152,6 +157,7 @@ static void reap_events(struct media_device *d) {
         uint32_t event;
         memcpy(&event, media_events[index_of(d)][id % MEDIA_EVENTS], 4);
         if (event <= EVT_EVENT) droidvm_media_events[event]++;
+        if (d->sink) d->sink(d->sink_context, media_events[index_of(d)][id % MEDIA_EVENTS], MEDIA_EVENT_SIZE);
         post(d, MEDIA_EVENTQ, (uint16_t)(id % MEDIA_EVENTS));
     }
 }
@@ -257,6 +263,24 @@ int droidvm_media_munmap(unsigned device, uint64_t gpa) {
 
 unsigned droidvm_media_devices(void) { return media_count; }
 uint32_t droidvm_media_caps(unsigned device) { return device < media_count ? media[device].device_caps : 0; }
+const char *droidvm_media_card(unsigned device) { return device < media_count ? media[device].card : ""; }
+bool droidvm_media_is_up(unsigned device) { return device < media_count && media[device].up; }
+
+// The layer above's event sink (see struct media_device), set once before its first session.
+void droidvm_media_set_sink(unsigned device, void (*sink)(void *, const uint8_t *, uint32_t), void *context) {
+    if (device >= media_count) return;
+    lck_mtx_lock(media[device].lock);
+    media[device].sink_context = context;
+    media[device].sink = sink;
+    lck_mtx_unlock(media[device].lock);
+}
+
+// Streaming sessions on the device: while any, the event queue is polled every millisecond.
+void droidvm_media_set_fast(unsigned device, bool on) {
+    if (device >= media_count) return;
+    if (on) __atomic_add_fetch(&media[device].fast, 1, __ATOMIC_RELAXED);
+    else __atomic_sub_fetch(&media[device].fast, 1, __ATOMIC_RELAXED);
+}
 
 static const char *bring_up(struct media_device *d) {
     media_write32(d, 0x70, 0);
@@ -334,15 +358,17 @@ static void media_thread(void *arg, wait_result_t result) {
     (void)arg; (void)result;
     for (unsigned device = 0; device < media_count; ++device)
         if (media[device].up) check(device);
-    // The event queues stay stocked while nothing above takes the events yet.
+    // The event queues stay stocked, and their events go to the layer above that took the device (droidvm_media_set_sink).
     for (;;) {
+        bool fast = false;
         for (unsigned device = 0; device < media_count; ++device) {
             if (!media[device].up) continue;
             lck_mtx_lock(media[device].lock);
             reap_events(&media[device]);
             lck_mtx_unlock(media[device].lock);
+            fast |= media[device].fast != 0;
         }
-        IOSleep(50);
+        IOSleep(fast ? 1 : 50);
     }
 }
 
