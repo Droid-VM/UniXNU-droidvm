@@ -18,7 +18,8 @@ kit = "droidvm"
 
 # The whole list: a layer's list replaces the one below it (the SoC layer's would drop the arm64e profile's XnuPrelink).
 [components]
-include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "VirtioMmioBlock", "RamBlock", "VerifiedRoot", "GopFramebuffer", "AppleKeyStoreState"]
+include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "VirtioMmioBlock", "RamBlock", "VerifiedRoot", "GopFramebuffer", "AppleKeyStoreState",
+           "SoftwareAES"]
 
 [kernel]
 defconfig = "droidvm_ipados27_defconfig"
@@ -49,6 +50,9 @@ archives = [
   # Touch, keyboard and motion sensors (scripts/build-droidvm-hid-input.py): NativeHidInput under the original IOHIDDevice of the
   # fileset, fed by the app's virtio-input devices; its objects ride in the display archive as well.
   "build-droidvm-hid-input.py",
+  # SoftwareAES's NativeAES, the IOAESAccelerator AppleImage4 waits for (package/DroidVMSoftwareAES.cpp): compiled here, linked in the
+  # display archive by the devices step below (its own archive is not linked: XNU_NATIVE_AES needs the prelinked crypto bootstrap).
+  "component:SoftwareAES",
   # The network (IONetworkingFamily and the virtio-net controller), sound, battery and media devices (scripts/build-droidvm-devices.py),
   # in the display archive too.
   "build-droidvm-devices.py",

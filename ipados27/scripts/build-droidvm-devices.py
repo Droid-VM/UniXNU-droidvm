@@ -23,7 +23,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from kernel_target import ARCH, IOS_VERSION
+from kernel_target import ARCH, IOS_VERSION, TRIPLE
 if ARCH != 'arm64e' or IOS_VERSION.split('.')[0] != '27':
     raise SystemExit('This device builder only supports arm64e iPadOS 27 (24A446).')
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,7 +136,7 @@ def main():
         sources.append(family / f'{stem}.cpp')
     strict = (*lib, *universe, '-isystem', str(include))
     for name, late in (('DroidVMVirtioEthernet', True), ('DroidVMVirtioNetIf', False), ('DroidVMAudio', True),
-                       ('DroidVMBattery', True), ('DroidVMSensorProcessor', True)):
+                       ('DroidVMBattery', True), ('DroidVMSensorProcessor', True), ('DroidVMSoftwareAES', False)):
         source = ROOT / 'kits/droidvm' / f'{name}.cpp'
         obj = command(cpp, source, OUT / f'{name}.o', strict)
         objects.append(stage_late(obj, name) if late else obj)
@@ -146,6 +146,37 @@ def main():
         objects.append(command(c_mach, source, OUT / f'{name}.o', ('-DDROIDVM_DEVICE_DYNAMIC=1',)))
         sources.append(source)
     sources += [ROOT / 'kits/droidvm/DroidVMDmaRegion.h', ROOT / 'kits/droidvm/DroidVMWifi.inc']
+    # SoftwareAES's NativeAES, from a staged copy compiled with component:SoftwareAES's own command: the hardware keys the guest is
+    # asked for derived in software (SoftwareAESKeys.inc), its static initializer staged for DroidVMSoftwareAES.cpp's registration,
+    # its parent bound to the original IOAESAccelerator of the 24A446 fileset.
+    aes_dir = ROOT / 'build/software-aes'
+    aes_original = ROOT / 'drivers/SoftwareAES/NativeAES.cpp'
+    aes_keys = ROOT / 'kits/droidvm/SoftwareAESKeys.inc'
+    aes_text = aes_original.read_text()
+    for anchor, replacement in (
+            ('#include <kern/task.h>\n', '#include <kern/task.h>\n' + aes_keys.read_text()),
+            ('  bool isKeySupported(unsigned selector) override { return selector == 0; }\n',
+             '  bool isKeySupported(unsigned selector) override { return selector == 0 || droidvmHardwareKey(selector); }\n'),
+            ('  if (key->selector || (operation != IOAESEncrypt && operation != IOAESDecrypt)) {\n',
+             '  IOAESKeyData droidvmKey;\n  key = droidvmKeyFor(key, droidvmKey);\n'
+             '  if (key->selector || (operation != IOAESEncrypt && operation != IOAESDecrypt)) {\n')):
+        require(aes_text.count(anchor) == 1, 'NativeAES.cpp no longer has exactly one ' + anchor.strip())
+        aes_text = aes_text.replace(anchor, replacement)
+    # the same file name: the late static initializer is named after it (__GLOBAL__sub_I_NativeAES.cpp)
+    aes_staged = aes_dir / 'droidvm' / 'NativeAES.cpp'
+    aes_staged.parent.mkdir(exist_ok=True)
+    aes_staged.write_text(aes_text)
+    aes_command = json.loads((aes_dir / 'compile-command.json').read_text())
+    require(aes_command.count(str(aes_original)) == 1 and aes_command.count(str(aes_dir / 'NativeAES.o')) == 1,
+            'component:SoftwareAES compiles drivers/SoftwareAES/NativeAES.cpp to build/software-aes/NativeAES.o once')
+    aes_obj = aes_staged.with_suffix('.o')
+    run([str(aes_staged) if a == str(aes_original) else str(aes_obj) if a == str(aes_dir / 'NativeAES.o') else a for a in aes_command]
+        + ['-I', str(ROOT / 'drivers/SoftwareAES')], cwd=cpp['directory'])
+    objects.append(stage_late(aes_obj, 'NativeAES'))
+    aes_bindings = ROOT / 'kits/droidvm/SoftwareAES-24A446.S'
+    run(['xcrun', 'clang', '-target', TRIPLE, '-Werror', '-Wno-incompatible-sysroot', '-c', aes_bindings, '-o', OUT / 'SoftwareAES-24A446.o'])
+    objects.append(OUT / 'SoftwareAES-24A446.o')
+    sources += [aes_original, ROOT / 'drivers/SoftwareAES/OriginalAESABI.h', aes_keys, aes_bindings]
     rel = lambda p: str(p.relative_to(ROOT))  # noqa: E731
     (OUT / 'objects.json').write_text(json.dumps([rel(p) for p in objects], indent=2) + '\n')
     (OUT / 'sources.json').write_text(json.dumps([rel(p) for p in sources], indent=2) + '\n')

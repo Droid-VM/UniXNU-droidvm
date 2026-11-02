@@ -437,6 +437,7 @@ extern void droidvm_net_start(void);
 extern void droidvm_snd_start(void);
 extern void droidvm_media_start(void);
 extern int droidvm_battery_attach(void);
+extern int droidvm_software_aes_attach(void);
 extern void droidvm_cpufreq_attach(void);
 extern void droidvm_sched_trace_attach(void);
 extern void droidvm_rtc_set_calendar(void);
@@ -467,6 +468,9 @@ void native_touch_probe(void) {
     thread_t thread;
     // The calendar from crosvm's PL030 (DroidVMClock.c), before launchd: the iPadOS 17 board sets it from its launch policy hook.
     droidvm_rtc_set_calendar();
+    // the IOAESAccelerator AppleImage4 waits for on the defaults node (DroidVMSoftwareAES.cpp), first: until it is up an IOKit
+    // configuration thread waits and the registry is never quiet
+    droidvm_software_aes_attach();
     droidvm_input_start();
     droidvm_net_start();
     droidvm_snd_start();
