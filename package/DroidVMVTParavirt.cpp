@@ -19,9 +19,10 @@
 //
 // This file is the transport: the classes under Apple's names (the platform sandbox lets a process open only the user clients
 // it names, as DroidVMSensorProcessor.cpp's), the buffers, the queue, and a record of every message for the host rig (peek.py):
-// droidvm_vtpv_log, and the first messages whole in a contiguous capture region at droidvm_vtpv_capture_pa (CaptureEntries
-// slots of CaptureBytes: the length, then the message). Each message then goes to the host's side (DroidVMVTHost.cpp: the
-// decoder over crosvm's virtio-media), whose messages to the guest are queued here. The service is
+// droidvm_vtpv_log, and whole messages in a contiguous capture region at droidvm_vtpv_capture_pa: the first of each type and
+// direction, CaptureEntries slots of CaptureBytes (the length, the direction -- 0 from the guest, 1 to it -- then the message).
+// Each message then goes to the host's side (DroidVMVTHost.cpp: the decoder and encoder over crosvm's virtio-media), whose
+// messages to the guest are queued here. The service is
 // published only with droidvm-vt-paravirt=1, or when root writes 1 to kern.droidvm_vt_paravirt (registered at run time, as
 // DroidVMMotion.c's; it reads the stage): without it VideoToolbox keeps its own codecs. Each process asks once
 // (VTParavirtualizationIsRunningInGuest is a dispatch_once), so only processes started after the write use the channel.
@@ -52,7 +53,7 @@ constexpr uint64_t MaxSendBytes = 64ull << 20;    // a message's limit (a compre
 constexpr uint32_t QueueBytes = 256 * 1024;       // the host's messages waiting for the guest
 constexpr uint32_t HeaderBytes = 48;              // the 'vtpv' atom
 constexpr uint32_t MaxSurfaces = 5;
-constexpr unsigned LogEntries = 32, CaptureEntries = 16, CaptureBytes = 16384;
+constexpr unsigned LogEntries = 32, CaptureEntries = 32, CaptureBytes = 8192;
 
 uint32_t big32(const uint8_t *p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
 uint64_t big64(const uint8_t *p) { return uint64_t(big32(p)) << 32 | big32(p + 4); }
@@ -79,6 +80,29 @@ volatile uint32_t droidvm_vtpv_closes;
 struct droidvm_vtpv_record droidvm_vtpv_log[LogEntries];
 volatile uint64_t droidvm_vtpv_capture_pa;
 int droidvm_vt_paravirt_attach(void);
+}
+
+// The first message of each type and direction, whole, into the capture region.
+static IOLock *captureLock;
+static void captureMessage(const uint8_t *bytes, uint32_t length, uint32_t direction) {
+    if (!capture || !captureLock || length < HeaderBytes) return;
+    const uint32_t type = big32(bytes + 8);
+    IOLockLock(captureLock);
+    uint8_t *region = static_cast<uint8_t *>(capture->getBytesNoCopy());
+    for (unsigned i = 0; i < CaptureEntries; ++i) {
+        uint8_t *slot = region + i * CaptureBytes;
+        uint32_t used, dir;
+        memcpy(&used, slot, 4);
+        memcpy(&dir, slot + 4, 4);
+        if (used && dir == direction && big32(slot + 8 + 8) == type) break;   // that type is kept already
+        if (used) continue;
+        const uint32_t kept = length < CaptureBytes - 8 ? length : CaptureBytes - 8;
+        memcpy(slot + 4, &direction, 4);
+        memcpy(slot + 8, bytes, kept);
+        memcpy(slot, &length, 4);
+        break;
+    }
+    IOLockUnlock(captureLock);
 }
 
 class AppleVideoToolboxParavirtualizationDriver : public IOService {
@@ -213,12 +237,7 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::message(uint64_t length,
     for (unsigned i = 0; i < count && i < MaxSurfaces && surfaces[i]; ++i) r.surfaces[r.surface_count++] = uint32_t(surfaces[i]);
     memset(r.payload, 0, sizeof r.payload);
     memcpy(r.payload, bytes + HeaderBytes, length - HeaderBytes < sizeof r.payload ? length - HeaderBytes : sizeof r.payload);
-    if (capture && seq < CaptureEntries) {
-        uint8_t *slot = static_cast<uint8_t *>(capture->getBytesNoCopy()) + seq * CaptureBytes;
-        const uint32_t whole = uint32_t(length), kept = whole < CaptureBytes - 4 ? whole : CaptureBytes - 4;
-        memcpy(slot, &whole, 4);
-        memcpy(slot + 4, bytes, kept);
-    }
+    captureMessage(bytes, uint32_t(length), 0);
     droidvm_vtpv_messages = seq + 1;
     uint32_t ids[MaxSurfaces];
     for (unsigned i = 0; i < r.surface_count; ++i) ids[i] = r.surfaces[i];
@@ -230,6 +249,7 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::message(uint64_t length,
 // A message to the guest, into its queue (whose notification wakes the framework's dequeue loop).
 bool AppleVideoToolboxParavirtualizationUserClient::sendToGuest(void *transport, const uint8_t *bytes, uint32_t size) {
     auto *self = static_cast<AppleVideoToolboxParavirtualizationUserClient *>(transport);
+    captureMessage(bytes, size, 1);
     IOLockLock(self->sendLock);
     const bool sent = self->queue && self->queue->enqueue(const_cast<uint8_t *>(bytes), size);
     IOLockUnlock(self->sendLock);
@@ -298,6 +318,7 @@ static int publish(void) {
     capture = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut) |
                                                                IOOptionBits(kIOMemoryPhysicallyContiguous),
                                                                CaptureEntries * CaptureBytes, 0x0000fffffffff000ULL);
+    captureLock = IOLockAlloc();
     if (capture) {
         bzero(capture->getBytesNoCopy(), CaptureEntries * CaptureBytes);
         droidvm_vtpv_capture_pa = capture->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);

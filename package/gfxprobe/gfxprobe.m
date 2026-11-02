@@ -27,6 +27,11 @@
 //                                       frame's format and a few luma samples, frames out and time; hw requires a hardware
 //                                       decoder (the paravirtualized one counts); paravirt first publishes the kernel's
 //                                       paravirtualization service (kern.droidvm_vt_paravirt=1, DroidVMVTParavirt.cpp)
+//   gfxprobe vtencode [paravirt] [hevc] [W H N]
+//                                       VideoToolbox encodes N synthetic NV12 frames (default 1280x720, 30): each frame's size
+//                                       and key-frame flag, the time, and the stream as Annex B in /private/var/ngpu/enc.h264
+//                                       (or .hevc); paravirt publishes the paravirtualization service first and asks for the
+//                                       paravirtualized encoder (DroidVMVTHost.cpp)
 //   gfxprobe argbuf                     an argument buffer (a buffer, a texture, a sampler, a constant) encoded by a descriptor-made and a
 //                                       function-made MTLArgumentEncoder, read by a kernel and by a fragment shader
 //   gfxprobe sysctl [NAME...]           sysconf's memory figures and each sysctl (in a sandbox: which the profile refuses)
@@ -1621,6 +1626,118 @@ static int vtDecodeProbe(int argc, char **argv) {
     CFRelease(session);
     CFRelease(format);
     return vtFramesOut ? 0 : 1;
+}
+
+// vtencode: N frames of a moving gradient through VTCompressionSession, the output kept as Annex B.
+static FILE *vtEncodeOut;
+static int vtEncoded, vtEncodeFailed, vtKeyFrames;
+static size_t vtEncodedBytes;
+
+static void vtEncodedFrame(void *refcon, void *frameRefcon, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample) {
+    (void)refcon; (void)frameRefcon;
+    if (status || !sample) {
+        if (vtEncodeFailed++ < 4) printf("vtencode: frame status %d flags %#x\n", (int)status, (unsigned)flags);
+        return;
+    }
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, false);
+    const bool key = !attachments || !CFArrayGetCount(attachments) ||
+                     !CFDictionaryContainsKey(CFArrayGetValueAtIndex(attachments, 0), kCMSampleAttachmentKey_NotSync);
+    CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample);
+    const bool hevc = CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC;
+    if (key) {
+        ++vtKeyFrames;
+        size_t count = 0;
+        int header = 0;
+        if (hevc) CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, 0, NULL, NULL, &count, &header);
+        else CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, 0, NULL, NULL, &count, &header);
+        for (size_t i = 0; i < count; ++i) {
+            const uint8_t *set = NULL;
+            size_t size = 0;
+            if (hevc) CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, i, &set, &size, NULL, NULL);
+            else CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, i, &set, &size, NULL, NULL);
+            static const uint8_t start[4] = {0, 0, 0, 1};
+            if (vtEncodeOut && set) { fwrite(start, 1, 4, vtEncodeOut); fwrite(set, 1, size, vtEncodeOut); }
+        }
+    }
+    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
+    const size_t length = CMBlockBufferGetDataLength(block);
+    uint8_t *bytes = malloc(length);
+    CMBlockBufferCopyDataBytes(block, 0, length, bytes);
+    for (size_t at = 0; at + 4 <= length;) {
+        const uint32_t n = (uint32_t)bytes[at] << 24 | (uint32_t)bytes[at + 1] << 16 | (uint32_t)bytes[at + 2] << 8 | bytes[at + 3];
+        static const uint8_t start[4] = {0, 0, 0, 1};
+        if (at + 4 + n > length) break;
+        if (vtEncodeOut) { fwrite(start, 1, 4, vtEncodeOut); fwrite(bytes + at + 4, 1, n, vtEncodeOut); }
+        at += 4 + n;
+    }
+    free(bytes);
+    if (vtEncoded < 3 || key) printf("vtencode: frame %lld: %zu bytes%s\n", CMSampleBufferGetPresentationTimeStamp(sample).value, length,
+                                     key ? " (key)" : "");
+    vtEncodedBytes += length;
+    ++vtEncoded;
+}
+
+static int vtEncodeProbe(int argc, char **argv) {
+    bool paravirt = false, hevc = false;
+    int numbers[3] = {1280, 720, 30}, numberCount = 0;
+    for (int i = 0; i < argc; ++i) {
+        if (!strcmp(argv[i], "paravirt")) paravirt = true;
+        else if (!strcmp(argv[i], "hevc")) hevc = true;
+        else if (numberCount < 3) numbers[numberCount++] = atoi(argv[i]);
+    }
+    const int width = numbers[0], height = numbers[1], frames = numbers[2];
+    if (paravirt) {
+        int one = 1;
+        const int r = sysctlbyname("kern.droidvm_vt_paravirt", NULL, NULL, &one, sizeof one);
+        printf("vtencode: kern.droidvm_vt_paravirt=1: %s\n", r ? strerror(errno) : "ok");
+    }
+    NSMutableDictionary *specification = [NSMutableDictionary dictionary];
+    if (paravirt)
+        specification[(id)kVTVideoEncoderSpecification_EncoderID] = hevc ? @"paravirtualized:com.droidvm.videoencoder.virtio-media.hevc"
+                                                                         : @"paravirtualized:com.droidvm.videoencoder.virtio-media.avc";
+    VTCompressionSessionRef session = NULL;
+    const uint64_t begin = mach_absolute_time();
+    OSStatus status = VTCompressionSessionCreate(kCFAllocatorDefault, width, height, hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+                                                 (__bridge CFDictionaryRef)specification, NULL, NULL, vtEncodedFrame, NULL, &session);
+    printf("vtencode: %s %dx%d session %d (%.1f ms)\n", hevc ? "HEVC" : "H.264", width, height, (int)status,
+           (mach_absolute_time() - begin) / 24000.0);
+    if (status) return 1;
+    CFStringRef encoderID = NULL;
+    if (!VTSessionCopyProperty(session, kVTCompressionPropertyKey_EncoderID, kCFAllocatorDefault, &encoderID) && encoderID) {
+        printf("vtencode: encoder %s\n", [(__bridge NSString *)encoderID UTF8String]);
+        CFRelease(encoderID);
+    }
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@(width * height * 4));
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@30);
+    VTCompressionSessionPrepareToEncodeFrames(session);
+    vtEncodeOut = fopen(hevc ? "/private/var/ngpu/enc.hevc" : "/private/var/ngpu/enc.h264", "wb");
+    NSDictionary *attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+    const uint64_t start = mach_absolute_time();
+    for (int f = 0; f < frames; ++f) {
+        CVPixelBufferRef pixels = NULL;
+        CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                            (__bridge CFDictionaryRef)attributes, &pixels);
+        CVPixelBufferLockBaseAddress(pixels, 0);
+        uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pixels, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pixels, 1);
+        const size_t yRow = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0), uvRow = CVPixelBufferGetBytesPerRowOfPlane(pixels, 1);
+        for (int r = 0; r < height; ++r)
+            for (int x = 0; x < width; ++x) y[r * yRow + x] = (uint8_t)(16 + ((x + r + f * 8) % 220));
+        for (int r = 0; r < height / 2; ++r)
+            for (int x = 0; x < width; x += 2) { uv[r * uvRow + x] = (uint8_t)(64 + (r % 128)); uv[r * uvRow + x + 1] = (uint8_t)(64 + (x / 2 % 128)); }
+        CVPixelBufferUnlockBaseAddress(pixels, 0);
+        status = VTCompressionSessionEncodeFrame(session, pixels, CMTimeMake(f, 30), CMTimeMake(1, 30), NULL, NULL, NULL);
+        if (status) printf("vtencode: frame %d: %d\n", f, (int)status);
+        CVPixelBufferRelease(pixels);
+    }
+    status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    const double ms = (mach_absolute_time() - start) / 24000.0;
+    printf("vtencode: complete %d: %d frames out (%d key), %d failed, %zu bytes, %.1f ms (%.1f fps)\n", (int)status, vtEncoded,
+           vtKeyFrames, vtEncodeFailed, vtEncodedBytes, ms, ms > 0 ? vtEncoded * 1000.0 / ms : 0.0);
+    if (vtEncodeOut) fclose(vtEncodeOut);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+    return vtEncoded ? 0 : 1;
 }
 
 // argbuf: MTLArgumentEncoder as WebKit's WebGPU uses it for every bind group: the argument buffer holds a buffer's address, a
@@ -3281,6 +3398,8 @@ int main(int argc, char **argv) {
             return dontCareProbe(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "vtdecode"))
             return vtDecodeProbe(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "vtencode"))
+            return vtEncodeProbe(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "sysctl"))
             return sysctlProbe(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "ethernet"))
