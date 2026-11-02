@@ -8,6 +8,9 @@
 //   gfxprobe cg W H FOURCC...           CoreGraphics into a surface as WebKit paints a layer: CAIOSurfaceCreateDefault, then
 //                                       CGIOSurfaceContextCreate with WebKit's parameters for the format ('BGRA', 'b3a8' RGB10A8,
 //                                       'w30r' RGB10), a red fill and a flush; the bytes of each plane that are not 0 after
+//   gfxprobe user UID VERB ARG...      the verb as that user, without a sandbox (ethernet: what Settings asks before it lists Ethernet)
+//   gfxprobe families                   each GPU family the Metal device answers (supportsFamily:), and the queries a family check uses
+//   gfxprobe sysctl [NAME...]           sysconf's memory figures and each sysctl (in a sandbox: which the profile refuses)
 //   gfxprobe box PROFILE[:UID] VERB ARG...  the verb inside the named sandbox profile (sandbox_init), e.g. com.apple.WebKit.GPU:501:
 //                                       what a sandboxed process can do with the GPU; whether the plugin's files and its
 //                                       shader-cache directories can be read and written
@@ -191,6 +194,9 @@
 #import <fcntl.h>
 #import <mach/mach_time.h>
 #import <sys/resource.h>
+#import <sys/ioctl.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <pthread.h>
@@ -1171,6 +1177,125 @@ static int pitchCheck(unsigned w, unsigned h, unsigned pitch) {
     }
     free(texels);
     return failures ? 1 : 0;
+}
+
+// families: what the Metal device answers for each GPU family (supportsFamily:) and the device queries a family check leans on --
+// WebKit's WebGPU gives an adapter only to a device in MTLGPUFamilyApple4 or later.
+static int familiesProbe(void) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) {
+        printf("no Metal device\n");
+        return 1;
+    }
+    static const struct { const char *name; long family; } families[] = {
+        {"Apple1", 1001}, {"Apple2", 1002}, {"Apple3", 1003}, {"Apple4", 1004}, {"Apple5", 1005}, {"Apple6", 1006},
+        {"Apple7", 1007}, {"Apple8", 1008}, {"Apple9", 1009}, {"Apple10", 1010}, {"Mac1", 2001}, {"Mac2", 2002},
+        {"Common1", 3001}, {"Common2", 3002}, {"Common3", 3003}, {"Metal3", 5001}, {"Metal4", 5002},
+    };
+    printf("%s:", device.name.UTF8String);
+    for (size_t i = 0; i < sizeof families / sizeof *families; i++)
+        printf(" %s %d", families[i].name, [device supportsFamily:(MTLGPUFamily)families[i].family]);
+    printf("\nargumentBuffersSupport %lu readWriteTextureSupport %lu maxThreadgroupMemoryLength %lu maxBufferLength %llu\n",
+           (unsigned long)device.argumentBuffersSupport, (unsigned long)device.readWriteTextureSupport,
+           (unsigned long)device.maxThreadgroupMemoryLength, (unsigned long long)device.maxBufferLength);
+    MTLSize threads = device.maxThreadsPerThreadgroup;
+    printf("maxThreadsPerThreadgroup %lux%lux%lu BC %d\n", (unsigned long)threads.width, (unsigned long)threads.height,
+           (unsigned long)threads.depth, device.supportsBCTextureCompression);
+    // The Adreno plugin's device names the rows of Apple's tables that keep a family false (droidvmFamilyBlockers:, the runtime's
+    // burn-down): Apple4 to Apple7 and Metal3, the families WebKit's WebGPU and newer apps look for.
+    SEL blockers = sel_registerName("droidvmFamilyBlockers:");
+    if ([device respondsToSelector:blockers]) {
+        static const struct { const char *name; long family; } wanted[] = {
+            {"Apple4", 1004}, {"Apple5", 1005}, {"Apple6", 1006}, {"Apple7", 1007}, {"Metal3", 5001}};
+        for (size_t i = 0; i < sizeof wanted / sizeof *wanted; i++) {
+            if ([device supportsFamily:(MTLGPUFamily)wanted[i].family])
+                continue;
+            NSString *rows = ((NSString * (*)(id, SEL, NSInteger))objc_msgSend)(device, blockers, wanted[i].family);
+            printf("%s blocked by:\n", wanted[i].name);
+            for (NSString *row in [rows componentsSeparatedByString:@"\n"])
+                if (row.length)
+                    printf("  %s\n", row.UTF8String);
+        }
+    }
+    return 0;
+}
+
+// sysctl [NAME...]: what Mesa's heap estimate reads (sysconf _SC_PHYS_PAGES and _SC_PAGESIZE, the sysctls behind them) and each named
+// sysctl, as numbers or the errno -- inside a sandbox (box) it says which the profile refuses.
+static int sysctlProbe(int count, char **names) {
+    errno = 0;
+    long pages = sysconf(_SC_PHYS_PAGES);
+    int pagesErrno = errno;
+    errno = 0;
+    long pageSize = sysconf(_SC_PAGESIZE);
+    int pageSizeErrno = errno;
+    printf("sysconf _SC_PHYS_PAGES %ld (%s), _SC_PAGESIZE %ld (%s)\n", pages, pagesErrno ? strerror(pagesErrno) : "ok", pageSize,
+           pageSizeErrno ? strerror(pageSizeErrno) : "ok");
+    static char *defaults[] = {"hw.memsize", "hw.physmem", "hw.pagesize", "hw.ncpu", "kern.osproductversion"};
+    if (!count) {
+        names = defaults;
+        count = (int)(sizeof defaults / sizeof *defaults);
+    }
+    for (int i = 0; i < count; i++) {
+        unsigned char value[256] = {};
+        size_t size = sizeof value;
+        if (sysctlbyname(names[i], value, &size, NULL, 0)) {
+            printf("  %s: %s\n", names[i], strerror(errno));
+            continue;
+        }
+        uint64_t number = 0;
+        memcpy(&number, value, size < 8 ? size : 8);
+        if (size == 4 || size == 8)
+            printf("  %s: %llu\n", names[i], (unsigned long long)number);
+        else
+            printf("  %s: %.*s\n", names[i], (int)size, value);
+    }
+    return 0;
+}
+
+// ethernet: what Settings asks before it lists Ethernet (PSSystemConfigurationDynamicStoreEthernetWatcher, Preferences.framework):
+// its answer, and for each network interface the conditions its ethernetNetworkInterfaces checks -- the BSD name's "en" prefix,
+// isHiddenEthernetInterface: (a USB NCM or USB Ethernet provider), the IOKit interface type (6), the ifnet family (2) and subfamily
+// (at most 1), and the extended flags' IFEF_DIRECTLINK (SIOCGIFEFLAGS).
+static int ethernetProbe(void) {
+    dlopen("/System/Library/PrivateFrameworks/Preferences.framework/Preferences", RTLD_NOW);
+    dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_NOW);
+    Class watcherClass = NSClassFromString(@"PSSystemConfigurationDynamicStoreEthernetWatcher");
+    id watcher = watcherClass ? ((id (*)(id, SEL))objc_msgSend)(watcherClass, sel_registerName("sharedManager")) : nil;
+    NSArray *listed = watcher ? ((id (*)(id, SEL))objc_msgSend)(watcher, sel_registerName("ethernetNetworkInterfaces")) : nil;
+    BOOL has = watcher ? ((BOOL (*)(id, SEL))objc_msgSend)(watcher, sel_registerName("hasEthernetNetworkInterfaces")) : NO;
+    printf("watcher %p: ethernetNetworkInterfaces %lu, hasEthernetNetworkInterfaces %d\n", (__bridge void *)watcher,
+           (unsigned long)listed.count, has);
+    CFArrayRef (*copyAll)(void) = (CFArrayRef (*)(void))dlsym(RTLD_DEFAULT, "SCNetworkInterfaceCopyAll");
+    CFStringRef (*bsdName)(CFTypeRef) = (CFStringRef (*)(CFTypeRef))dlsym(RTLD_DEFAULT, "SCNetworkInterfaceGetBSDName");
+    CFNumberRef (*ioType)(CFTypeRef) = (CFNumberRef (*)(CFTypeRef))dlsym(RTLD_DEFAULT, "_SCNetworkInterfaceGetIOInterfaceType");
+    CFNumberRef (*family)(CFTypeRef) = (CFNumberRef (*)(CFTypeRef))dlsym(RTLD_DEFAULT, "_SCNetworkInterfaceGetFamilyType");
+    CFNumberRef (*subfamily)(CFTypeRef) = (CFNumberRef (*)(CFTypeRef))dlsym(RTLD_DEFAULT, "_SCNetworkInterfaceGetFamilySubType");
+    if (!copyAll || !bsdName) {
+        printf("no SCNetworkInterfaceCopyAll\n");
+        return 1;
+    }
+    CFArrayRef all = copyAll();
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    printf("SCNetworkInterfaceCopyAll: %ld interfaces, socket %d\n", all ? (long)CFArrayGetCount(all) : -1L, s);
+    for (CFIndex i = 0; all && i < CFArrayGetCount(all); ++i) {
+        CFTypeRef interface = CFArrayGetValueAtIndex(all, i);
+        NSString *name = (__bridge NSString *)bsdName(interface);
+        int type = -1, fam = -1, sub = -1;
+        CFNumberRef n;
+        if (ioType && (n = ioType(interface))) CFNumberGetValue(n, kCFNumberIntType, &type);
+        if (family && (n = family(interface))) CFNumberGetValue(n, kCFNumberIntType, &fam);
+        if (subfamily && (n = subfamily(interface))) CFNumberGetValue(n, kCFNumberIntType, &sub);
+        BOOL hidden = watcher ? ((BOOL (*)(id, SEL, CFTypeRef))objc_msgSend)(watcher, sel_registerName("isHiddenEthernetInterface:"),
+                                                                            interface) : NO;
+        struct { char name[16]; uint64_t eflags; char pad[8]; } request = {};
+        strncpy(request.name, name.UTF8String ?: "", sizeof request.name - 1);
+        int r = s >= 0 ? ioctl(s, 0xc020698e /* SIOCGIFEFLAGS */, &request) : -1;
+        printf("  %s: type %d family %d subfamily %d hidden %d eflags %s%#llx\n", name.UTF8String ?: "(none)", type, fam, sub, hidden,
+               r ? "(ioctl failed) " : "", (unsigned long long)request.eflags);
+    }
+    if (s >= 0) close(s);
+    return 0;
 }
 
 // spuopen: the motion devices (AppleSPUHIDDevice, DroidVMMotionHid.inc), and on the one that names the sensor processor's plug-in (the device orientation)
@@ -2470,6 +2595,22 @@ int main(int argc, char **argv) {
             return memoryIdle(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), strtoul(argv[4], NULL, 0));
         if (argc >= 4 && !strcmp(argv[1], "memcheck"))
             return memoryCheck(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+        // user UID VERB...: the verb as that user (501, mobile, as Settings and the apps run), without a sandbox.
+        if (argc >= 4 && !strcmp(argv[1], "user")) {
+            uid_t uid = (uid_t)atoi(argv[2]);
+            if (setgid((gid_t)uid) || setuid(uid)) {
+                perror("setuid");
+                return 1;
+            }
+            argv[2] = argv[0];
+            return main(argc - 2, argv + 2);
+        }
+        if (argc >= 2 && !strcmp(argv[1], "families"))
+            return familiesProbe();
+        if (argc >= 2 && !strcmp(argv[1], "sysctl"))
+            return sysctlProbe(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "ethernet"))
+            return ethernetProbe();
         if (argc >= 2 && !strcmp(argv[1], "spuopen"))
             return spuOpen();
         if (argc >= 3 && !strcmp(argv[1], "ktxdecode"))

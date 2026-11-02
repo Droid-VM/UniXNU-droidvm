@@ -24,8 +24,10 @@ char PE_builtin_boot_args[] =
     // the hypervisor hidden from the audio server (fork patches/xnu-12377/zzyd-owner-hide-vmm.patch: kern.hv_vmm_present 0 for the
     // processes named): MobileGestalt answers IsVirtualDevice from it, and in a virtual device iPadOS 27's VirtualAudio expects
     // Apple's research VM and publishes no audio device but the Null one. Not for everyone: SpringBoard's backlight state machine
-    // then waits on panel hardware and its watchdog kills SpringBoard.
-    "owner-hide-vmm=audiomxd "
+    // then waits on panel hardware and its watchdog kills SpringBoard. And from Safari's GPU process: iPadOS 27's WebGPU.framework asks
+    // kern.hv_vmm_present and, in a virtual machine, makes an adapter only when the WebKitAllowWebGPUOnVMs default is set, so no page
+    // had WebGPU; this guest's GPU is the phone's own Adreno, not a paravirtual one.
+    "owner-hide-vmm=audiomxd,com.apple.WebKit.GPU "
     // memory pressure (the warning that has Turnip's freed-BO cache, the Metal plugin's held imports and Apple's frameworks give
     // their caches back) below 1280 MiB of available memory rather than XNU's 848 at 6 GiB: the GPU's memory is wired guest
     // memory, and the guest ran out of free pages and paged its files in through the seed disk's polled reads with 1.1-1.3 GiB

@@ -144,7 +144,8 @@ kernel_args = [
   # gaps close (the command line wins over the built-in value). The wallpaper takes the poster extensions (*Poster*) and
   # SBRendererService, PaperBoardUI's renderer, whose NeutrinoCore device asserts without a Metal device. Games: its VFX scenes
   # end the app without a Metal device ("failed to load Metal shaders library", then a null object in com.apple.games.vfx.loader).
-  "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService,Games",
+  # com.apple.WebKit.GPU: Safari's WebGPU (requestAdapter) and WebGL (ANGLE's Metal back end) run there and had no device.
+  "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService,Games,com.apple.WebKit.GPU",
   # Debug only: clear the MACF checks the release AMFI/Sandbox impose on an owner debug binary, at the XNU call sites
   # (patches/xnu-12377 zzye/zzyf). Only a caller carrying the owner entitlement com.apple.private.droidvm.debug is cleared,
   # and only read is relaxed for files: the ssh debugserver gets a system process's task port (task_for_pid stopped returning
