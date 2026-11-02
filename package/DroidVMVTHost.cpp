@@ -9,7 +9,8 @@
 //   decs   the decoder list: one entry per coded format the virtio-media decoder offers that VideoToolbox can describe (H.264,
 //          HEVC). The guest registers each as "paravirtualized:<CMClassImplementationID>" (rating 400, above its software ones).
 //   +dec   a decoder instance (,cod the codec type, ,cid the ID): answered with ,err ,ver ,hin.
-//   dset dcop dsup   properties: taken, UsingHardwareAcceleratedVideoDecoder is true, no supported-property list.
+//   dset dcop dsup   properties: taken; the supported list (dsup) names UsingHardwareAcceleratedVideoDecoder alone, which dcop
+//          answers true (esup/ecop: the encoder's, UsingHardwareAcceleratedVideoEncoder).
 //   dsta   the session's format (,fds an ImageDescription with avcC or hvcC): a virtio-media session is opened, its OUTPUT queue set
 //          up and streaming; the guest is told the pixel buffers it should allocate (Dpba, 420v of the coded size) before the
 //          answer.
@@ -1389,6 +1390,26 @@ void teardown(Session *s) {
     OSSafeReleaseNULL(s->holder);
 }
 
+// dsup/esup: the properties the codec has, by name, each {PropertyType, ReadWriteStatus} (as macOS's host lists its
+// hardware codecs'). VideoToolbox answers a property missing here itself (kVTPropertyNotSupportedErr) and sends no dcop/ecop
+// or dset/eset for it: only that the codec runs on hardware, which dcop/ecop answer, is listed.
+void supportedProperties(Client *c, const Header &h) {
+    Plist *p = new Plist();
+    uint8_t buffer[384];
+    if (!p) return;
+    const int typeKeys[2] = {p->string("PropertyType"), p->string("ReadWriteStatus")};
+    const int typeValues[2] = {p->string("Boolean"), p->string("ReadOnly")};
+    const int names[1] = {p->string(h.type == cc("dsup") ? "UsingHardwareAcceleratedVideoDecoder" : "UsingHardwareAcceleratedVideoEncoder")};
+    const int values[1] = {p->dict(typeKeys, typeValues, 2)};
+    const int supported = p->dict(names, values, 1);
+    Writer w(buffer, sizeof buffer);
+    w.header(h.type, FlagReply, h.uuid, h.request);
+    w.s32(cc(",err"), 0);
+    w.plist(cc(",sup"), *p, supported);
+    sendToGuest(c, w, buffer);
+    delete p;
+}
+
 void decoderList(Client *c, const Header &h) {
     Plist *p = new Plist();
     uint8_t *buffer = static_cast<uint8_t *>(IOMallocZero(4096));
@@ -1702,20 +1723,6 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
         if (s) teardown(s);
         replyStatus(c, h, 0);
         break;
-    case cc("esup"): {
-        Plist *p = new Plist();
-        uint8_t buffer[192];
-        if (p) {
-            const int empty = p->dict(nullptr, nullptr, 0);
-            Writer w(buffer, sizeof buffer);
-            w.header(h.type, FlagReply, h.uuid, h.request);
-            w.s32(cc(",err"), 0);
-            w.plist(cc(",sup"), *p, empty);
-            sendToGuest(c, w, buffer);
-        }
-        delete p;
-        break;
-    }
     case cc("-enc"):
         if (s) {
             teardown(s);
@@ -1730,25 +1737,17 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
     case cc("dset"): replyStatus(c, h, 0); break;
     case cc("dmul"): replyStatus(c, h, 0); break;
     case cc("dsta"): replyStatus(c, h, s ? startSession(s, m, n) : -12903); break;
-    case cc("dsup"): {
-        Plist *p = new Plist();
-        uint8_t buffer[192];
-        if (p) {
-            const int empty = p->dict(nullptr, nullptr, 0);
-            Writer w(buffer, sizeof buffer);
-            w.header(h.type, FlagReply, h.uuid, h.request);
-            w.s32(cc(",err"), 0);
-            w.plist(cc(",sup"), *p, empty);
-            sendToGuest(c, w, buffer);
-        }
-        delete p;
+    case cc("dsup"): case cc("esup"):
+        supportedProperties(c, h);
         break;
-    }
-    case cc("dcop"): {
+    case cc("dcop"): case cc("ecop"): {
+        // Properties the session asks of the codec. The one it has is that it runs on hardware; anything else (an HEVC encoder
+        // session asks MVHEVCVideoLayerIDs, the layers of a multiview stream) is kVTPropertyNotSupportedErr, as a codec without it
+        // answers.
         Param key;
         char name[96] = "";
         if (param(m, n, cc(",key"), key)) plistString(key.value, key.size, name, sizeof name);
-        if (!strcmp(name, "UsingHardwareAcceleratedVideoDecoder")) {
+        if (!strcmp(name, h.type == cc("dcop") ? "UsingHardwareAcceleratedVideoDecoder" : "UsingHardwareAcceleratedVideoEncoder")) {
             Plist *p = new Plist();
             uint8_t buffer[192];
             if (p) {

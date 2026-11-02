@@ -1707,6 +1707,11 @@ static int vtEncodeProbe(int argc, char **argv) {
         printf("vtencode: encoder %s\n", [(__bridge NSString *)encoderID UTF8String]);
         CFRelease(encoderID);
     }
+    CFBooleanRef usingHardware = NULL;
+    const OSStatus hardwareStatus = VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                                          kCFAllocatorDefault, &usingHardware);
+    printf("vtencode: using a hardware encoder: %d (%d)\n", usingHardware ? CFBooleanGetValue(usingHardware) : -1, (int)hardwareStatus);
+    if (usingHardware) CFRelease(usingHardware);
     VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@(width * height * 4));
     VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@30);
