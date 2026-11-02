@@ -12,6 +12,8 @@
 //   gfxprobe clocks                     mach and POSIX clocks side by side, and a 1 s dispatch timer on uptime, wall and monotonic time
 //   gfxprobe scnotify KEY...            configd tells the SCDynamicStore sessions watching each key that it changed (value untouched)
 //   gfxprobe families                   each GPU family the Metal device answers (supportsFamily:), and the queries a family check uses
+//   gfxprobe argbuf                     an argument buffer (a buffer, a texture, a sampler, a constant) encoded by a descriptor-made and a
+//                                       function-made MTLArgumentEncoder, read by a kernel and by a fragment shader
 //   gfxprobe sysctl [NAME...]           sysconf's memory figures and each sysctl (in a sandbox: which the profile refuses)
 //   gfxprobe box PROFILE[:UID] VERB ARG...  the verb inside the named sandbox profile (sandbox_init), e.g. com.apple.WebKit.GPU:501:
 //                                       what a sandboxed process can do with the GPU; whether the plugin's files and its
@@ -1178,6 +1180,131 @@ static int pitchCheck(unsigned w, unsigned h, unsigned pitch) {
         }
     }
     free(texels);
+    return failures ? 1 : 0;
+}
+
+// argbuf: MTLArgumentEncoder as WebKit's WebGPU uses it for every bind group: the argument buffer holds a buffer's address, a
+// texture's and a sampler's resource IDs and a constant; a kernel and a fragment shader read all four through it (the buffer and the
+// texture made resident by useResource:usage:). Each of the four runs must give in[i] * k + red(i) + green(i) << 8 for every i.
+static const char *kArgSource =
+    "#include <metal_stdlib>\nusing namespace metal;\n"
+    "struct Args { device const uint *in [[id(0)]]; texture2d<float> tex [[id(1)]]; sampler smp [[id(2)]]; uint k [[id(3)]]; };\n"
+    "static uint argValue(constant Args &a, uint2 p) { uint i = p.y * 4 + p.x; float4 c = a.tex.read(p);"
+    " float4 s = a.tex.sample(a.smp, (float2(p) + 0.5) / 4.0, level(0));"
+    " return a.in[i] * a.k + uint(rint(c.r * 255)) + (uint(rint(s.g * 255)) << 8); }\n"
+    "kernel void arg_kernel(constant Args &a [[buffer(0)]], device uint *out [[buffer(1)]], uint i [[thread_position_in_grid]]) {"
+    " out[i] = argValue(a, uint2(i % 4, i / 4)); }\n"
+    "struct V { float4 p [[position]]; };\n"
+    "vertex V arg_vertex(uint i [[vertex_id]]) { float2 c = float2((i << 1) & 2, i & 2); V v; v.p = float4(c * 4 - 1, 0, 1); return v; }\n"
+    "fragment uint4 arg_fragment(V v [[stage_in]], constant Args &a [[buffer(0)]]) { return uint4(argValue(a, uint2(v.p.xy)), 0, 0, 1); }\n";
+
+static int argBufferProbe(void) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) { printf("argbuf: no Metal device\n"); return 1; }
+    printf("argumentBuffersSupport %lu maxArgumentBufferSamplerCount %lu\n", (unsigned long)device.argumentBuffersSupport,
+           (unsigned long)device.maxArgumentBufferSamplerCount);
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:@(kArgSource) options:nil error:&error];
+    if (!library) { printf("argbuf: no library: %s\n", error.description.UTF8String); return 1; }
+    id<MTLFunction> kernel = [library newFunctionWithName:@"arg_kernel"], fragment = [library newFunctionWithName:@"arg_fragment"];
+    id<MTLComputePipelineState> compute = [device newComputePipelineStateWithFunction:kernel error:&error];
+    if (!compute) { printf("argbuf: no compute pipeline: %s\n", error.description.UTF8String); return 1; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [library newFunctionWithName:@"arg_vertex"];
+    pd.fragmentFunction = fragment;
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Uint;
+    id<MTLRenderPipelineState> render = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+    if (!render) { printf("argbuf: no render pipeline: %s\n", error.description.UTF8String); return 1; }
+
+    enum { N = 16, K = 7 };
+    id<MTLBuffer> in = [device newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+    for (uint32_t i = 0; i < N; ++i) ((uint32_t *)in.contents)[i] = 1000 + i * 3;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [device newTextureWithDescriptor:td];
+    uint8_t texels[N * 4];
+    for (uint32_t i = 0; i < N; ++i) { texels[i * 4] = (uint8_t)(i * 10); texels[i * 4 + 1] = (uint8_t)(255 - i * 9); texels[i * 4 + 2] = 0; texels[i * 4 + 3] = 255; }
+    [texture replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:texels bytesPerRow:16];
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest; sd.supportArgumentBuffers = YES;
+    id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sd];
+    printf("resource IDs: texture %#llx sampler %#llx, buffer address %#llx\n", (unsigned long long)texture.gpuResourceID._impl,
+           (unsigned long long)sampler.gpuResourceID._impl, (unsigned long long)in.gpuAddress);
+    uint32_t expected[N];
+    for (uint32_t i = 0; i < N; ++i) expected[i] = (1000 + i * 3) * K + i * 10 + ((255 - i * 9) << 8);
+
+    NSMutableArray<MTLArgumentDescriptor *> *arguments = [NSMutableArray array];
+    const MTLDataType types[4] = {MTLDataTypePointer, MTLDataTypeTexture, MTLDataTypeSampler, MTLDataTypeUInt};
+    for (NSUInteger k = 0; k < 4; ++k) {
+        MTLArgumentDescriptor *a = [MTLArgumentDescriptor argumentDescriptor];
+        a.dataType = types[k]; a.index = k; a.access = MTLBindingAccessReadOnly;
+        if (types[k] == MTLDataTypeTexture) a.textureType = MTLTextureType2D;
+        [arguments addObject:a];
+    }
+    id<MTLArgumentEncoder> encoders[2][2] = {
+        {[device newArgumentEncoderWithArguments:arguments], [device newArgumentEncoderWithArguments:arguments]},
+        {[kernel newArgumentEncoderWithBufferIndex:0], [fragment newArgumentEncoderWithBufferIndex:0]},
+    };
+    const char *made[2] = {"descriptors", "function"}, *runs[2] = {"kernel", "fragment"};
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    int failures = 0;
+    for (int m = 0; m < 2; ++m)
+        for (int r = 0; r < 2; ++r) {
+            id<MTLArgumentEncoder> ae = encoders[m][r];
+            if (!ae) { printf("%s encoder for the %s: none\n", made[m], runs[r]); ++failures; continue; }
+            id<MTLBuffer> ab = [device newBufferWithLength:MAX(ae.encodedLength, (NSUInteger)16) options:MTLResourceStorageModeShared];
+            [ae setArgumentBuffer:ab offset:0];
+            [ae setBuffer:in offset:0 atIndex:0];
+            [ae setTexture:texture atIndex:1];
+            [ae setSamplerState:sampler atIndex:2];
+            uint32_t *k = (uint32_t *)[ae constantDataAtIndex:3];
+            if (k) *k = K;
+            const uint64_t *words = (const uint64_t *)ab.contents;
+            printf("%s encoder, %s: length %lu alignment %lu, words %#llx %#llx %#llx %#llx\n", made[m], runs[r],
+                   (unsigned long)ae.encodedLength, (unsigned long)ae.alignment, (unsigned long long)words[0],
+                   ae.encodedLength >= 16 ? (unsigned long long)words[1] : 0ull, ae.encodedLength >= 24 ? (unsigned long long)words[2] : 0ull,
+                   ae.encodedLength >= 32 ? (unsigned long long)words[3] : 0ull);
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLBuffer> out = [device newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+            id<MTLTexture> target = nil;
+            if (r == 0) {
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:compute];
+                [enc setBuffer:ab offset:0 atIndex:0];
+                [enc setBuffer:out offset:0 atIndex:1];
+                [enc useResource:in usage:MTLResourceUsageRead];
+                [enc useResource:texture usage:MTLResourceUsageRead];
+                [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(N, 1, 1)];
+                [enc endEncoding];
+            } else {
+                MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint width:4 height:4 mipmapped:NO];
+                rd.usage = MTLTextureUsageRenderTarget;
+                target = [device newTextureWithDescriptor:rd];
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = target; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+                [enc setRenderPipelineState:render];
+                [enc setFragmentBuffer:ab offset:0 atIndex:0];
+                [enc useResource:in usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+                [enc useResource:texture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [enc endEncoding];
+            }
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.error) { printf("  command buffer: %s\n", cb.error.description.UTF8String); ++failures; continue; }
+            uint32_t got[N];
+            if (target) [target getBytes:got bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+            else memcpy(got, out.contents, sizeof got);
+            unsigned wrong = 0;
+            for (uint32_t i = 0; i < N; ++i)
+                if (got[i] != expected[i]) {
+                    if (wrong++ < 4) printf("  [%u] %u, want %u\n", i, got[i], expected[i]);
+                }
+            printf("  %s\n", wrong ? "FAIL" : "ok");
+            failures += wrong != 0;
+        }
     return failures ? 1 : 0;
 }
 
@@ -2706,6 +2833,8 @@ int main(int argc, char **argv) {
             return scNotify(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "families"))
             return familiesProbe();
+        if (argc >= 2 && !strcmp(argv[1], "argbuf"))
+            return argBufferProbe();
         if (argc >= 2 && !strcmp(argv[1], "sysctl"))
             return sysctlProbe(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "ethernet"))
