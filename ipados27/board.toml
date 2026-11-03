@@ -143,13 +143,8 @@ kernel_args = [
   # add-gpu-plugin-data.py --plugin build/adreno-metal-plugin27). The GPU clients and the other switches of iPadOS 17's built-in
   # arguments this board has are built in as well (package/DroidVMBootArgs27.c).
   "sheng-gpu-addon=1",
-  # Fewer GPU clients than the built-in iPadOS 17 list for now: with all of them (14 clients, each priming its own pipelines) the
-  # host's GPU memory took the phone to swap and it stopped answering for minutes. The list grows as the plugin's iPadOS 27
-  # gaps close (the command line wins over the built-in value). The wallpaper takes the poster extensions (*Poster*) and
-  # SBRendererService, PaperBoardUI's renderer, whose NeutrinoCore device asserts without a Metal device. Games: its VFX scenes
-  # end the app without a Metal device ("failed to load Metal shaders library", then a null object in com.apple.games.vfx.loader).
-  # com.apple.WebKit.GPU: Safari's WebGPU (requestAdapter) and WebGL (ANGLE's Metal back end) run there and had no device.
-  "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService,Games,com.apple.WebKit.GPU",
+  # droidvm-gpu-clients is among the built-in boot arguments (package/DroidVMBootArgs27.c), not here: with the test tools the
+  # list no longer fits the command line's 1023 bytes, and a value here would replace the built-in one.
   # Debug only: clear the MACF checks the release AMFI/Sandbox impose on an owner debug binary, at the XNU call sites
   # (patches/xnu-12377 zzye/zzyf). Only a caller carrying the owner entitlement com.apple.private.droidvm.debug is cleared,
   # and only read is relaxed for files: the ssh debugserver gets a system process's task port (task_for_pid stopped returning

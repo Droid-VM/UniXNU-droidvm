@@ -52,8 +52,14 @@ char PE_builtin_boot_args[] =
     // timebase ticks: 12.5 ms here): a stackshot takes the debugger, and a vCPU the host keeps off its core longer than that made it
     // a panic ("Resuming from debugger synchronization failed", osanalyticshelper's stackshot at boot, 2026-11-01)
     "ml-timeout-debug-ack-scale=40 "
-    // the processes besides the render server that get the accelerator's user client and a native Metal device, as on iPadOS 17
-    // (DroidVMBootArgs.c), and iPadOS 27's wallpaper renderer (SBRendererService, PaperBoardUI): the launch policy writes the
-    // plugin's NativeAdrenoMetal.clients from it at every boot
-    "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService,com.apple.WebKit.*,Preferences,"
+    // the processes besides the render server that get the accelerator's user client and a native Metal device (the launch
+    // policy writes the plugin's NativeAdrenoMetal.clients from it at every boot). Fewer than iPadOS 17's (DroidVMBootArgs.c):
+    // with all of those (14 clients, each priming its own pipelines) the host's GPU memory took the phone to swap and it stopped
+    // answering for minutes, so the list grows as the plugin's iPadOS 27 gaps close. The wallpaper takes the poster extensions
+    // (*Poster*) and SBRendererService, PaperBoardUI's renderer, whose NeutrinoCore device asserts without a Metal device. Games:
+    // its VFX scenes end the app without a Metal device ("failed to load Metal shaders library", then a null object in
+    // com.apple.games.vfx.loader). com.apple.WebKit.GPU: Safari's WebGPU (requestAdapter) and WebGL (ANGLE's Metal back end).
+    // MetalCheck, app_ios (GFXBench) and gfxprobe: the test tools, GPU clients only while they run. Here rather than on the
+    // command line, which it no longer fits (1023 bytes).
+    "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService,Games,com.apple.WebKit.GPU,"
     "MetalCheck,app_ios,gfxprobe";

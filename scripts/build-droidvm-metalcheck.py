@@ -11,6 +11,7 @@ import hashlib
 import json
 import plistlib
 import re
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +41,13 @@ MACOS_AIR = OUTPUT / 'Checks-macosx.air'
 IOS_METALLIB = APP / 'default.metallib'
 MACOS_METALLIB = HOST / 'default.metallib'
 
+# DROIDVM_IOS_TARGET picks the app's build, as build-droidvm-gfxprobe.py's: arm64-apple-ios17.0 (the default) or
+# arm64e-apple-ios27.0. On iPadOS 27 an arm64 app gets no Metal device until the GPU plugin carries an arm64 slice (dyld loads
+# no arm64e image from outside the shared cache into an arm64 process), so the arm64e build is the one that tests the plugin there.
+TARGET = os.environ.get('DROIDVM_IOS_TARGET', 'arm64-apple-ios17.0')
+ARCH = TARGET.split('-', 1)[0]
+
+
 def build_metallib(sdk, language, target, air, metallib):
     subprocess.run(['xcrun', '--sdk', sdk, 'metal', f'-std={language}', '-target', target,
                     '-c', SOURCE_DIR / 'Checks.metal', '-o', air], check=True)
@@ -57,7 +65,7 @@ FRAMEWORKS = ['-framework', 'Foundation', '-framework', 'Metal', '-framework', '
               '-framework', 'QuartzCore']
 SOURCES = [SOURCE_DIR / 'Core.mm', SOURCE_DIR / 'App.mm']
 
-subprocess.run(['xcrun', 'clang++', '-target', 'arm64-apple-ios17.0', '-isysroot', IOS_SDK,
+subprocess.run(['xcrun', 'clang++', '-target', TARGET, '-isysroot', IOS_SDK,
                 *COMMON_FLAGS, '-DMETALCHECK_APP=1', *FRAMEWORKS,
                 '-framework', 'UIKit', '-framework', 'CoreGraphics', *SOURCES, '-o', APP_BINARY], check=True)
 subprocess.run(['xcrun', 'clang++', '-isysroot', MACOS_SDK, *COMMON_FLAGS, *FRAMEWORKS,
@@ -107,7 +115,7 @@ TRUST.mkdir(parents=True, exist_ok=True)
     'cdhashes': [cdhash],
     'category': 0,
     'binary': 'build/metalcheck/MetalCheck.app/MetalCheck',
-    'source': 'package/metalcheck (iphoneos arm64)',
+    'source': f'package/metalcheck (iphoneos {ARCH})',
 }, indent=2) + '\n')
 
 source_files = {
@@ -127,7 +135,7 @@ provenance = {
     },
     'xcode_version': XCODE_VERSION,
     'targets': {
-        'ios': 'arm64-apple-ios17.0; ios-metal2.3',
+        'ios': f'{TARGET}; ios-metal2.3',
         'host': 'native macOS; macos-metal2.3; AIR air64-apple-macosx11.0',
     },
     'ios_cdhash': cdhash,
