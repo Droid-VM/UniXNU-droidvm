@@ -15,6 +15,8 @@ extern "C" IOService *native_hid_input_allocate(void);
 extern "C" IOService *native_hid_touch_allocate(void);
 extern "C" IOService *droidvm_motion_hid_allocate(unsigned kind);
 extern "C" bool droidvm_motion_present(void);
+extern "C" IOService *native_hid_pen_allocate(void);
+extern "C" bool droidvm_pen_present(void);
 extern "C" int droidvm_sensor_processor_register(void);
 extern "C" {
 extern kern_return_t OSKextLoadKextWithIdentifier(const char *);
@@ -115,23 +117,35 @@ __attribute__((noinline)) void native_hid_live_checkpoint(IOService *device) {
         size_t props=0;native_hid_input_props[0]=0;
         // backboardd's digitizer service classification reads Built-In/DisplayIntegrated from the event service it
         // opened, not from the HID device below it; publish them on the service itself (idempotent, once per second).
-        // Set once only: every setProperty on a service with attached user clients is a registry property-change
-        // notification, and repeating it each second keeps backboardd/hidd busy re-evaluating the service.
-        static IORegistryEntry *publishedFor;
-        if(device->getProperty("Built-In") && publishedFor!=driver) {
-            publishedFor=driver;
+        // Set once only, per service: every setProperty on a service with attached user clients is a registry property-change
+        // notification, and repeating it each second keeps backboardd/hidd busy re-evaluating the service. (One record for
+        // every Built-In device's service: with a single one the devices took turns and each re-published every second.)
+        static IORegistryEntry *publishedFor[4];
+        bool published=false;
+        for(IORegistryEntry *entry:publishedFor)published|=entry==driver;
+        if(device->getProperty("Built-In") && !published) {
+            for(IORegistryEntry *&entry:publishedFor)if(!entry){entry=driver;break;}
+            // The pen digitizer keeps its usage, Digitizer/Stylus: backboardd's pencil digitizer, whose hover range and
+            // maximum force it reads from the service as well (MaxHoverHeight, AccurateMaxDigitizerPressureValue).
+            OSNumber *own=OSDynamicCast(OSNumber,device->getProperty("PrimaryUsage"));
+            const bool pen=own && own->unsigned32BitValue()==0x20 && device->getProperty("MaxHoverHeight");
+            const unsigned long long usage=pen?0x20:4;
             driver->setProperty("Built-In",kOSBooleanTrue);driver->setProperty("DisplayIntegrated",kOSBooleanTrue);
+            if(pen) {
+                driver->setProperty("MaxHoverHeight",device->getProperty("MaxHoverHeight"));
+                driver->setProperty("AccurateMaxDigitizerPressureValue",device->getProperty("AccurateMaxDigitizerPressureValue"));
+            }
             // backboardd (-[BKHIDDirectTouchEventProcessor processEvent:sender:dispatcher:], decoded from the target) drops a
             // digitizer event unless the sending service has PrimaryUsagePage 0x0D and PrimaryUsage 1, 4 or 0x20
             // ("ignoring digitizer event ... from unsupported service"). The combined device lists its keyboard collection
             // first, so the services would publish (1,6); publish Digitizer/Touch Screen on the services after they have
             // matched (setting it on the device would change driver matching, which is observed to depend on the layout).
-            driver->setProperty("PrimaryUsagePage",(unsigned long long)0x0d,32);driver->setProperty("PrimaryUsage",(unsigned long long)4,32);
+            driver->setProperty("PrimaryUsagePage",(unsigned long long)0x0d,32);driver->setProperty("PrimaryUsage",usage,32);
             // backboardd's digitizer filter is {DeviceUsagePage, DeviceUsage, Built-In}; make the flag visible on the
             // interface (the event service's provider) as well, not only on the device two levels down.
             if(IORegistryEntry *interface=driver->getParentEntry(gIOServicePlane)) {
                 interface->setProperty("Built-In",kOSBooleanTrue);interface->setProperty("DisplayIntegrated",kOSBooleanTrue);
-                interface->setProperty("PrimaryUsagePage",(unsigned long long)0x0d,32);interface->setProperty("PrimaryUsage",(unsigned long long)4,32);
+                interface->setProperty("PrimaryUsagePage",(unsigned long long)0x0d,32);interface->setProperty("PrimaryUsage",usage,32);
             }
         }
         // The Digitizer/DebugState dumps (appendProperty) are not read on hardware runs without a photograph and walk
@@ -192,6 +206,13 @@ void native_hid_input_probe(void) {
                         IOService *touch=native_hid_touch_allocate();
                         bool touchStarted=touch && touch->metaCast("IOHIDDevice") && touch->init() && touch->attach(resource) && touch->start(resource);
                         if(!touchStarted && touch){touch->detach(resource);OSSafeReleaseNULL(touch);}
+                    }
+                    // DroidVM: the pen digitizer (Digitizer/Stylus, the staged NativeHidInput's third mode), when the VM has a pen
+                    // (DroidVMVirtioInput.c).
+                    if(started && droidvm_pen_present()) {
+                        IOService *pen=native_hid_pen_allocate();
+                        bool penStarted=pen && pen->metaCast("IOHIDDevice") && pen->init() && pen->attach(resource) && pen->start(resource);
+                        if(!penStarted && pen){pen->detach(resource);OSSafeReleaseNULL(pen);}
                     }
                     // DroidVM: the accelerometer, the gyroscope and the device orientation, as the services locationd and
                     // backboardd look for (DroidVMMotionHid.inc), when the VM has motion sensors (DroidVMVirtioInput.c).

@@ -8,6 +8,10 @@
 // publishes the finger set where NativeHidInput's digitizer reads it every 8 ms (native_touch_*, a seqlock: odd
 // while written; DroidVMStubs.c), on the 30480 x 20320 axes it expects. The other input devices stay unconfigured.
 //
+// A pen (crosvm --input stylus, or any evdev pen: INPUT_PROP_DIRECT with BTN_TOOL_PEN and ABS_X/Y) is read too, with what it has of
+// ABS_PRESSURE, ABS_DISTANCE, ABS_TILT_X/Y and the barrel buttons. Each of its frames goes to NativeHidInput's pen sink (the
+// digitizer's Stylus collection, report 4), with the tilt also as the polar angles iPadOS reads an Apple Pencil's by.
+//
 // Motion sensors (crosvm --input motion, or any evdev accelerometer: INPUT_PROP_ACCELEROMETER with ABS_X/Y/Z, the gravity vector
 // in the panel's frame, Y up the panel) are read too. Their latest values, and the device orientation they say, are published in
 // droidvm_motion for DroidVMMotion.c's sysctl, where the owner tool that tells backboardd the device orientation reads them.
@@ -55,11 +59,20 @@ extern void IOSleep(unsigned milliseconds);
 #define DROIDVM_TOUCH_STILL_MS 8
 
 enum { EV_SYN = 0, EV_KEY = 1, EV_ABS = 3 };
-enum { SYN_REPORT = 0, ABS_X = 0, ABS_Y = 1, ABS_Z = 2, ABS_RZ = 5, ABS_MT_SLOT = 0x2f, ABS_MT_POSITION_X = 0x35,
-       ABS_MT_POSITION_Y = 0x36, ABS_MT_TRACKING_ID = 0x39, BTN_LEFT = 0x110, BTN_TOUCH = 0x14a, INPUT_PROP_DIRECT = 1,
-       INPUT_PROP_ACCELEROMETER = 6, KEY_ENTER = 28, KEY_A = 30 };
+enum { SYN_REPORT = 0, ABS_X = 0, ABS_Y = 1, ABS_Z = 2, ABS_RZ = 5, ABS_PRESSURE = 0x18, ABS_DISTANCE = 0x19, ABS_TILT_X = 0x1a,
+       ABS_TILT_Y = 0x1b, ABS_MT_SLOT = 0x2f, ABS_MT_POSITION_X = 0x35, ABS_MT_POSITION_Y = 0x36, ABS_MT_TRACKING_ID = 0x39,
+       BTN_LEFT = 0x110, BTN_TOOL_PEN = 0x140, BTN_TOOL_RUBBER = 0x141, BTN_TOUCH = 0x14a, BTN_STYLUS = 0x14b, BTN_STYLUS2 = 0x14c,
+       INPUT_PROP_DIRECT = 1, INPUT_PROP_ACCELEROMETER = 6, KEY_ENTER = 28, KEY_A = 30 };
 enum { CFG_ID_NAME = 1, CFG_PROP_BITS = 0x10, CFG_EV_BITS = 0x11, CFG_ABS_INFO = 0x12 };
-enum { KIND_NONE, KIND_TOUCH, KIND_POINTER, KIND_KEYBOARD, KIND_MOTION };
+enum { KIND_NONE, KIND_TOUCH, KIND_POINTER, KIND_KEYBOARD, KIND_MOTION, KIND_PEN };
+// The pen's axes past ABS_X/Y, in its state and axis arrays.
+enum { PEN_PRESSURE, PEN_DISTANCE, PEN_TILT_X, PEN_TILT_Y, PEN_AXES };
+// What the pen sink gets (NativeHidInput's report 4 and its dispatch wrapper): flags (1 in range, 2 the tip touches, 4 the barrel
+// button, 8 the eraser end), x and y 0..32767, pressure 0..4095, distance 0..255, tilt x and y in whole degrees, and the pen's
+// altitude from the normal and azimuth (the cap end's direction from +x, counterclockwise with y up, as UIKit reads a display's:
+// towards -y of the panel's y-down frame) in IOFixed radians.
+enum { PEN_OUT_FLAGS, PEN_OUT_X, PEN_OUT_Y, PEN_OUT_PRESSURE, PEN_OUT_DISTANCE, PEN_OUT_TILT_X, PEN_OUT_TILT_Y, PEN_OUT_ALTITUDE,
+       PEN_OUT_AZIMUTH, PEN_OUT_VALUES };
 // UIDeviceOrientation, as backboardd takes it: 0 not known (lying flat, or between two), 1 portrait, 2 upside down, 3 landscape
 // left (the Home side on the right: the panel's left edge down), 4 landscape right (its right edge down).
 enum { ORIENTATION_UNKNOWN, ORIENTATION_PORTRAIT, ORIENTATION_UPSIDE_DOWN, ORIENTATION_LANDSCAPE_LEFT,
@@ -109,15 +122,20 @@ struct droidvm_input {
     uint8_t key_modifiers, keys[6];   // a keyboard's boot report state: modifier bits and up to six usages held
     bool keys_changed;
     int32_t motion[6];                 // motion sensors: ABS_X..ABS_RZ as last reported
+    // A pen: the ends in range, contact and the barrel buttons, its position and its other axes as last reported, each axis's
+    // range (span 0: the device has none) and the tilt's resolution (units per radian, 0 when the device states none).
+    bool pen_tip, pen_eraser, pen_touch, pen_barrel, pen_was_in_range;
+    int32_t pen_x, pen_y, pen[PEN_AXES], pen_min[PEN_AXES], pen_span[PEN_AXES], pen_tilt_res;
 };
 static struct droidvm_input droidvm_inputs[DROIDVM_INPUT_DEVICES];
 static unsigned droidvm_input_count;
 
-// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 4 motion, 0 left alone), events and frames
-// seen, keyboard reports sent.
+// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 4 motion, 5 pen, 0 left alone), events
+// and frames seen, keyboard and pen reports sent.
 volatile uint32_t droidvm_input_found, droidvm_input_started, droidvm_input_kinds[DROIDVM_INPUT_DEVICES];
 volatile uint64_t droidvm_input_events, droidvm_input_frames, droidvm_input_published, droidvm_input_key_reports,
-    droidvm_input_still;   // publications of a held finger set (touch_still)
+    droidvm_input_still,   // publications of a held finger set (touch_still)
+    droidvm_input_pen_reports;
 char droidvm_input_names[DROIDVM_INPUT_DEVICES][48];
 
 // The motion sensors' latest frame and the orientation it says (DroidVMMotion.c publishes it as kern.droidvm_motion). seq is
@@ -176,6 +194,20 @@ static bool input_axis(const struct droidvm_input *d, uint8_t axis, int32_t *min
     *min = lo;
     *span = hi - lo + 1;
     return true;
+}
+
+// A pen axis the device may lack: its range and (tilt) resolution, or a zero span.
+static void pen_axis(struct droidvm_input *d, unsigned axis, uint8_t code) {
+    uint8_t info[20] = {0};
+    int32_t lo, hi;
+    d->pen_span[axis] = 0;
+    if (input_config(d, CFG_ABS_INFO, code, info, sizeof(info)) < 8) return;
+    memcpy(&lo, info, 4);
+    memcpy(&hi, info + 4, 4);
+    if (hi <= lo) return;
+    d->pen_min[axis] = lo;
+    d->pen_span[axis] = hi - lo + 1;
+    if (axis == PEN_TILT_X) memcpy(&d->pen_tilt_res, info + 16, 4);
 }
 
 static bool input_reset(const struct droidvm_input *d) {
@@ -250,6 +282,14 @@ static unsigned input_identify(struct droidvm_input *d) {
         input_bit(props, nprops, INPUT_PROP_DIRECT) &&
         input_axis(d, ABS_MT_POSITION_X, &d->min_x, &d->span_x) && input_axis(d, ABS_MT_POSITION_Y, &d->min_y, &d->span_y))
         return KIND_TOUCH;
+    // A pen before the pointer below, which it would also pass for (ABS_X/Y and BTN_TOUCH).
+    if (input_bit(keys, nkeys, BTN_TOOL_PEN) && input_bit(props, nprops, INPUT_PROP_DIRECT) && input_bit(abs, nabs, ABS_X) &&
+        input_bit(abs, nabs, ABS_Y) && input_axis(d, ABS_X, &d->min_x, &d->span_x) && input_axis(d, ABS_Y, &d->min_y, &d->span_y)) {
+        static const uint8_t codes[PEN_AXES] = {ABS_PRESSURE, ABS_DISTANCE, ABS_TILT_X, ABS_TILT_Y};
+        for (unsigned axis = 0; axis < PEN_AXES; ++axis)
+            if (input_bit(abs, nabs, codes[axis])) pen_axis(d, axis, codes[axis]);
+        return KIND_PEN;
+    }
     if (!input_bit(abs, nabs, ABS_MT_POSITION_X) && input_bit(abs, nabs, ABS_X) && input_bit(abs, nabs, ABS_Y) &&
         (input_bit(keys, nkeys, BTN_LEFT) || input_bit(keys, nkeys, BTN_TOUCH)) &&
         input_axis(d, ABS_X, &d->min_x, &d->span_x) && input_axis(d, ABS_Y, &d->min_y, &d->span_y))
@@ -474,6 +514,104 @@ static void keyboard_publish(struct droidvm_input *d) {
     droidvm_input_key_reports = droidvm_input_key_reports + 1;
 }
 
+// The pen's tilt in whole degrees and its polar angles, in integers (no floating point in the kernel): tan of whole degrees in
+// 16.16, interpolated between them, and atan as the inverse of that table.
+static const uint32_t pen_tan[90] = {
+    0, 1144, 2289, 3435, 4583, 5734, 6888, 8047, 9210, 10380,
+    11556, 12739, 13930, 15130, 16340, 17560, 18792, 20036, 21294, 22566,
+    23853, 25157, 26478, 27818, 29179, 30560, 31964, 33392, 34846, 36327,
+    37837, 39378, 40951, 42560, 44205, 45889, 47615, 49385, 51202, 53070,
+    54991, 56970, 59009, 61113, 63287, 65536, 67865, 70279, 72785, 75391,
+    78103, 80930, 83882, 86969, 90203, 93595, 97161, 100917, 104880, 109070,
+    113512, 118230, 123255, 128622, 134369, 140542, 147196, 154393, 162207, 170727,
+    180059, 190330, 201699, 214359, 228551, 244584, 262851, 283868, 308323, 337153,
+    371673, 413778, 466313, 533748, 623533, 749080, 937208, 1250501, 1876705, 3754555,
+};
+#define PEN_DEGREES_PER_RADIAN_16 3754936u   // 180 / pi in 16.16
+// tan of 0 <= degrees (16.16) < 89 degrees.
+static uint32_t pen_tan_of(uint32_t degrees) {
+    uint32_t n = degrees >> 16, f = degrees & 0xffff;
+    if (n >= 89) return pen_tan[89];
+    return pen_tan[n] + (uint32_t)(((uint64_t)(pen_tan[n + 1] - pen_tan[n]) * f) >> 16);
+}
+// atan of 0 <= t (16.16), in degrees (16.16).
+static uint32_t pen_atan_of(uint32_t t) {
+    if (t >= pen_tan[89]) return (90u << 16) - (uint32_t)(((uint64_t)PEN_DEGREES_PER_RADIAN_16 << 16) / t);
+    unsigned lo = 0, hi = 89;
+    while (hi - lo > 1) {
+        unsigned mid = (lo + hi) / 2;
+        if (pen_tan[mid] <= t) lo = mid; else hi = mid;
+    }
+    return (lo << 16) + (uint32_t)(((uint64_t)(t - pen_tan[lo]) << 16) / (pen_tan[lo + 1] - pen_tan[lo]));
+}
+static uint32_t pen_isqrt(uint64_t v) {
+    uint64_t r = 0, bit = 1ull << 62;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) { v -= r + bit; r = (r >> 1) + bit; } else r >>= 1;
+        bit >>= 2;
+    }
+    return (uint32_t)r;
+}
+// Degrees (16.16) as IOFixed radians.
+static int32_t pen_radians(int64_t degrees) {
+    return (int32_t)(degrees * 65536 / PEN_DEGREES_PER_RADIAN_16);
+}
+// A tilt axis's value in degrees (16.16, clamped below 89): by its resolution in units per radian (evdev's for tilt), or as
+// degrees when the device states none.
+static int32_t pen_tilt_degrees(const struct droidvm_input *d, unsigned axis) {
+    if (!d->pen_span[axis]) return 0;
+    int64_t v = d->pen[axis];
+    int64_t degrees = d->pen_tilt_res > 0 ? v * PEN_DEGREES_PER_RADIAN_16 / d->pen_tilt_res : v << 16;
+    const int64_t bound = 89ll << 16;
+    return (int32_t)(degrees > bound ? bound : degrees < -bound ? -bound : degrees);
+}
+// A pen axis scaled to 0..max-1 (0 when the device has none).
+static int32_t pen_scaled(const struct droidvm_input *d, unsigned axis, int32_t max) {
+    return d->pen_span[axis] ? input_scale(d->pen[axis], d->pen_min[axis], d->pen_span[axis], max) : 0;
+}
+
+static void (*droidvm_pen_sink)(void *, const int32_t *);
+static void *droidvm_pen_sink_context;
+void native_pen_set_sink(void (*sink)(void *, const int32_t *), void *context) {
+    droidvm_pen_sink_context = context;
+    __atomic_store_n(&droidvm_pen_sink, sink, __ATOMIC_RELEASE);
+}
+
+// One pen frame to the sink (PEN_OUT_*). The polar angles from the tilt: the cap end points along (tan tx, tan ty, 1), so the
+// altitude from the normal is atan |(tan tx, tan ty)| and the azimuth atan2(tan ty, tan tx), negated for UIKit's y-up sense (a
+// pen leaning towards +x and +y reached Safari's Pointer Events leaning towards -x unnegated); an upright pen has azimuth 0.
+static void pen_publish(struct droidvm_input *d) {
+    void (*sink)(void *, const int32_t *) = __atomic_load_n(&droidvm_pen_sink, __ATOMIC_ACQUIRE);
+    bool in_range = d->pen_tip || d->pen_eraser;
+    if (!sink || (!in_range && !d->pen_was_in_range)) return;
+    d->pen_was_in_range = in_range;
+    bool touch = in_range && d->pen_touch;
+    int32_t tx = pen_tilt_degrees(d, PEN_TILT_X), ty = pen_tilt_degrees(d, PEN_TILT_Y);
+    uint32_t a = pen_tan_of((uint32_t)(tx < 0 ? -tx : tx)), b = pen_tan_of((uint32_t)(ty < 0 ? -ty : ty));
+    uint32_t r = pen_isqrt((uint64_t)a * a + (uint64_t)b * b);
+    int64_t azimuth = 0;
+    if (a || b) {
+        // atan2 by quadrant from the angle of |y| / |x| in the first one
+        int64_t first = a ? pen_atan_of((uint32_t)(((uint64_t)b << 16) / a)) : 90ll << 16;
+        if (tx >= 0) azimuth = ty >= 0 ? first : -first;
+        else azimuth = ty >= 0 ? (180ll << 16) - first : first - (180ll << 16);
+    }
+    int32_t pen[PEN_OUT_VALUES] = {
+        [PEN_OUT_FLAGS] = (in_range ? 1 : 0) | (touch ? 2 : 0) | (in_range && d->pen_barrel ? 4 : 0) | (in_range && d->pen_eraser ? 8 : 0),
+        [PEN_OUT_X] = input_scale(d->pen_x, d->min_x, d->span_x, 32768),
+        [PEN_OUT_Y] = input_scale(d->pen_y, d->min_y, d->span_y, 32768),
+        [PEN_OUT_PRESSURE] = touch ? pen_scaled(d, PEN_PRESSURE, 4096) : 0,
+        [PEN_OUT_DISTANCE] = in_range && !touch ? pen_scaled(d, PEN_DISTANCE, 256) : 0,
+        [PEN_OUT_TILT_X] = tx / 65536,
+        [PEN_OUT_TILT_Y] = ty / 65536,
+        [PEN_OUT_ALTITUDE] = pen_radians(pen_atan_of(r)),
+        [PEN_OUT_AZIMUTH] = pen_radians(-azimuth),
+    };
+    sink(droidvm_pen_sink_context, pen);
+    droidvm_input_pen_reports = droidvm_input_pen_reports + 1;
+}
+
 static bool input_event(struct droidvm_input *d, const struct droidvm_input_event *e) {
     droidvm_input_events = droidvm_input_events + 1;
     if (e->type == EV_SYN) return e->code == SYN_REPORT;
@@ -492,6 +630,25 @@ static bool input_event(struct droidvm_input *d, const struct droidvm_input_even
         keyboard_key(d, e->code, e->value != 0);
     } else if (d->kind == KIND_MOTION && e->type == EV_ABS && e->code <= ABS_RZ) {
         d->motion[e->code] = e->value;
+    } else if (d->kind == KIND_PEN && e->type == EV_ABS) {
+        switch (e->code) {
+        case ABS_X: d->pen_x = e->value; break;
+        case ABS_Y: d->pen_y = e->value; break;
+        case ABS_PRESSURE: d->pen[PEN_PRESSURE] = e->value; break;
+        case ABS_DISTANCE: d->pen[PEN_DISTANCE] = e->value; break;
+        case ABS_TILT_X: d->pen[PEN_TILT_X] = e->value; break;
+        case ABS_TILT_Y: d->pen[PEN_TILT_Y] = e->value; break;
+        default: break;
+        }
+    } else if (d->kind == KIND_PEN && e->type == EV_KEY) {
+        bool down = e->value != 0;
+        switch (e->code) {
+        case BTN_TOOL_PEN: d->pen_tip = down; break;
+        case BTN_TOOL_RUBBER: d->pen_eraser = down; break;
+        case BTN_TOUCH: d->pen_touch = down; break;
+        case BTN_STYLUS: case BTN_STYLUS2: d->pen_barrel = down; break;
+        default: break;
+        }
     }
     return false;
 }
@@ -512,6 +669,7 @@ static void input_poll(struct droidvm_input *d) {
                 droidvm_input_frames = droidvm_input_frames + 1;
                 if (d->kind == KIND_KEYBOARD) keyboard_publish(d);
                 else if (d->kind == KIND_MOTION) motion_publish(d);
+                else if (d->kind == KIND_PEN) pen_publish(d);
                 else touch_frame();
             }
             available[2 + (head + returned) % d->size] = (uint16_t)id;
@@ -555,7 +713,13 @@ static void droidvm_input_worker(void *parameter, wait_result_t result) {
     }
 }
 
-static bool droidvm_motion_found;
+static bool droidvm_motion_found, droidvm_pen_found;
+
+// Whether the VM has a pen: HidInputProbe.cpp publishes the pen digitizer then (after droidvm_input_start, as for the motion
+// sensors).
+bool droidvm_pen_present(void) {
+    return droidvm_pen_found;
+}
 
 // Whether the VM has motion sensors. HidInputProbe.cpp publishes the accelerometer and gyroscope HID services (DroidVMMotionHid.inc)
 // only then; it runs after droidvm_input_start, which finds the devices before it returns.
@@ -608,11 +772,12 @@ void droidvm_input_start(void) {
             continue;
         }
         printf("droidvm input %s: %s, %s\n", path, droidvm_input_names[d->index], d->kind == KIND_TOUCH ? "touch" :
-               d->kind == KIND_POINTER ? "pointer" : d->kind == KIND_MOTION ? "motion sensors" : "keyboard");
+               d->kind == KIND_POINTER ? "pointer" : d->kind == KIND_MOTION ? "motion sensors" : d->kind == KIND_PEN ? "pen" : "keyboard");
         if (d->kind == KIND_MOTION) {
             droidvm_motion_register();
             droidvm_motion_found = true;
         }
+        if (d->kind == KIND_PEN) droidvm_pen_found = true;
         droidvm_input_count++;
     }
     droidvm_input_started = droidvm_input_count;
