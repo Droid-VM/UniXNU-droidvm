@@ -4,8 +4,9 @@ the host's dmabuf fds in crosvm (one per imported resource).
 
   vgpu-clients.py [--sizes] reads guest RAM (--sizes: each client's largest resources too) through crosvm's /proc/PID/mem (peek.py); the guest keeps running
 
-Layouts are this kernel's: Client {connection, lock, context, rings, nextHandle, resourceCount, resourceCapacity, pendingCount,
-closedCount, closedCapacity, resources, closed, sequence, ...}, Resource {handle, id, size, hostVisible, pages, wired, window, map} (56 bytes)."""
+Layouts are this kernel's: Client {connection, lock, fenceLock, name[16], blobKib, blobPagesUs, context, rings, nextHandle,
+resourceCount, resourceCapacity, pendingCount, closedCount, closedCapacity, resources, closed, sequence, ...}, Resource {handle, id,
+size, hostVisible, pages, wired, prepared, window, map} (56 bytes)."""
 import os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rigenv  # noqa: F401
@@ -41,15 +42,16 @@ clients = struct.unpack('<64Q', vbytes(peek.symbol('__ZN16DroidVMVirtioGpu12_GLO
 total = dict(clients=0, resources=0, user=0, host=0, bytes=0, pending=0)
 for slot, c in enumerate(clients):
     if not c: continue
-    (connection, lock, context, rings, next_handle, count, capacity, pending, closed, closed_capacity, resources, closed_rows,
-     sequence) = struct.unpack('<QQIIIIIIIIQQQ', vbytes(c, 72))
+    (connection, lock, fence_lock, name, blob_kib, blob_us, context, rings, next_handle, count, capacity, pending, closed,
+     closed_capacity, resources, closed_rows, sequence) = struct.unpack('<QQQ16sIIIIIIIIIIQQQ', vbytes(c, 104))
+    name = name.split(b'\0')[0].decode(errors='replace')
     rows = vbytes(resources, count * 56) if resources and count else b''
     user = host = size = 0
     sizes = []
     for i in range(count):
-        handle, rid, rsize, visible, pages, wired, window, rmap = struct.unpack_from('<IIQ?7xQ?7xQQ', rows, i * 56)
+        handle, rid, rsize, visible, pages, wired, prepared, window, rmap = struct.unpack_from('<IIQ?7xQ??6xQQ', rows, i * 56)
         size += rsize; user += wired; host += visible; sizes.append(rsize)
-    print(f'client {slot:2}: connection {connection:#x} context {context} handles {next_handle - 1} live {count} '
+    print(f'client {slot:2} {name}: connection {connection:#x} context {context} handles {next_handle - 1} live {count} '
           f'(user {user}, host-visible {host}) {size / 2**20:.1f} MiB, pending {pending}, closed waiting {closed}, '
           f'fenced submissions {sequence}')
     if '--sizes' in sys.argv:
