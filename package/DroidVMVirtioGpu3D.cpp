@@ -152,6 +152,7 @@ void selftest3D() {
 // (a method held the client's lock ~0.8 s while the GPU sat idle, and the display, which took a busy client for one whose work
 // was not done, showed nothing meanwhile).
 #include "DroidVMVirtgpuABI.h"
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMultiMemoryDescriptor.h>
 extern "C" void proc_selfname(char *, int);
@@ -192,6 +193,17 @@ volatile uint32_t droidvm_virtgpu_fence_poll_us = 100;
 volatile uint64_t droidvm_virtgpu_scattered_blobs, droidvm_virtgpu_scattered_bytes;
 // Display holds (see hold()): taken, ended, ended because their connection closed, refused (too many open).
 volatile uint64_t droidvm_virtgpu_holds_stats[4];
+// The GPU's IOSurface accesses (see surfaceAccess()): tickets begun, ended, ended because their connection closed, uses not
+// recorded (the table full); CPU locks that waited for them, of those the ones that gave up after droidvm_surface_wait_ms, the
+// time they waited (us) and the longest wait. Then the IOSurface user client's traps by index, and the lock trap's options
+// (kIOSurfaceLockReadOnly 1, kIOSurfaceLockAvoidSync 2) by value.
+volatile uint64_t droidvm_surface_stats[8], droidvm_surface_traps[16], droidvm_surface_lock_options[4];
+// The lock trap's index (IOSurface.framework's IOSurfaceClientLock: trap 2, unlock 3) and how long a lock waits at most.
+volatile uint32_t droidvm_surface_lock_trap = 2;
+volatile uint32_t droidvm_surface_wait_ms = 500;
+// XNU's iokit_user_client_trap calls it before each trap (droidvm-surface-gpu-wait.patch); this weak definition keeps a kernel
+// without the patch linking.
+__attribute__((weak)) void (*volatile droidvm_user_client_trap_hook)(IOUserClient *, uint32_t, uintptr_t, uintptr_t);
 // Guest memory the clients' blobs hold now: bytes of pages this driver allocated, bytes of the callers' own pages it wired
 // (CREATE_BLOB_USER), and how many blobs of each; and the same per client slot, with the process that made the connection.
 volatile uint64_t droidvm_virtgpu_live[4];
@@ -205,7 +217,9 @@ enum : uint32_t { MaxClients = 64, MaxRings = 64, MaxPending = 256, FirstContext
                   MaxBlobEntries = (HugeRequest - sizeof(CreateBlob)) / sizeof(Entry),
                   // The display hold: an op of this board's own beyond DroidVMVirtgpuABI.h's (NativeAdreno's tunnel passes any op
                   // of its range here). In: the ticket to end, or 0 to take a hold; out: the ticket.
-                  OpHold = DROIDVM_VIRTGPU_OPS, HoldRing = 64, HoldsPerClient = 8 };
+                  OpHold = DROIDVM_VIRTGPU_OPS, HoldRing = 64, HoldsPerClient = 8,
+                  // The GPU's IOSurface accesses (surfaceAccess()), another op of the board's own: their uses at once, at most.
+                  OpSurfaceAccess = DROIDVM_VIRTGPU_OPS + 1, MaxSurfaceUses = 4096, MaxSurfacesPerCall = 256 };
 struct Resource {
     uint32_t handle, id;
     uint64_t size;
@@ -809,6 +823,120 @@ IOReturn hold(Client *c, uint64_t ticket, uint64_t &answer) {
     IOLockUnlock(gClientsLock);
     return status;
 }
+// The GPU's IOSurface accesses. Apple's IOSurfaceLock waits for the GPU work still using the surface; nothing here did, so a CPU
+// access raced the GPU: WebKit draws a canvas through CoreAnimation's Metal renderer, then flushes, locks and writes it with the
+// CPU (putImageData), and the drawing still queued on the GPU (the canvas's first clear) landed over the write; a getImageData
+// right after drawing read it half drawn. A submission does not name the resources it uses, so the Metal plugin says which
+// IOSurfaces each command buffer uses as it commits it (a ticket, with each surface marked written or only read) and ends the
+// ticket once the command buffer has completed. The IOSurface user client's lock trap (XNU calls droidvm_user_client_trap_hook)
+// waits for the tickets begun before it: a read lock for those writing the surface, a write lock for every one using it.
+struct SurfaceUse { uint32_t surface; bool write; Client *client; uint64_t ticket; };
+SurfaceUse gSurfaceUses[MaxSurfaceUses];
+uint32_t gSurfaceUseCount, gSurfaceWaiters;
+uint64_t gSurfaceTickets;                // tickets given, the latest
+IOLock *gSurfaceLock;
+const OSMetaClass *gSurfaceClientMeta;   // IOSurfaceRootUserClient's, once seen
+IOLock *surfaceLock() {
+    if (!gSurfaceLock) {
+        IOLock *made = IOLockAlloc();
+        if (made && !OSCompareAndSwapPtr(nullptr, made, reinterpret_cast<void *volatile *>(&gSurfaceLock))) IOLockFree(made);
+    }
+    return gSurfaceLock;
+}
+// gSurfaceLock held: the client's uses under `ticket` (every one of its uses for 0) go, and the locks waiting look again.
+uint32_t endSurfaceUses(Client *c, uint64_t ticket) {
+    uint32_t ended = 0;
+    for (uint32_t i = 0; i < gSurfaceUseCount;) {
+        if (gSurfaceUses[i].client == c && (!ticket || gSurfaceUses[i].ticket == ticket)) {
+            gSurfaceUses[i] = gSurfaceUses[--gSurfaceUseCount];
+            ++ended;
+        } else {
+            ++i;
+        }
+    }
+    if (ended && gSurfaceWaiters) IOLockWakeup(gSurfaceLock, &gSurfaceUses, false);
+    return ended;
+}
+// A lock of `surface` waits for the GPU work begun before it that writes the surface, or for a write lock any that uses it, for
+// droidvm_surface_wait_ms at most (work that waits for the locking thread itself would otherwise never end).
+void waitSurface(uint32_t surface, bool write) {
+    IOLock *lock = gSurfaceLock;
+    if (!lock) return;
+    uint64_t began = 0, deadline = 0;
+    IOLockLock(lock);
+    const uint64_t before = gSurfaceTickets;
+    for (;;) {
+        bool busy = false;
+        for (uint32_t i = 0; i < gSurfaceUseCount && !busy; ++i) {
+            const SurfaceUse &use = gSurfaceUses[i];
+            busy = use.surface == surface && use.ticket <= before && (use.write || write);
+        }
+        if (!busy) break;
+        if (!deadline) {
+            began = nowUsLocal();
+            clock_interval_to_deadline(droidvm_surface_wait_ms, kMillisecondScale, &deadline);
+            droidvm_surface_stats[4] = droidvm_surface_stats[4] + 1;
+        }
+        ++gSurfaceWaiters;
+        const int woke = IOLockSleepDeadline(lock, &gSurfaceUses, deadline, THREAD_UNINT);
+        --gSurfaceWaiters;
+        if (woke == THREAD_TIMED_OUT) { droidvm_surface_stats[5] = droidvm_surface_stats[5] + 1; break; }
+    }
+    IOLockUnlock(lock);
+    if (began) {
+        const uint64_t waited = nowUsLocal() - began;
+        droidvm_surface_stats[6] = droidvm_surface_stats[6] + waited;
+        if (waited > droidvm_surface_stats[7]) droidvm_surface_stats[7] = waited;
+    }
+}
+// Before each user client trap (XNU's iokit_user_client_trap): IOSurfaceRootUserClient's lock trap {surface ID, options, &seed}
+// waits for the GPU; kIOSurfaceLockAvoidSync asks it not to.
+void surfaceTrap(IOUserClient *client, uint32_t index, uintptr_t surface, uintptr_t options) {
+    const OSMetaClass *meta = client ? client->getMetaClass() : nullptr;
+    if (!meta) return;
+    if (meta != gSurfaceClientMeta) {
+        if (gSurfaceClientMeta || strcmp(meta->getClassName(), "IOSurfaceRootUserClient")) return;
+        gSurfaceClientMeta = meta;
+    }
+    if (index < 16) droidvm_surface_traps[index] = droidvm_surface_traps[index] + 1;
+    if (index != droidvm_surface_lock_trap) return;
+    droidvm_surface_lock_options[options & 3] = droidvm_surface_lock_options[options & 3] + 1;
+    if (!(options & 2)) waitSurface(uint32_t(surface), !(options & 1));
+}
+// OpSurfaceAccess. In: {ticket, count, pad} then count records {IOSurface ID, written}; out: the ticket. Ticket 0 begins one with
+// these surfaces; a ticket of the caller's adds them to it; a ticket with no surfaces ends it.
+IOReturn surfaceAccess(Client *c, const void *in, size_t inSize, uint64_t &answer) {
+    struct Head { uint64_t ticket; uint32_t count, pad; };
+    struct Record { uint32_t surface, written; };
+    Head head;
+    if (inSize < sizeof head) return kIOReturnBadArgument;
+    memcpy(&head, in, sizeof head);
+    if (head.count > MaxSurfacesPerCall || inSize != sizeof head + head.count * sizeof(Record)) return kIOReturnBadArgument;
+    IOLock *lock = surfaceLock();
+    if (!lock) return kIOReturnNoMemory;
+    if (!droidvm_user_client_trap_hook) droidvm_user_client_trap_hook = &surfaceTrap;   // locks wait once there is work to wait for
+    IOLockLock(lock);
+    IOReturn status = kIOReturnSuccess;
+    if (head.ticket && !head.count) {
+        endSurfaceUses(c, head.ticket);
+        answer = head.ticket;
+        droidvm_surface_stats[1] = droidvm_surface_stats[1] + 1;
+    } else if (head.ticket > gSurfaceTickets) {
+        status = kIOReturnBadArgument;
+    } else {
+        if (!head.ticket) droidvm_surface_stats[0] = droidvm_surface_stats[0] + 1;
+        answer = head.ticket ? head.ticket : ++gSurfaceTickets;
+        const uint8_t *records = static_cast<const uint8_t *>(in) + sizeof head;
+        for (uint32_t i = 0; i < head.count; ++i) {
+            Record record;
+            memcpy(&record, records + i * sizeof record, sizeof record);
+            if (gSurfaceUseCount == MaxSurfaceUses) { droidvm_surface_stats[3] = droidvm_surface_stats[3] + 1; continue; }
+            gSurfaceUses[gSurfaceUseCount++] = {record.surface, record.written != 0, c, answer};
+        }
+    }
+    IOLockUnlock(lock);
+    return status;
+}
 }
 }
 // For the display: the holds taken so far (a swap waits for them), and whether every hold up to `holds` has ended, with the work
@@ -825,7 +953,7 @@ extern "C" bool droidvm_virtgpu_held(uint64_t holds, uint64_t *order) {
 extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t task, const void *in, size_t inSize, void *out, size_t outSize) {
     using namespace DroidVMVirtioGpu;
     if (!ready()) return kIOReturnNotReady;
-    if (op > OpHold) { count(7); return kIOReturnUnsupported; }
+    if (op > OpSurfaceAccess) { count(7); return kIOReturnUnsupported; }
     Client *c = client(connection, true);
     if (!c) return kIOReturnNoResources;
     auto fixed = [&](size_t inBytes, size_t outBytes, bool variableIn = false) {
@@ -836,6 +964,13 @@ extern "C" IOReturn droidvm_virtgpu_call(void *connection, uint32_t op, task_t t
         uint64_t ticket, answer = 0;
         memcpy(&ticket, in, sizeof ticket);
         const IOReturn status = hold(c, ticket, answer);
+        memcpy(out, &answer, sizeof answer);
+        return status;
+    }
+    if (op == OpSurfaceAccess) {   // takes only gSurfaceLock: tickets end on the plugin's completion threads
+        if (!in || !out || outSize != sizeof(uint64_t)) return kIOReturnBadArgument;
+        uint64_t answer = 0;
+        const IOReturn status = surfaceAccess(c, in, inSize, answer);
         memcpy(out, &answer, sizeof answer);
         return status;
     }
@@ -958,6 +1093,11 @@ extern "C" void droidvm_virtgpu_close(void *connection) {
     droidvm_virtgpu_holds_stats[2] = droidvm_virtgpu_holds_stats[2] + c->holdCount;
     c->holdCount = 0;
     IOLockUnlock(gClientsLock);
+    if (IOLock *lock = gSurfaceLock) {   // a lock waits for no surface use of a process that is gone
+        IOLockLock(lock);
+        if (endSurfaceUses(c, 0)) droidvm_surface_stats[2] = droidvm_surface_stats[2] + 1;
+        IOLockUnlock(lock);
+    }
     IOLockLock(c->lock);
     drain(c, 5000000);
     if (c->pendingCount) droidvm_virtgpu_closes[3] = droidvm_virtgpu_closes[3] + 1;

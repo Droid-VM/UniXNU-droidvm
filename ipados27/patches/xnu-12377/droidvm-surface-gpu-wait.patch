@@ -1,0 +1,31 @@
+iokit_user_client_trap calls droidvm_user_client_trap_hook before each trap, which the board's GPU driver sets (package/
+DroidVMVirtioGpu3D.cpp, surfaceTrap): IOSurfaceRootUserClient's lock trap waits for the GPU work still using the surface, as
+IOSurfaceLock does on Apple's GPUs. Without it WebKit's canvases lost CPU writes to drawing still queued on the GPU.
+
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -6597,6 +6597,13 @@
+ 
+ 	return kIOReturnSuccess;
+ }
++
++/*
++ * DroidVM: the board's GPU driver sees each user client trap before it runs (package/DroidVMVirtioGpu3D.cpp): the lock trap
++ * of IOSurfaceRootUserClient waits there for the GPU work still using the surface, as IOSurfaceLock waits on Apple's GPUs.
++ */
++extern "C" void (*volatile droidvm_user_client_trap_hook)(IOUserClient * client, uint32_t index, uintptr_t p1, uintptr_t p2);
++void (*volatile droidvm_user_client_trap_hook)(IOUserClient * client, uint32_t index, uintptr_t p1, uintptr_t p2);
+ 
+ kern_return_t
+ iokit_user_client_trap(struct iokit_user_client_trap_args *args)
+@@ -6642,6 +6649,9 @@
+ 				func = trap->func;
+ 
+ 				if (func) {
++					if (droidvm_user_client_trap_hook) {
++						droidvm_user_client_trap_hook(userClient, args->index, (uintptr_t) args->p1, (uintptr_t) args->p2);
++					}
+ 					result = (target->*func)(args->p1, args->p2, args->p3, args->p4, args->p5, args->p6);
+ 				}
+ 			}
