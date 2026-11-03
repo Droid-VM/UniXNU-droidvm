@@ -213,7 +213,8 @@ uint32_t bootArg(const char *name, uint32_t fallback)
 // Metal device of its own (DroidVMLaunchPolicy.c writes the same list for the plugin). Their own profiles refuse this driver's user
 // client as well: without the grant WidgetRenderer_Default and iconservicesagent got no device (Vulkan -3), and CoreImage then crashed
 // in its GL fallback, which left the widgets and every Settings icon blank. "*" (every process) gets no grant; only named processes
-// pass the sandbox, a name longer than a process name's 16 characters by its first 16 (com.apple.WebKit.* names WebKit's processes).
+// pass the sandbox, a name longer than a process name's 16 characters by its first 16 (com.apple.WebKit.* names WebKit's processes),
+// and "@apps" every process run from an app bundle container (droidvm-gpu-grant-apps.patch).
 OSString *grantedProcesses()
 {
     char names[256] = "backboardd";

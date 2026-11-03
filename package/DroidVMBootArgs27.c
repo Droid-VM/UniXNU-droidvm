@@ -59,7 +59,9 @@ char PE_builtin_boot_args[] =
     // (*Poster*) and SBRendererService, PaperBoardUI's renderer, whose NeutrinoCore device asserts without a Metal device. Games:
     // its VFX scenes end the app without a Metal device ("failed to load Metal shaders library", then a null object in
     // com.apple.games.vfx.loader). com.apple.WebKit.GPU: Safari's WebGPU (requestAdapter) and WebGL (ANGLE's Metal back end).
-    // MetalCheck, app_ios (GFXBench) and gfxprobe: the test tools, GPU clients only while they run. Here rather than on the
-    // command line, which it no longer fits (1023 bytes).
+    // MetalCheck and gfxprobe: the test tools, GPU clients only while they run. @apps: every app (a process run from an app bundle
+    // container, as any installed app is, GFXBench's app_ios among them), as on an iPad, where every app may use the GPU (the plugin
+    // and the kernel's sandbox grant, droidvm-gpu-grant-apps.patch, both read it). Here rather than on the command line, which it no
+    // longer fits (1023 bytes).
     "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService,Games,com.apple.WebKit.GPU,"
-    "MetalCheck,app_ios,gfxprobe";
+    "MetalCheck,gfxprobe,@apps";

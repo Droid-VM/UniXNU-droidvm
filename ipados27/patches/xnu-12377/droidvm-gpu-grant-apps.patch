@@ -1,0 +1,56 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4386,7 +4386,42 @@
+  * The first 64 refusals of an AGX service are logged with the name and the list (a framework's sandbox_check is not one of them).
+  */
+ extern "C" void proc_selfname(char * buf, int size);
++/*
++ * "@apps" in the list names every app: a process whose executable lies in an app bundle container (/var/containers/Bundle/
++ * Application/), as every installed app's does. On an iPad every app may open the GPU; the names in the list are the system's
++ * processes, which here each keep a device and memory pools of their own, so those stay named one by one.
++ */
++extern "C" struct proc * current_proc(void);
++extern "C" struct vnode * proc_getexecutablevnode(struct proc *);
++extern "C" int vn_getpath(struct vnode * vp, char * pathbuf, int * len);
++extern "C" int vnode_put(struct vnode * vp);
+ static bool
++native_sandbox_grant_app(const char * list)
++{
++	bool named = false;
++	for (const char * at = list; *at;) {
++		size_t length = 0;
++		while (at[length] && at[length] != ',') {
++			++length;
++		}
++		named |= length == 5 && 0 == strncmp(at, "@apps", 5);
++		at += length + (at[length] == ',' ? 1 : 0);
++	}
++	if (!named) {
++		return false;
++	}
++	struct vnode * vp = proc_getexecutablevnode(current_proc());
++	if (!vp) {
++		return false;
++	}
++	char path[1024];   /* PATH_MAX */
++	int length = sizeof(path);
++	const bool app = vn_getpath(vp, path, &length) == 0 &&
++	    (0 == strncmp(path, "/private/var/containers/Bundle/Application/", 43) || 0 == strncmp(path, "/var/containers/Bundle/Application/", 35));
++	vnode_put(vp);
++	return app;
++}
++static bool
+ native_sandbox_grant(IOService * service)
+ {
+ 	OSString * list = OSDynamicCast(OSString, service->getProperty("NativeSandboxGrantProcess"));
+@@ -4406,6 +4441,9 @@
+ 	if (list->isEqualTo("*")) {
+ 		return true;
+ 	}
++	if (native_sandbox_grant_app(list->getCStringNoCopy())) {
++		return true;
++	}
+ 	for (const char * at = list->getCStringNoCopy(); *at;) {
+ 		size_t length = 0;
+ 		while (at[length] && at[length] != ',') {

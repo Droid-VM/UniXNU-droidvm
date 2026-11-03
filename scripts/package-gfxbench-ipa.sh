@@ -8,7 +8,8 @@ Usage: package-gfxbench-ipa.sh GFXBENCH_APP OUTPUT_DIR
 Zips the GFXBench.app that build-droidvm-gfxbench.sh built into an IPA that
 serves both the guest and a real iPad or iPhone (a reference for the guest's
 rendering). The app is not changed: it keeps the build's ad-hoc signature, whose
-CDHash the guest trusts and whose entitlements the guest needs, and it picks its
+CDHash the guest trusts (a third-party app's entitlements by default, see
+build-droidvm-gfxbench.sh), and it picks its
 orientations from the panel at run time. A sideloading tool re-signs it for a
 real device with its user's certificate and provisioning profile entitlements.
 GitHub release assets stop at 2 GiB, so an IPA over 1.9 GiB is also cut into

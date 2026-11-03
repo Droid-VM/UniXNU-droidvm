@@ -166,7 +166,8 @@ static int write_overrides(void *process, uint64_t scratch) {
  return error;
 }
 
-// droidvm-gpu-clients=<name>[,<name>...] ("*" = every process): the processes besides the render server that the Adreno Metal plugin
+// droidvm-gpu-clients=<name>[,<name>...] ("*" = every process, "@apps" = every app, a process run from an app bundle container): the
+// processes besides the render server that the Adreno Metal plugin
 // gives a native Metal device. The plugin reads NativeAdrenoMetal.clients beside its bundle, which is this Data directory in the addon
 // mount's view of /System/Library/Extensions (sheng-gpu-addon=1), so the list changes with a boot argument instead of a new Data seed.
 // Written before every launchd attempt like the overrides; without the argument the file the Data seed carries stays. A failure is
@@ -179,7 +180,7 @@ static int write_gpu_clients(proc_t p, uint64_t scratch) {
  size_t length=strlen(clients);
  for(size_t i=0;i<length;++i) {
   const char c=clients[i];
-  if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='.'||c=='-'||c=='_'||c=='*'||c==','))return EINVAL;
+  if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='.'||c=='-'||c=='_'||c=='*'||c==','||c=='@'))return EINVAL;
   if(c==',')clients[i]='\n';
  }
  clients[length++]='\n';clients[length]=0;

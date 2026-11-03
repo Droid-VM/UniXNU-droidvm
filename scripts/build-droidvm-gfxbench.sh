@@ -10,6 +10,13 @@ at FORK_REVISION (the compatibility changes committed), or upstream at
 PINNED_REVISION, to which the packaged compatibility patch is applied if needed.
 The checkout is never cleaned or reset. Requires macOS, Xcode, CMake, and the
 iOS Metal toolchain.
+
+The app is signed as a third-party app is (GFXBENCH_ENTITLEMENTS=appstore, the
+default): its own application identifier and team, sandboxed in its data
+container. GFXBENCH_ENTITLEMENTS=legacy signs it with the private entitlements
+the iPadOS 17 measurements used (no container, the GPU and IOSurface user
+clients, no classic mode); iPadOS 27's platform policy denies such an app every
+write into its data container.
 EOF
 }
 
@@ -183,22 +190,36 @@ provenance_path.write_text(json.dumps(provenance, indent=2) + '\n')
 PY
 
 ENTITLEMENTS="$INTERMEDIATE_DIR/gfxbench-entitlements.plist"
-"$TOOLS_DIR/python" - "$ENTITLEMENTS" <<'PY'
+"$TOOLS_DIR/python" - "$ENTITLEMENTS" "${GFXBENCH_ENTITLEMENTS:-appstore}" <<'PY'
 import plistlib
 import sys
 from pathlib import Path
 
-Path(sys.argv[1]).write_bytes(plistlib.dumps({
-    'com.apple.private.security.no-container': True,
-    'com.apple.security.iokit-user-client-class': [
-        'IOSurfaceRootUserClient',
-        'AGXDeviceUserClient',
-    ],
-    # SpringBoard runs an app in classic mode (a 768x1024 canvas, pillarboxed) when the screen type matches none it was built
-    # for, which the guest's wide 1366x1024 portrait never does; an app with this entitlement bypasses classic mode
-    # (-[SBApplication _bypassesClassicMode]) and gets the whole screen.
-    'com.apple.UIKit.vends-view-services': True,
-}))
+if sys.argv[2] == 'legacy':
+    entitlements = {
+        'com.apple.private.security.no-container': True,
+        'com.apple.security.iokit-user-client-class': [
+            'IOSurfaceRootUserClient',
+            'AGXDeviceUserClient',
+        ],
+        # SpringBoard runs an app in classic mode (a 768x1024 canvas, pillarboxed) when the screen type matches none it was built
+        # for, which the guest's wide 1366x1024 portrait never does; an app with this entitlement bypasses classic mode
+        # (-[SBApplication _bypassesClassicMode]) and gets the whole screen.
+        'com.apple.UIKit.vends-view-services': True,
+    }
+elif sys.argv[2] == 'appstore':
+    # What an App Store app carries (a placeholder team), and container-required: the guest trusts the app by its CDHash, which
+    # makes it a platform binary, and libsystem_secinit leaves a platform binary unsandboxed unless it asks for its container (as
+    # the stock containerized apps, Calculator among them, do). The GPU is the guest's to grant every app (droidvm-gpu-clients @apps).
+    entitlements = {
+        'application-identifier': 'DROIDVMAPP.org.droidvm.gfxbench',
+        'com.apple.developer.team-identifier': 'DROIDVMAPP',
+        'keychain-access-groups': ['DROIDVMAPP.org.droidvm.gfxbench'],
+        'com.apple.private.security.container-required': True,
+    }
+else:
+    raise SystemExit(f'GFXBENCH_ENTITLEMENTS must be appstore or legacy, not {sys.argv[2]!r}')
+Path(sys.argv[1]).write_bytes(plistlib.dumps(entitlements))
 PY
 codesign --force --sign - --pagesize 4096 --identifier org.droidvm.gfxbench \
     --entitlements "$ENTITLEMENTS" "$STAGED_APP"
