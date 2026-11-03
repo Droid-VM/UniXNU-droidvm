@@ -53,15 +53,11 @@ char PE_builtin_boot_args[] =
     // a panic ("Resuming from debugger synchronization failed", osanalyticshelper's stackshot at boot, 2026-11-01)
     "ml-timeout-debug-ack-scale=40 "
     // the processes besides the render server that get the accelerator's user client and a native Metal device (the launch
-    // policy writes the plugin's NativeAdrenoMetal.clients from it at every boot). Fewer than iPadOS 17's (DroidVMBootArgs.c):
-    // with all of those (14 clients, each priming its own pipelines) the host's GPU memory took the phone to swap and it stopped
-    // answering for minutes, so the list grows as the plugin's iPadOS 27 gaps close. The wallpaper takes the poster extensions
-    // (*Poster*) and SBRendererService, PaperBoardUI's renderer, whose NeutrinoCore device asserts without a Metal device. Games:
-    // its VFX scenes end the app without a Metal device ("failed to load Metal shaders library", then a null object in
-    // com.apple.games.vfx.loader). com.apple.WebKit.GPU: Safari's WebGPU (requestAdapter) and WebGL (ANGLE's Metal back end).
-    // MetalCheck and gfxprobe: the test tools, GPU clients only while they run. @apps: every app (a process run from an app bundle
-    // container, as any installed app is, GFXBench's app_ios among them), as on an iPad, where every app may use the GPU (the plugin
-    // and the kernel's sandbox grant, droidvm-gpu-grant-apps.patch, both read it). Here rather than on the command line, which it no
-    // longer fits (1023 bytes).
-    "droidvm-gpu-clients=WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService,Games,com.apple.WebKit.GPU,"
-    "MetalCheck,gfxprobe,@apps";
+    // policy writes the plugin's NativeAdrenoMetal.clients from it at every boot): "*", every process, as on an iPad. A named list
+    // (with "@apps" for every app) was the rule while each client's cost and the plugin's gaps were unknown: iPadOS 17's 14 clients
+    // took the host to swap, and Maps' VectorKit once wedged the render server. Measured 2026-11-03 with every process: 6 resident
+    // clients after boot (SpringBoard, the Dock folders, a poster, the widget renderer, the icon service, the render server), the
+    // guest's wired memory as with the list, and Maps draws its map. SpringBoard with a device offers iPadOS's windowed apps; in
+    // that mode no home indicator shows (the 11-02 "home gesture" report), and the bottom-edge swipe goes home in either mode.
+    // Here rather than on the command line, which it no longer fits (1023 bytes).
+    "droidvm-gpu-clients=*";

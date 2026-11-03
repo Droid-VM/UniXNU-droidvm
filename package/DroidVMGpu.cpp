@@ -212,7 +212,7 @@ uint32_t bootArg(const char *name, uint32_t fallback)
 // comma-separated list, patch zzw-native-adreno-sandbox-grant): the render server, and each process droidvm-gpu-clients gives a native
 // Metal device of its own (DroidVMLaunchPolicy.c writes the same list for the plugin). Their own profiles refuse this driver's user
 // client as well: without the grant WidgetRenderer_Default and iconservicesagent got no device (Vulkan -3), and CoreImage then crashed
-// in its GL fallback, which left the widgets and every Settings icon blank. "*" (every process) gets no grant; only named processes
+// in its GL fallback, which left the widgets and every Settings icon blank. "*" grants every process; otherwise only named processes
 // pass the sandbox, a name longer than a process name's 16 characters by its first 16 (com.apple.WebKit.* names WebKit's processes),
 // and "@apps" every process run from an app bundle container (droidvm-gpu-grant-apps.patch).
 OSString *grantedProcesses()
@@ -225,7 +225,9 @@ OSString *grantedProcesses()
             if (*at && *at != ',') continue;
             const bool last = !*at;
             *at = 0;
-            if (*name && strcmp(name, "*") != 0) {
+            // "*": every process may open the accelerator, as on an iPad (the grant patch takes "*" alone for that).
+            if (!strcmp(name, "*")) return OSString::withCString("*");
+            if (*name) {
                 strlcat(names, ",", sizeof names);
                 strlcat(names, name, sizeof names);
             }
