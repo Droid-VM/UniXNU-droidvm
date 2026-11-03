@@ -20,3 +20,5 @@ droidvm-timebase-24mhz.patch
 droidvm-text-fixup-bitmap.patch
 droidvm-gpu-grant-apps.patch
 droidvm-native-pac-user-ib.patch
+droidvm-osmetaclass-adopt-superclass.patch
+droidvm-gpu-sandbox-first.patch

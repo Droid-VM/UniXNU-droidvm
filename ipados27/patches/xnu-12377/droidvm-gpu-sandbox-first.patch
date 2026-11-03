@@ -1,0 +1,34 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4386,6 +4386,8 @@
+  * The first 64 refusals of an AGX service are logged with the name and the list (a framework's sandbox_check is not one of them).
+  */
+ extern "C" void proc_selfname(char * buf, int size);
++/* Set by the board's GPU publisher once its user client's class chain is Apple's (droidvm-gpu-sandbox-first.patch). */
++extern "C" { bool droidvm_gpu_sandbox_decides = false; }
+ /*
+  * "@apps" in the list names every app: a process whose executable lies in an app bundle container (/var/containers/Bundle/
+  * Application/), as every installed app's does. On an iPad every app may open the GPU; the names in the list are the system's
+@@ -4505,7 +4507,11 @@
+ 	}
+ 
+ #if CONFIG_MACF
+-	if (!native_sandbox_grant(service) && mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
++	/* Once the native GPU driver's user client stands where Apple's does in the class chain (DroidVMGpu.cpp, through
++	 * OSMetaClassAdoptSuperclass), the sandbox decides who opens it, as for Apple's (droidvm-gpu-sandbox-first.patch): its
++	 * grant then stands in for the message filter below alone, whose rules name the original user client's methods. */
++	if (!(native_sandbox_grant(service) && !droidvm_gpu_sandbox_decides)
++	    && mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
+ 		return kIOReturnNotPermitted;
+ 	}
+ #endif
+@@ -4665,7 +4671,7 @@
+ 			}
+ #if CONFIG_MACF
+ 			/* The service's grant (native_sandbox_grant) stands in for the sandbox's verdict on the render server's open. */
+-			else if (!native_sandbox_grant(service)
++			else if (!(native_sandbox_grant(service) && !droidvm_gpu_sandbox_decides)
+ 			    && 0 != mac_iokit_check_open(kauth_cred_get(), client, connect_type)) {
+ 				IOLog("IOUC %s failed MACF in process %s\n",
+ 				    client->getMetaClass()->getClassName(), creatorNameCStr);

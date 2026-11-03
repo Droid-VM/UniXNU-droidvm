@@ -53,7 +53,8 @@ char PE_builtin_boot_args[] =
     // a panic ("Resuming from debugger synchronization failed", osanalyticshelper's stackshot at boot, 2026-11-01)
     "ml-timeout-debug-ack-scale=40 "
     // the processes besides the render server that get the accelerator's user client and a native Metal device (the launch
-    // policy writes the plugin's NativeAdrenoMetal.clients from it at every boot): "*", every process, as on an iPad. A named list
+    // policy writes the plugin's NativeAdrenoMetal.clients from it at every boot): "*", every process, as on an iPad, the sandbox
+    // deciding each open as for Apple's GPU (DroidVMGpu.cpp grantedProcesses, droidvm-gpu-sandbox-first.patch). A named list
     // (with "@apps" for every app) was the rule while each client's cost and the plugin's gaps were unknown: iPadOS 17's 14 clients
     // took the host to swap, and Maps' VectorKit once wedged the render server. Measured 2026-11-03 with every process: 6 resident
     // clients after boot (SpringBoard, the Dock folders, a poster, the widget renderer, the icon service, the render server), the

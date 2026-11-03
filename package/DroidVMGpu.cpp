@@ -181,6 +181,11 @@ extern "C" IOReturn droidvm_gpu_client_health(uint32_t slot, bool)
 
 // ---- board: publication -----------------------------------------------------------------------------------------------------
 extern "C" volatile uint64_t droidvm_metal_publish[3] = {};
+// The class chains publishMetal adopted: the user client's as Apple's 1 (the sandbox decides every open), not 2; the
+// accelerator's 4, not 8.
+extern "C" volatile uint32_t droidvm_gpu_chain = 0;
+extern "C" bool OSMetaClassAdoptSuperclass(const char *className, const char *superName);   // droidvm-osmetaclass-adopt-superclass.patch
+extern "C" bool droidvm_gpu_sandbox_decides;                                                // droidvm-gpu-sandbox-first.patch
 namespace {
 NativeAdrenoVm gVm;
 NativeAdrenoRing gRing;
@@ -208,13 +213,16 @@ uint32_t bootArg(const char *name, uint32_t fallback)
     return value;
 }
 
-// The processes the accelerator's user client is granted to in place of the sandbox's verdict (NativeSandboxGrantProcess, a
-// comma-separated list, patch zzw-native-adreno-sandbox-grant): the render server, and each process droidvm-gpu-clients gives a native
-// Metal device of its own (DroidVMLaunchPolicy.c writes the same list for the plugin). Their own profiles refuse this driver's user
-// client as well: without the grant WidgetRenderer_Default and iconservicesagent got no device (Vulkan -3), and CoreImage then crashed
-// in its GL fallback, which left the widgets and every Settings icon blank. "*" grants every process; otherwise only named processes
-// pass the sandbox, a name longer than a process name's 16 characters by its first 16 (com.apple.WebKit.* names WebKit's processes),
-// and "@apps" every process run from an app bundle container (droidvm-gpu-grant-apps.patch).
+// The processes the accelerator's user client is granted to (NativeSandboxGrantProcess, a comma-separated list, patch
+// zzw-native-adreno-sandbox-grant): the render server, and each process droidvm-gpu-clients gives a native Metal device of its own
+// (DroidVMLaunchPolicy.c writes the same list for the plugin). With the class chains Apple's (publishMetal, droidvm_gpu_chain 5)
+// the sandbox decides every open, as for Apple's GPU, and the grant stands in only for the user client's message filter, whose
+// rules name Apple's methods (droidvm-gpu-sandbox-first.patch). Where a chain could not be adopted it stands in for the sandbox's
+// verdict too, as it did before: the original profiles refuse a user client of this chain (WidgetRenderer_Default and
+// iconservicesagent got no device, Vulkan -3, and CoreImage crashed in its GL fallback, the widgets and Settings icons blank).
+// "*" grants every process; otherwise only named processes, a name longer than a process name's 16 characters by its first 16
+// (com.apple.WebKit.* names WebKit's processes), and "@apps" every process run from an app bundle container
+// (droidvm-gpu-grant-apps.patch).
 OSString *grantedProcesses()
 {
     char names[256] = "backboardd";
@@ -245,6 +253,14 @@ void publishMetal()
     droidvm_metal_publish[1] = 1;
     kern_return_t status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
     if (status) {droidvm_metal_publish[2] = uint32_t(status); return;}
+    // The user client's class chain as Apple's, before the accelerator is published (no user client exists yet): the original
+    // sandbox profiles match a GPU user client by its chain, many by the family's IOGPUDeviceUserClient, which Apple's
+    // AGXDeviceUserClient derives from and ours, an IOUserClient in C++, did not, so they refused it to backboardd ("deny(1)
+    // iokit-open-user-client AGXDeviceUserClient") and to every poster, whatever the name. With the chain adopted the sandbox
+    // decides every open, as for Apple's (droidvm-gpu-sandbox-first.patch): a process whose profile refuses Apple's GPU is
+    // refused ours. Where it cannot be adopted, the grant (grantedProcesses) still stands in for the sandbox's verdict.
+    droidvm_gpu_sandbox_decides = OSMetaClassAdoptSuperclass("AGXDeviceUserClient", "IOGPUDeviceUserClient");
+    droidvm_gpu_chain = droidvm_gpu_sandbox_decides ? 1 : 2;
     const OSSymbol *name = OSSymbol::withCString("IOAcceleratorES");
     const OSMetaClass *parent = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
     OSSafeReleaseNULL(name);
@@ -257,6 +273,11 @@ void publishMetal()
     if (status) {droidvm_metal_publish[2] = uint32_t(status); return;}
     if (native_adreno_accelerator_instance_size() != 136) {droidvm_metal_publish[2] = uint32_t(kIOReturnInvalid); return;}
     droidvm_metal_publish[1] = 3;
+    // The accelerator's chain as Apple's too, before its first instance: Apple's AGXAccelerator derives from the family's IOGPU
+    // (an IOAcceleratorES), and WebKit's GPU process opens it under the sandbox extension its UI process issues for IOGPU: an
+    // IOAcceleratorES alone was refused it ("deny(1) iokit-open-service AGXAccelerator"). No personality the guest loads
+    // matches an IOGPU provider, so the class chain changes no matching.
+    droidvm_gpu_chain = droidvm_gpu_chain | (OSMetaClassAdoptSuperclass("AGXAccelerator", "IOGPU") ? 4 : 8);
     IOService *accelerator = native_adreno_accelerator_allocate();
     if (!accelerator) {droidvm_metal_publish[2] = uint32_t(kIOReturnNoMemory); return;}
     if (!accelerator->init()) {accelerator->release(); droidvm_metal_publish[2] = uint32_t(kIOReturnError); return;}
