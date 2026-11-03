@@ -340,10 +340,27 @@ static void updateOwnerApp(NSArray<NSString *> *words) {
     }
 }
 
+// registerContainerizedApplicationWithInfoDictionaries: as each OS names it: iPadOS 17 takes the persona strings,
+// iPadOS 27 dropped that argument (...WithInfoDictionaries:operationUUID:requestContext:saveObserver:registrationError:).
+// NO, with *available NO, when the workspace answers neither.
+static BOOL registerContainerized(id workspace, NSArray *items, NSError **error, BOOL *available) {
+    SEL withPersonas = sel_registerName("registerContainerizedApplicationWithInfoDictionaries:personaUniqueStrings:operationUUID:requestContext:saveObserver:registrationError:");
+    SEL without = sel_registerName("registerContainerizedApplicationWithInfoDictionaries:operationUUID:requestContext:saveObserver:registrationError:");
+    if (available) *available = YES;
+    if ([workspace respondsToSelector:withPersonas])
+        return ((BOOL (*)(id, SEL, NSArray *, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
+            workspace, withPersonas, items, nil, [NSUUID UUID], nil, nil, error);
+    if ([workspace respondsToSelector:without])
+        return ((BOOL (*)(id, SEL, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
+            workspace, without, items, [NSUUID UUID], nil, nil, error);
+    if (available) *available = NO;
+    return NO;
+}
+
 static void registerOwnerApps(NSArray<NSString *> *paths) {
     id workspace = call(NSClassFromString(@"LSApplicationWorkspace"), "defaultWorkspace");
-    SEL registerItems = sel_registerName("registerContainerizedApplicationWithInfoDictionaries:personaUniqueStrings:operationUUID:requestContext:saveObserver:registrationError:");
-    if (![workspace respondsToSelector:registerItems]) { line(@"owner-register: selector unavailable"); return; }
+    BOOL available = YES;
+    if (!workspace) { line(@"owner-register: no LSApplicationWorkspace"); return; }
     for (NSString *input in paths) {
         NSString *path = input.stringByResolvingSymlinksInPath.stringByStandardizingPath;
         NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Info.plist"]];
@@ -369,8 +386,8 @@ static void registerOwnerApps(NSArray<NSString *> *paths) {
             @"Path": path, @"CompatibilityState": @0, @"IsContainerized": @(![entitlements[@"com.apple.private.security.no-container"] boolValue]), @"IsDeletable": @NO,
             @"IsAdHocSigned": @YES, @"LSInstallType": @1, @"_LSBundlePlugins": @{}}];
         NSError *error = nil;
-        BOOL ok = ((BOOL (*)(id, SEL, NSArray *, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
-            workspace, registerItems, @[item], nil, [NSUUID UUID], nil, nil, &error);
+        BOOL ok = registerContainerized(workspace, @[item], &error, &available);
+        if (!available) { line(@"owner-register: selector unavailable"); return; }
         line(@"owner-register %@ (%@): %@ %@", path, identifier, ok ? @"YES" : @"NO", error ?: @"");
     }
 }
@@ -580,9 +597,9 @@ static void relink(NSArray<NSString *> *bundleIDs) {
     if (all)
         bundleIDs = [groups.allKeys sortedArrayUsingSelector:@selector(compare:)];
     id workspace = call(NSClassFromString(@"LSApplicationWorkspace"), "defaultWorkspace");
-    SEL sel = sel_registerName("registerContainerizedApplicationWithInfoDictionaries:personaUniqueStrings:operationUUID:requestContext:saveObserver:registrationError:");
-    if (![workspace respondsToSelector:sel]) {
-        line(@"relink: LSApplicationWorkspace does not answer %s", sel_getName(sel));
+    if (![workspace respondsToSelector:sel_registerName("registerContainerizedApplicationWithInfoDictionaries:personaUniqueStrings:operationUUID:requestContext:saveObserver:registrationError:")] &&
+        ![workspace respondsToSelector:sel_registerName("registerContainerizedApplicationWithInfoDictionaries:operationUUID:requestContext:saveObserver:registrationError:")]) {
+        line(@"relink: LSApplicationWorkspace does not answer registerContainerizedApplicationWithInfoDictionaries:");
         return;
     }
     for (NSString *bundleID in bundleIDs) {
@@ -600,8 +617,7 @@ static void relink(NSArray<NSString *> *bundleIDs) {
             }
         }
         NSError *error = nil;
-        BOOL ok = ((BOOL (*)(id, SEL, NSArray *, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
-            workspace, sel, items, nil, [NSUUID UUID], nil, nil, &error);
+        BOOL ok = registerContainerized(workspace, items, &error, NULL);
         line(@"relink %@ (%lu plug-ins): %@ %@", bundleID, (unsigned long)items.count - 1, ok ? @"YES" : @"NO", error ?: @"");
     }
 }

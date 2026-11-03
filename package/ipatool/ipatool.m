@@ -16,6 +16,7 @@
 // at build time). Entitlements and trust: scripts/build-droidvm-ipatool.py (the curated debug set, category 3 in the owner
 // module), like lsdiag. Only root, or an owner process ownervisor spawns, runs it; it is not on ownervisor's app.sock.
 #import <Foundation/Foundation.h>
+#import <fcntl.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -81,8 +82,11 @@ static BOOL extractZip(NSString *ipa, NSString *dest) {
     uint32_t count = OSReadLittleInt16(b, eocd + 10);
     uint64_t cd = OSReadLittleInt32(b, eocd + 16), cdAt = cd;
     NSFileManager *fm = NSFileManager.defaultManager;
-    for (uint32_t e = 0; e < count; e++) {
+    // Each entry's buffers are released as it is written: kept to the end of the loop, a 2.6 GB app held them all.
+    for (uint32_t e = 0; e < count; e++) @autoreleasepool {
         if (cdAt + 46 > n || OSReadLittleInt32(b, cdAt) != 0x02014b50) { line(@"ipatool: bad central directory"); return NO; }
+        uint16_t madeBy = OSReadLittleInt16(b, cdAt + 4);
+        uint32_t externalAttributes = OSReadLittleInt32(b, cdAt + 38);
         uint16_t method = OSReadLittleInt16(b, cdAt + 10);
         uint32_t comp = OSReadLittleInt32(b, cdAt + 20), uncomp = OSReadLittleInt32(b, cdAt + 24);
         uint16_t nameLen = OSReadLittleInt16(b, cdAt + 28), extraLen = OSReadLittleInt16(b, cdAt + 30);
@@ -113,6 +117,11 @@ static BOOL extractZip(NSString *ipa, NSString *dest) {
             if (!inflateRaw(b + dataAt, comp, out.mutableBytes, uncomp)) { line(@"ipatool: inflate failed for %@", name); return NO; }
         } else { line(@"ipatool: unsupported zip method %u for %@", method, name); return NO; }
         if (![out writeToFile:path atomically:NO]) { line(@"ipatool: cannot write %@", path); return NO; }
+        // The entry's Unix permissions (an archive made on Unix keeps st_mode in the high half of the external attributes): the
+        // executables' x bits, without which an app is installed and cannot run. Only the permission bits, of a regular file.
+        const mode_t mode = (mode_t)(externalAttributes >> 16);
+        if ((madeBy >> 8) == 3 && S_ISREG(mode) && (mode & 07777))
+            chmod(path.fileSystemRepresentation, mode & 0777);
     }
     return YES;
 }
@@ -185,12 +194,19 @@ static NSArray<NSString *> *bundleMachOs(NSString *app) {
         NSString *p = [app stringByAppendingPathComponent:exe];
         if ([NSFileManager.defaultManager fileExistsAtPath:p]) [found addObject:p];
     }
+    // Only the first four bytes of each regular file, and each file's objects released as the walk goes: mapping every file and
+    // keeping it to the end of the walk ran a 2.6 GB app (GFXBench, 17017 files) out of memory (NSMallocException).
     NSDirectoryEnumerator *e = [NSFileManager.defaultManager enumeratorAtPath:app];
-    for (NSString *rel in e) {
+    for (NSString *rel in e) @autoreleasepool {
+        if (![e.fileAttributes[NSFileType] isEqual:NSFileTypeRegular]) continue;
         NSString *p = [app stringByAppendingPathComponent:rel];
-        NSData *head = [NSData dataWithContentsOfFile:p options:NSDataReadingMappedIfSafe error:nil];
-        if (head.length < 4) continue;
-        uint32_t m = OSReadBigInt32(head.bytes, 0);
+        int fd = open(p.fileSystemRepresentation, O_RDONLY);
+        if (fd < 0) continue;
+        uint8_t head[4];
+        const ssize_t n = pread(fd, head, sizeof head, 0);
+        close(fd);
+        if (n != sizeof head) continue;
+        uint32_t m = OSReadBigInt32(head, 0);
         if ((m == MH_MAGIC_64 || m == FAT_MAGIC || m == FAT_CIGAM) && ![found containsObject:p]) [found addObject:p];
     }
     return found;
@@ -210,6 +226,23 @@ static BOOL scanBundle(NSString *app, NSMutableArray<NSString *> *cdhashes) {
 }
 
 // ---- LaunchServices / MobileContainerManager (private, looked up at run time) ----
+// registerContainerizedApplicationWithInfoDictionaries: as each OS names it: iPadOS 17 takes the persona strings,
+// iPadOS 27 dropped that argument (...WithInfoDictionaries:operationUUID:requestContext:saveObserver:registrationError:).
+// NO, with *available NO, when the workspace answers neither.
+static BOOL registerContainerized(id workspace, NSArray *items, NSError **error, BOOL *available) {
+    SEL withPersonas = sel_registerName("registerContainerizedApplicationWithInfoDictionaries:personaUniqueStrings:operationUUID:requestContext:saveObserver:registrationError:");
+    SEL without = sel_registerName("registerContainerizedApplicationWithInfoDictionaries:operationUUID:requestContext:saveObserver:registrationError:");
+    if (available) *available = YES;
+    if ([workspace respondsToSelector:withPersonas])
+        return ((BOOL (*)(id, SEL, NSArray *, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
+            workspace, withPersonas, items, nil, [NSUUID UUID], nil, nil, error);
+    if ([workspace respondsToSelector:without])
+        return ((BOOL (*)(id, SEL, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
+            workspace, without, items, [NSUUID UUID], nil, nil, error);
+    if (available) *available = NO;
+    return NO;
+}
+
 static NSURL *ownerContainer(NSString *className, NSString *identifier, BOOL create, BOOL *existed) {
     dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
     Class cls = NSClassFromString(className);
@@ -293,8 +326,6 @@ static BOOL installApp(NSString *app) {
     symlink(destination.fileSystemRepresentation, source.fileSystemRepresentation);   // keep a CLI handle in staging
 
     id workspace = launchServices();
-    SEL reg = sel_registerName("registerContainerizedApplicationWithInfoDictionaries:personaUniqueStrings:operationUUID:requestContext:saveObserver:registrationError:");
-    if (![workspace respondsToSelector:reg]) { line(@"ipatool: register selector unavailable"); return NO; }
     NSDictionary *ents = machoEntitlements([destination stringByAppendingPathComponent:executable]);
     NSMutableDictionary *item = [info mutableCopy];
     if (ents) item[@"Entitlements"] = ents;
@@ -303,8 +334,9 @@ static BOOL installApp(NSString *app) {
         @"CompatibilityState": @0, @"IsContainerized": @(!(ents && [ents[@"com.apple.private.security.no-container"] boolValue])),
         @"IsDeletable": @YES, @"IsAdHocSigned": @YES, @"LSInstallType": @1, @"_LSBundlePlugins": @{}}];
     NSError *error = nil;
-    BOOL ok = ((BOOL (*)(id, SEL, NSArray *, NSArray *, NSUUID *, id, id, NSError **))objc_msgSend)(
-        workspace, reg, @[item], nil, [NSUUID UUID], nil, nil, &error);
+    BOOL available = YES;
+    BOOL ok = registerContainerized(workspace, @[item], &error, &available);
+    if (!available) { line(@"ipatool: register selector unavailable"); return NO; }
     line(@"ipatool: install %@ -> %@: register %@ %@", identifier, destination, ok ? @"OK" : @"FAILED", error ?: @"");
     return ok;
 }
