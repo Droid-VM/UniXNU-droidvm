@@ -50,6 +50,7 @@ the hypervisor); --timebase supplies it, 19.2 MHz on every Qualcomm host seen so
 from pathlib import Path
 import argparse
 import os
+import re
 import struct
 import zlib
 
@@ -381,10 +382,16 @@ def main():
     parser.add_argument('--kernel-ctrr-to-be-enabled', type=int, choices=[0, 1], default=None,
                         help='/chosen/kernel-ctrr-to-be-enabled, which iBoot writes: 0 when nothing locks the kernel text (xnu-12377 '
                              'asserts it was given before DTrace\'s SDT probes ask ml_unsafe_kernel_text)')
+    parser.add_argument('--text-fixup', action='append', default=[], metavar='FILE,OFFSET,ORIGINAL,REPLACEMENT',
+                        help="A fixup of signed text for the kernel's native-text-fixup (/chosen/text-fixups, as UniXNU's "
+                             "[payload] text_fixups): the file's name, the offset in it and the bytes, in hex; repeatable")
     parser.add_argument('--reclaim-memory', action='store_true',
                         help='/chosen/darwinboot-memory-limit: DarwinBoot also hands the kernel the RAM after its window that the '
                              'firmware frees at ExitBootServices, up to the panic region (or the end of guest RAM)')
     args = parser.parse_args()
+    for value in args.text_fixup:
+        if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,63},[0-9a-fA-F]{1,16},(?:[0-9a-fA-F]{2}){1,16},(?:[0-9a-fA-F]{2}){1,16}', value) or len(value) >= 160:
+            parser.error(f'malformed --text-fixup {value}')
     if args.identity_tree and not args.ipad_identity:
         parser.error('--identity-tree takes --ipad-identity')
     if (args.unique_chip_id is None) != (args.chip_id is None):
@@ -524,6 +531,9 @@ def main():
                         *([('kernel-ctrr-to-be-enabled', struct.pack('<I', args.kernel_ctrr_to_be_enabled))]
                           if args.kernel_ctrr_to_be_enabled is not None else []),
                         *([('embedded-panic-log-size', struct.pack('<I', panic_region[1]))] if panic_region else []),
+                        # signed text the kernel changes after validating its page (native-text-fixup.patch), only where the
+                        # original bytes match: NUL-separated entries, as UniXNU's devicetree.py writes [payload] text_fixups
+                        *([('text-fixups', b''.join(value.encode() + b'\0' for value in args.text_fixup))] if args.text_fixup else []),
                         *empty_nvram_proxy()],
              [node('memory-map', ([('PackedRAMDisk' if args.packed_data_ramdisk else 'RAMDisk', bytes(16))]
                                   if (args.data_ramdisk or args.packed_data_ramdisk) else []) +

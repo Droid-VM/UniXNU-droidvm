@@ -1,0 +1,22 @@
+diff --git a/osfmk/vm/vm_fault.c b/osfmk/vm/vm_fault.c
+--- a/osfmk/vm/vm_fault.c
++++ b/osfmk/vm/vm_fault.c
+@@ -8887,6 +8887,18 @@
+ 		page->vmp_cs_validated = VMP_CS_ALL_TRUE;
+ 		page->vmp_cs_tainted = VMP_CS_ALL_FALSE;
+ 		vm_cs_bitmap_validated++;
++#if __arm64__
++		/*
++		 * DroidVM: a page of the root volume validated once before comes back validated by the bitmap,
++		 * not hashed, after it was paged out: the text fixups land here too, or a process that faults
++		 * the page in again runs the original code (vm_page_validate_cs_mapped_slow applies them after
++		 * a hash). The original bytes must still match, so a page fixed up already is left alone.
++		 */
++		if (cs_text_fixup_page(vnode_pager_lookup_vnode(object->pager), page->vmp_offset + object->paging_offset,
++		    (void *)phystokv((pmap_paddr_t)VM_PAGE_GET_PHYS_PAGE(page) << PAGE_SHIFT)) != 0) {
++			cache_sync_page(VM_PAGE_GET_PHYS_PAGE(page));
++		}
++#endif
+ 		return TRUE;
+ 	}
+ #endif /* CHECK_CS_VALIDATION_BITMAP */

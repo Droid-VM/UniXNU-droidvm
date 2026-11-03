@@ -17,3 +17,4 @@ droidvm-free-target-bytes.patch
 droidvm-dyld-16k-peek-first.patch
 droidvm-native-pac-user-jop.patch
 droidvm-timebase-24mhz.patch
+droidvm-text-fixup-bitmap.patch

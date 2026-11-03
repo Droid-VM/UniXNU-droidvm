@@ -171,5 +171,12 @@ unique_chip_id = "required"
 chip_id = "8142"                     # iPad17,3 (the OS profile's [ipsw] chip_id 33090)
 # The J820's identity from the IPSW's own device tree (unixnu ipsw fetch DeviceTree, copied to .cache/firmware here).
 # --boot-video-mib: DarwinBoot's BLT-only boot screen in RAM, 2048x2732 at 4 bytes a pixel (21.3 MiB).
+# --text-fixup: the UI scale for a phone's GPU. QuartzCore's -[CADisplayMode preferredScale] gives a mode without a preferred UI
+# scale (an internal panel's) @2x in a virtual device, and @2x on any other taller than 1080 pixels, so half of a 12.9- or 13-inch
+# iPad's pixels laid out as an iPad mini's. The two fixups (24A446 dyld_shared_cache_arm64e.01, the native-text-fixup patch,
+# applied only where the original bytes match) send a virtual device to the height rule and raise its limit to 1920: a VM display
+# up to 1920 pixels tall is @1x (1032x1376, the 13-inch iPad's points at a quarter of its pixels), a taller one @2x as before.
 tool_args = ["--dynamic", "--boot-video-mib", "24", "--reclaim-memory", "--display-gamut", "sRGB",
-             "--identity-tree", ".cache/firmware/DeviceTree.j820ap.im4p", "--kernel-ctrr-to-be-enabled", "0"]
+             "--identity-tree", ".cache/firmware/DeviceTree.j820ap.im4p", "--kernel-ctrr-to-be-enabled", "0",
+             "--text-fixup", "dyld_shared_cache_arm64e.01,40b17a0,282540b9,05000014",   # ldr w8,[x9,#0x24] -> b to the height rule
+             "--text-fixup", "dyld_shared_cache_arm64e.01,40b17b8,1fe110f1,1f011ef1"]   # cmp x8,#1080 -> cmp x8,#1920
