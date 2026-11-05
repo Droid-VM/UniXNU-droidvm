@@ -340,11 +340,14 @@ void worker(void *, wait_result_t) {
             bool drawn = droidvm_virtgpu_finished(frame.work);
             const bool busy = !drawn;
             while (mode && !drawn && nowUs() - begin < 2000000) {
-                // GPU work: sleep, so the vCPU goes idle, but in steps of 100 us: IOSleep's 1 ms added half a millisecond
-                // a frame on average to a display that paces the compositor (offered -> done 14-16 ms of a 17-19 ms frame).
+                // GPU work: wait for the device to return a command (the transport's one watch, which sleeps on the interrupt),
+                // at most 1 ms at a time so the frame in flight still lands early and a busy client lock is looked at again.
+                // IOSleep's 1 ms added half a millisecond a frame on average to a display that paces the compositor (offered ->
+                // done 14-16 ms of a 17-19 ms frame).
                 if (!landEarly()) return;
-                delay_for_interval(100, NSEC_PER_USEC);
+                const uint64_t seen = DroidVMVirtioGpu::returns();
                 drawn = droidvm_virtgpu_finished(frame.work);
+                if (!drawn) DroidVMVirtioGpu::awaitReturn(seen, nowUs() + 1000);
             }
             if (!drawn) droidvm_virtio_present_late = droidvm_virtio_present_late + 1;
             const uint64_t waited = nowUs() - begin;

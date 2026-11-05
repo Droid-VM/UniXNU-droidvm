@@ -178,6 +178,12 @@ volatile uint32_t droidvm_virtgpu_chunk_kib = 256;
 volatile uint32_t droidvm_virtgpu_contiguous = 0;
 // 1: a guest blob's pages in the calling process's address space (taskPages), not the kernel's; 0: guestPages, as before.
 volatile uint32_t droidvm_virtgpu_in_task = 1;
+// 1, the default: a blob's GEM_NEW and CREATE_BLOB go to the device detached (postDetached), the caller waiting for neither: the
+// guest names the blob's handle, resource and iova, and the device takes commands in order, so a later submission or map naming
+// the blob comes after them. 0: each waited for, as before. Each wait was the device's whole round trip on the caller's thread:
+// 0.1-0.3 ms mostly, 5-15 ms for a few in a hundred (a sync KGSL bind that slept, a large udmabuf and import, a slow kick or
+// answer), and the render server makes hundreds of blobs as a view first comes up (2026-11-05, droidvm_virtio_gpu_legs).
+volatile uint32_t droidvm_virtgpu_async_create = 1;
 // Blob pages taken (droidvm_virtgpu_task_pages[0], bytes [1]) in the calling process's address space, how often that failed and
 // guestPages served the blob instead ([2]), and how often their ownership stayed the process's footprint ([3], taskPages).
 volatile uint64_t droidvm_virtgpu_task_pages[4];
@@ -187,8 +193,6 @@ volatile uint64_t droidvm_virtgpu_page_failures[2];
 // fenced command once its fence signals, after the GPU ran it): count, total and largest (us), and a histogram by power-of-two
 // milliseconds (<1, <2 ... <256, more). What of a frame's commit-to-completion is the host's and the GPU's.
 volatile uint64_t droidvm_virtgpu_rs_fences[3], droidvm_virtgpu_rs_fence_hist[10];
-// The step (us) a fence wait sleeps between looks at the device's returned commands (waitFence).
-volatile uint32_t droidvm_virtgpu_fence_poll_us = 100;
 // Guest blobs whose pages, or the rest of them, came as ordinary pages because no 64 KiB contiguous piece was free, and their bytes.
 volatile uint64_t droidvm_virtgpu_scattered_blobs, droidvm_virtgpu_scattered_bytes;
 // Display holds (see hold()): taken, ended, ended because their connection closed, refused (too many open).
@@ -338,7 +342,12 @@ void reapPending(Client *c) {
 // Waits for every submission of the client in flight (before its resources' pages go back), at most `timeoutUs`.
 void drain(Client *c, uint64_t timeoutUs) {
     const uint64_t begin = nowUsLocal();
-    for (reapPending(c); c->pendingCount && nowUsLocal() - begin < timeoutUs; reapPending(c)) IOSleep(1);
+    for (;;) {
+        const uint64_t seen = returns();
+        reapPending(c);
+        if (!c->pendingCount || nowUsLocal() - begin >= timeoutUs) return;
+        awaitReturn(seen, begin + timeoutUs);
+    }
 }
 IOReturn submitCommand(Client *c, const void *command, uint32_t size) {
     Submit submit = {{CmdSubmit3D, 0, 0, c->context, 0, {}}, size, 0};
@@ -346,6 +355,11 @@ IOReturn submitCommand(Client *c, const void *command, uint32_t size) {
     uint32_t ticket = 0;
     IOReturn status = post(&submit, sizeof submit, command, size, sizeof reply, false, &ticket);
     return status ? status : wait(ticket, 5000000, &reply, sizeof reply);
+}
+// submitCommand without the wait (droidvm_virtgpu_async_create).
+IOReturn submitDetached(Client *c, const void *command, uint32_t size) {
+    Submit submit = {{CmdSubmit3D, 0, 0, c->context, 0, {}}, size, 0};
+    return postDetached(&submit, sizeof submit, command, size, sizeof(Header));
 }
 // A blob's guest memory, counted while it lives (droidvm_virtgpu_live, droidvm_virtgpu_client_memory).
 void countPages(Client *c, const Resource &r, int64_t sign) {
@@ -634,7 +648,8 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
         c->resources = grown; c->resourceCapacity = capacity;
     }
     // The ccmd that describes the blob to the host (GEM_NEW: its iova) goes first, as Linux's virtgpu sends it.
-    IOReturn status = in.cmd_size ? submitCommand(c, ccmd, in.cmd_size) : kIOReturnSuccess;
+    const bool detached = droidvm_virtgpu_async_create != 0;
+    IOReturn status = !in.cmd_size ? kIOReturnSuccess : detached ? submitDetached(c, ccmd, in.cmd_size) : submitCommand(c, ccmd, in.cmd_size);
     if (status) return status;
     Resource r = {}; r.handle = c->nextHandle++; r.id = resourceId(); r.size = in.size; r.hostVisible = !guest;
     Entry *entries = nullptr; uint32_t entryCount = 0, entryCapacity = 0;
@@ -676,7 +691,8 @@ IOReturn createBlob(Client *c, const droidvm_virtgpu_create_blob &in, const uint
     if (!status) {
         CreateBlob blob = {{CmdCreateBlob, 0, 0, c->context, 0, {}}, r.id, in.blob_mem, in.blob_flags, entryCount, in.blob_id, in.size};
         Header reply = {};
-        status = command(&blob, sizeof blob, entries, entryCount * uint32_t(sizeof(Entry)), &reply, sizeof reply);
+        status = detached ? postDetached(&blob, sizeof blob, entries, entryCount * uint32_t(sizeof(Entry)), sizeof reply)
+                          : command(&blob, sizeof blob, entries, entryCount * uint32_t(sizeof(Entry)), &reply, sizeof reply);
     }
     if (entries) IODeleteData(entries, Entry, entryCapacity);
     if (status) { dropPages(r); return status; }
@@ -717,7 +733,12 @@ IOReturn execbuffer(Client *c, const droidvm_virtgpu_execbuffer &in, const uint8
     count(4);
     if (!(in.flags & DROIDVM_VIRTGPU_EXEC_FENCE)) { out.fence = 0; return submitCommand(c, commands, in.size); }
     if (in.ring_idx >= c->rings) return kIOReturnBadArgument;
-    for (reapPending(c); c->pendingCount == MaxPending; reapPending(c)) IOSleep(1);
+    for (;;) {
+        const uint64_t seen = returns();
+        reapPending(c);
+        if (c->pendingCount < MaxPending) break;
+        awaitReturn(seen, ~0ull);
+    }
     // Numbered on its ring: the host retires a ring's fences in order, and crosvm returns the command when its fence signals.
     const uint64_t fence = c->nextFence[in.ring_idx] + 1;
     Submit submit = {{CmdSubmit3D, uint32_t(FlagFence) | uint32_t(FlagRingIndex), fence, c->context, uint8_t(in.ring_idx), {}}, in.size, 0};
@@ -736,6 +757,7 @@ IOReturn waitFence(Client *c, const droidvm_virtgpu_wait_fence &in) {
     if (in.ring_idx >= MaxRings) return kIOReturnBadArgument;
     const uint64_t begin = nowUsLocal(), timeoutUs = in.timeout_ns / 1000;
     for (;;) {
+        const uint64_t seen = returns();
         IOLockLock(c->fenceLock);
         reapFences(c);
         const bool done = c->completed[in.ring_idx] >= in.fence || in.fence > c->nextFence[in.ring_idx];
@@ -747,12 +769,12 @@ IOReturn waitFence(Client *c, const droidvm_virtgpu_wait_fence &in) {
         }
         const uint64_t waited = nowUsLocal() - begin;
         if (waited >= timeoutUs) { if (timeoutUs) count(6); return kIOReturnTimeout; }
-        // A fence is a GPU job: sleep, so the vCPU goes idle -- but in steps of 100 us after a short spin, not IOSleep(1).
-        // The device raises no interrupt (waiters poll), so the step is the latency between the host retiring the fence and
-        // Metal's completion: IOSleep(1), timer leeway included, held each frame's commit-to-completion near 10 ms while
-        // its GPU work took about 1 ms, the GPU sat idle most of the frame and its governor kept it at the lowest clocks.
-        if (waited < 50) IODelay(5);
-        else delay_for_interval(droidvm_virtgpu_fence_poll_us, NSEC_PER_USEC);
+        // The fence's command comes back when the host retires it: wait for the device to return something, with every other
+        // waiter (the transport keeps one watch on the used ring and sleeps on the interrupt past a short spin). The latency
+        // between the host retiring the fence and Metal's completion is that watch's: IOSleep(1) here held each frame's
+        // commit-to-completion near 10 ms while its GPU work took about 1 ms, and each waiter polling every 100 us on its own
+        // cost a quarter of a vCPU in page swipes.
+        awaitReturn(seen, begin + timeoutUs);
     }
 }
 // The handle goes now; the pages go once the GPU cannot be using them. A submission does not name the resources it uses, so
