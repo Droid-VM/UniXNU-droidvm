@@ -1,0 +1,65 @@
+--- a/NativeVirtioBlock.cpp
++++ b/NativeVirtioBlock.cpp
+@@ -117,6 +117,7 @@
+   struct vr_view verified = {};
+   vm_offset_t verifiedStorage = 0;
+   vm_size_t verifiedStorageBytes = 0;
++  const uint8_t *verifiedManifest = nullptr;   // the manifest verified reads: verifiedStorage's or the policy's own
+   unsigned char *verifiedSnapshot = nullptr;   // slot 0's snapshot
+   unsigned char *slotSnapshot[slotCount] = {};
+   bool configureVerification();
+@@ -263,7 +264,7 @@
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+ bool NativeVirtioBlock::authenticatesVolume(const char *uuid, uint8_t *manifestDigest) const
+ {
+-  if (!uuid || !online || !verifiedStorage || !verifiedSnapshot || !verified.hashes) return false;
++  if (!uuid || !online || !verifiedManifest || !verifiedSnapshot || !verified.hashes) return false;
+   static const char hex[] = "0123456789ABCDEF";
+   char expected[37];
+   unsigned at = 0;
+@@ -279,7 +280,7 @@
+     const uint64_t bytes = VR_HEADER_BYTES + VR_SIGNATURE_BYTES + verified.block_count * 32;
+     SHA384_CTX context;
+     SHA384_Init(&context);
+-    SHA384_Update(&context, reinterpret_cast<const void *>(verifiedStorage), bytes);
++    SHA384_Update(&context, verifiedManifest, bytes);
+     SHA384_Final(manifestDigest, &context);
+   }
+   return true;
+@@ -433,22 +434,34 @@
+   }
+   if (!manifest) return false;
+ #endif
++#if defined(NATIVE_VERIFIED_BLOCK_MULTI_POLICY) && NATIVE_VERIFIED_BLOCK_MULTI_POLICY
++  // The policy's manifest already lies in read-only kernel memory (the source storage's copy of the firmware's policies,
++  // protected before it was authenticated): the disk verifies against it there and only the key gets a page of its own.
++  // A copy per disk kept both disks' hash tables twice, 116 MiB of wired memory on the iPadOS 27 guest.
++  const vm_size_t tableBytes = 0;
++#else
+   vm_size_t tableBytes = round_page(static_cast<vm_size_t>(manifestBytes));
+   if (tableBytes < manifestBytes || tableBytes > UINT64_MAX - 4096) return false;
++#endif
+   verifiedStorageBytes = tableBytes + 4096;
+   if (kmem_alloc(kernel_map, &verifiedStorage, verifiedStorageBytes,
+       static_cast<kma_flags_t>(KMA_KOBJECT | KMA_DATA), VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS) return false;
++#if defined(NATIVE_VERIFIED_BLOCK_MULTI_POLICY) && NATIVE_VERIFIED_BLOCK_MULTI_POLICY
++  verifiedManifest = manifest;
++#else
+   memcpy(reinterpret_cast<void *>(verifiedStorage), manifest, manifestBytes);
++  verifiedManifest = reinterpret_cast<const uint8_t *>(verifiedStorage);
++#endif
+   auto *key = reinterpret_cast<uint8_t *>(verifiedStorage + tableBytes);
+   memcpy(key, verified_root_key, VR_KEY_BYTES);
+   if (mach_vm_protect(kernel_map, verifiedStorage, verifiedStorageBytes,
+       TRUE, VM_PROT_READ) != KERN_SUCCESS) return false;
+-  if (vr_open(reinterpret_cast<const uint8_t *>(verifiedStorage), manifestBytes,
++  if (vr_open(verifiedManifest, manifestBytes,
+       key, 1, &vr_xnu_crypto, &verified) != VR_OK || verified.image_bytes != capacity * 512) return false;
+   for (unsigned s = 0; s < slots; ++s)
+     if (!(slotSnapshot[s] = static_cast<unsigned char *>(IOMalloc(transferSize)))) return false;
+   verifiedSnapshot = slotSnapshot[0];
+-  native_virtio_verified_manifest_pointer = verifiedStorage;
++  native_virtio_verified_manifest_pointer = reinterpret_cast<uintptr_t>(verifiedManifest);
+   native_virtio_verified_key_pointer = reinterpret_cast<uintptr_t>(key);
+   native_virtio_manifest_ready = 1;
+   return true;

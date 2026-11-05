@@ -1,0 +1,181 @@
+--- a/NativeVirtioBlock.cpp
++++ b/NativeVirtioBlock.cpp
+@@ -7,6 +7,8 @@
+ #include <libkern/crypto/sha2.h>
+ #include <kern/clock.h>
+ #include <kern/task.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
+ 
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+ #include "verified_root.h"
+@@ -61,6 +63,19 @@
+ volatile uint64_t native_virtio_time[6] = {};
+ // Per disk, in the order they started: its size in sectors and the bytes read from it.
+ volatile uint64_t native_virtio_unit_sectors[8] = {}, native_virtio_unit_bytes[8] = {};
++// Readers past their spin (waitSlot): [0] slept for the interrupt, [1] woken before the guard, [2] the guard's timeout, [3] a
++// return already there as the interrupt went on; [4] the interrupts taken.
++volatile uint64_t native_virtio_irq_waits[5] = {};
++// A/B (poke.py): 0 has every reader poll past its spin, as before the interrupt; read as each wait goes on.
++volatile uint32_t native_virtio_irq_enable = 1;
++// How long a reader looks every 2 us before it sleeps for the interrupt (poke.py; read as each wait begins). With a real spin
++// (ArmCpu's idle latency) the device leg was 231 us a read polled against 330 us with 150 us of spin: the interrupt reaches the
++// boot vCPU, which wakes the reader's, two host round trips. 97% of reads were back within 1 ms.
++volatile uint32_t native_virtio_spin_us = 1000;
++// The device leg of each read (posted to collected), in microseconds: <50 <100 <200 <500 <1000 <2000 <5000, more.
++volatile uint64_t native_virtio_wait_hist[8] = {};
++IOReturn armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback,
++                           uint64_t *router);
+ static volatile uint32_t native_virtio_units = 0;
+ unsigned char native_virtio_first_sector_sha256[32] = {};
+ __attribute__((noinline)) void native_virtio_read_checkpoint(void *device) {
+@@ -104,6 +119,10 @@
+   uint64_t slotPosted[slotCount] = {};
+   uint32_t slotBytes[slotCount] = {}, slotLength[slotCount] = {};
+   uint32_t freeSlots = 0, doneSlots = 0;   // under gate
++  uint32_t interruptId = 0;                // the window's interrupt once attached; 0: readers poll
++  uint32_t sleepers = 0;                   // under gate: readers asleep on it, the queue's interrupt on while any
++  static void interrupt(void *);
++  void interruptsOn(bool);
+   struct Chunk { uint64_t begin, alignedBegin; uint32_t bytes, span; };
+   bool chunkFor(uint64_t sector, uint32_t bytes, Chunk *);
+   unsigned takeSlot();
+@@ -175,6 +194,9 @@
+   IOReturn doAsyncReadWrite(IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
+ };
+ OSDefineMetaClassAndStructors(NativeVirtioBlock, IOBlockStorageDevice)
++
++// The disks whose interrupt is attached, by unit: the handler's context names the unit, not the object.
++static NativeVirtioBlock *volatile interruptOwners[8];
+ 
+ IOService *NativeVirtioBlock::probe(IOService *provider, SInt32 *score)
+ {
+@@ -547,14 +569,37 @@
+   return true;
+ }
+ 
+-// Waits for slot s, the gate held on entry and return and dropped while waiting: it looks every 2 us for the first 150 us of
+-// the request (a 4 KB read is back in ~80 us; with 32 us of spinning the waiter was mostly asleep when it came back, and woke
+-// a timer tick later), then sleeps 20 us at a time so a slow host does not keep a vCPU spinning. Any reader collects for every
+-// slot.
++// The used ring's interrupt (the available ring's NO_INTERRUPT flag clear) while a reader sleeps for it, under the gate; a full
++// barrier after the flag so that the look at the used ring that follows is ordered after it, as the device's look at the flag
++// is after its used index (VirtIO 2.7.7).
++void NativeVirtioBlock::interruptsOn(bool on)
++{
++  *reinterpret_cast<volatile uint16_t *>(static_cast<unsigned char *>(queueMemory->getBytesNoCopy()) + availableOffset) = on ? 0 : 1;
++  __asm__ volatile("dmb sy" ::: "memory");
++}
++
++// The window's interrupt, in the primary interrupt context (the line is level): the status is acknowledged here and every
++// reader asleep for the device is woken, each to collect and look for its own slot.
++void NativeVirtioBlock::interrupt(void *context)
++{
++  const uintptr_t at = reinterpret_cast<uintptr_t>(context);
++  NativeVirtioBlock *self = at < 8 ? interruptOwners[at] : nullptr;
++  __atomic_fetch_add(&native_virtio_irq_waits[4], 1, __ATOMIC_RELAXED);
++  if (!self) return;
++  const uint32_t status = self->read32(0x60) & 3;
++  if (status) self->write32(0x64, status);
++  thread_wakeup_prim(reinterpret_cast<event_t>(&self->sleepers), FALSE, THREAD_AWAKENED);
++}
++
++// Waits for slot s, the gate held on entry and return and dropped while waiting: it looks every 2 us for the first
++// native_virtio_spin_us of the request (a 4 KB read is back in ~80 us), then sleeps on the driver's own event until the window's
++// interrupt, guarded at 2 ms; without one it looks every 20 us. Those delays all slept on the one event every delaying thread shares (clock_delay_until): with
++// thousands of reads a second at boot, the threads queued on its wait queue's lock until its 0.5 s timeout panicked the guest
++// (2026-11-05). Any reader collects for every slot.
+ IOReturn NativeVirtioBlock::waitSlot(unsigned s)
+ {
+-  static uint64_t spinTicks;
+-  if (!spinTicks) nanoseconds_to_absolutetime(150 * NSEC_PER_USEC, &spinTicks);
++  uint64_t spinTicks;
++  nanoseconds_to_absolutetime(static_cast<uint64_t>(native_virtio_spin_us) * NSEC_PER_USEC, &spinTicks);
+   uint64_t deadline;
+   clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
+   for (;;) {
+@@ -565,18 +610,48 @@
+       return kIOReturnIOError;
+     }
+     if (doneSlots & (1U << s)) break;
+-    if (mach_absolute_time() >= deadline) {
++    const uint64_t now = mach_absolute_time();
++    if (now >= deadline) {
+       reset();
+       __atomic_fetch_add(&native_virtio_read_failures, 1, __ATOMIC_RELAXED);
+       return kIOReturnTimeout;
+     }
+-    IOLockUnlock(gate);
+-    IODelay(mach_absolute_time() - slotPosted[s] < spinTicks ? 2 : 20);
+-    IOLockLock(gate);
+-  }
+-  __atomic_fetch_add(&native_virtio_time[0], mach_absolute_time() - slotPosted[s], __ATOMIC_RELAXED);
+-  uint32_t interrupts = read32(0x60) & 3;
+-  if (interrupts) write32(0x64, interrupts);
++    if (!interruptId || !native_virtio_irq_enable || now - slotPosted[s] < spinTicks) {
++      IOLockUnlock(gate);
++      IODelay(now - slotPosted[s] < spinTicks ? 2 : 20);
++      IOLockLock(gate);
++      continue;
++    }
++    // On the driver's own event first, then the interrupt on, then one more look: a request returned between the last look
++    // and the interrupt raised none, and one returned after it wakes this thread before it blocks.
++    uint64_t guard;
++    clock_interval_to_deadline(2, kMillisecondScale, &guard);
++    assert_wait_deadline(reinterpret_cast<event_t>(&sleepers), THREAD_UNINT, guard < deadline ? guard : deadline);
++    if (sleepers++ == 0) interruptsOn(true);
++    __atomic_fetch_add(&native_virtio_irq_waits[0], 1, __ATOMIC_RELAXED);
++    if (reinterpret_cast<volatile uint16_t *>(static_cast<unsigned char *>(queueMemory->getBytesNoCopy()) + usedOffset)[1] !=
++        usedIndex) {
++      clear_wait(current_thread(), THREAD_AWAKENED);
++      __atomic_fetch_add(&native_virtio_irq_waits[3], 1, __ATOMIC_RELAXED);
++    } else {
++      IOLockUnlock(gate);
++      const wait_result_t woke = thread_block(THREAD_CONTINUE_NULL);
++      IOLockLock(gate);
++      __atomic_fetch_add(&native_virtio_irq_waits[woke == THREAD_TIMED_OUT ? 2 : 1], 1, __ATOMIC_RELAXED);
++    }
++    if (--sleepers == 0) interruptsOn(false);
++  }
++  const uint64_t leg = mach_absolute_time() - slotPosted[s];
++  __atomic_fetch_add(&native_virtio_time[0], leg, __ATOMIC_RELAXED);
++  {
++    static const uint64_t bounds[7] = {50, 100, 200, 500, 1000, 2000, 5000};
++    uint64_t us;
++    absolutetime_to_nanoseconds(leg, &us);
++    us /= NSEC_PER_USEC;
++    unsigned bucket = 0;
++    while (bucket < 7 && us >= bounds[bucket]) ++bucket;
++    __atomic_fetch_add(&native_virtio_wait_hist[bucket], 1, __ATOMIC_RELAXED);
++  }
+   const volatile uint8_t *status = static_cast<unsigned char *>(queueMemory->getBytesNoCopy()) + statusOffset + s;
+   dmaBarrier();
+   if (slotLength[s] < slotBytes[s] + 1 || *status != 0) {
+@@ -677,6 +752,19 @@
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+   __atomic_fetch_add(&native_virtio_verified_devices, 1, __ATOMIC_RELAXED);
+ #endif
++  // The window's interrupt (DarwinBoot copies it from the FDT), for the waits past their spin; without one they poll.
++  if (OSData *intid = OSDynamicCast(OSData, provider->getProperty("droidvm,intid")))
++    if (intid->getLength() == sizeof(uint32_t) && unit < 8) {
++      uint32_t id;
++      memcpy(&id, intid->getBytesNoCopy(), sizeof id);
++      interruptOwners[unit] = this;
++      if (armcpu_spi_attach(id, false, interrupt, reinterpret_cast<void *>(static_cast<uintptr_t>(unit)), nullptr, nullptr) ==
++          kIOReturnSuccess) {
++        IOLockLock(gate);
++        interruptId = id;
++        IOLockUnlock(gate);
++      }
++    }
+   native_virtio_read_checkpoint(this);
+   registerService();
+   return true;
+@@ -747,6 +835,7 @@
+ void NativeVirtioBlock::free()
+ {
+   if (registers && !reset()) panic("NativeVirtioBlock: refusing to free active DMA buffers");
++  if (unit < 8 && interruptOwners[unit] == this) interruptOwners[unit] = nullptr;
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+   for (unsigned s = 0; s < slotCount; ++s)
+     if (slotSnapshot[s]) { IOFree(slotSnapshot[s], transferSize); slotSnapshot[s] = nullptr; }
