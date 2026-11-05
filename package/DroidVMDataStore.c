@@ -54,6 +54,10 @@ const char *volatile droidvm_store_why = "";
 volatile uint64_t droidvm_store_disk_blocks, droidvm_store_window_blocks;
 volatile uint64_t droidvm_store_reads, droidvm_store_writes, droidvm_store_flushes, droidvm_store_errors;
 volatile uint32_t droidvm_store_last_status;
+// How long requests took, from the notify to the device's answer: a histogram by bound (us: 50, 100, 200, 500, 1000, 2000, 5000,
+// more) and the total (us). The switches: spin_us of busy wait first, then sleeps of poll_us (1000 is the old IOSleep(1) step).
+volatile uint64_t droidvm_store_wait_hist[8], droidvm_store_wait_us;
+volatile uint32_t droidvm_store_spin_us = 50, droidvm_store_poll_us = 50;
 
 static uintptr_t droidvm_store_registers;
 static bool droidvm_store_device, droidvm_store_can_flush, droidvm_store_dirty;
@@ -95,7 +99,11 @@ static void store_fail(const char *why) {
     printf("droidvm data store failed: %s (status %u)\n", why, droidvm_store_last_status);
 }
 
-// One request, polled: a short spin for the common fast completion, then 1 ms sleeps. Caller holds the lock (or is open).
+// One request, polled: a short spin for the common fast completion, then sleeps of droidvm_store_poll_us. Caller holds the lock
+// (or is open). The sleeps were IOSleep(1): crosvm answers a write once it is in the host's page cache, usually in well under a
+// millisecond, but a request it answered after the spin waited out a whole millisecond (more with the timer's leeway), and every
+// request of the disk queues behind it -- NativeRamBlock serves one at a time -- so while a page swipe's Biome events had
+// SpringBoard, biomed and contextstored writing 200-300 blocks a second, SpringBoard's main thread sat in fsync behind them.
 static bool store_request(uint32_t type, uint64_t sector, uint32_t bytes) {
     struct droidvm_store_desc *descriptors = (struct droidvm_store_desc *)droidvm_store_queue;
     struct droidvm_store_request *request = (struct droidvm_store_request *)(droidvm_store_queue + 512);
@@ -121,8 +129,9 @@ static bool store_request(uint32_t type, uint64_t sector, uint32_t bytes) {
     store_write32(0x50, 0);
     volatile uint16_t *used = (volatile uint16_t *)(droidvm_store_queue + 256);
     uint64_t start = mach_absolute_time(), spin, limit;
-    nanoseconds_to_absolutetime(200 * NSEC_PER_USEC, &spin);   // then sleep, so the vCPU goes idle (DroidVMVirtioGpu.cpp pause())
+    nanoseconds_to_absolutetime((uint64_t)droidvm_store_spin_us * NSEC_PER_USEC, &spin);   // then sleep, so the vCPU goes idle
     nanoseconds_to_absolutetime((uint64_t)DROIDVM_STORE_TIMEOUT_MS * NSEC_PER_MSEC, &limit);
+    const uint32_t step = droidvm_store_poll_us ? droidvm_store_poll_us : 1;
     while (used[1] == droidvm_store_used_index) {
         uint64_t waited = mach_absolute_time() - start;
         if (waited >= limit) {
@@ -130,10 +139,19 @@ static bool store_request(uint32_t type, uint64_t sector, uint32_t bytes) {
             return false;
         }
         if (waited < spin) delay(1);
-        else IOSleep(1);
+        else if (step >= 1000) IOSleep(step / 1000);
+        else delay_for_interval(step, NSEC_PER_USEC);
         store_barrier();
     }
     store_barrier();
+    uint64_t took;
+    absolutetime_to_nanoseconds(mach_absolute_time() - start, &took);
+    took /= NSEC_PER_USEC;
+    static const uint64_t bounds[7] = {50, 100, 200, 500, 1000, 2000, 5000};
+    unsigned bucket = 0;
+    while (bucket < 7 && took >= bounds[bucket]) ++bucket;
+    droidvm_store_wait_hist[bucket] = droidvm_store_wait_hist[bucket] + 1;
+    droidvm_store_wait_us = droidvm_store_wait_us + took;
     volatile struct droidvm_store_used *element =
         (volatile struct droidvm_store_used *)(droidvm_store_queue + 260) + droidvm_store_used_index % DROIDVM_STORE_QUEUE;
     bool valid = used[1] == (uint16_t)(droidvm_store_used_index + 1) && element->id == 0 && *status == 0 &&
