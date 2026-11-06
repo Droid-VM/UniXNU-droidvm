@@ -4,7 +4,7 @@
 // the phone's br-wifi) is moved onto the MMIO transport by the fork's --virtio-mmio-net, and make-droidvm-adt.py (--net-mmio)
 // publishes its window as /arm-io/net, compatible "droidvm,net". This file is the transport half: it maps that window, brings
 // the virtio-net device up (VIRTIO_F_VERSION_1 + VIRTIO_NET_F_MAC, no offloads or mergeable buffers -- so every packet carries a
-// 12-byte virtio_net_hdr in one descriptor), drives the receive and transmit split virtqueues, and runs a polling worker.
+// 12-byte virtio_net_hdr in one descriptor), drives the receive and transmit split virtqueues, and runs a worker that sleeps on the receive interrupt.
 //
 // Above it, the device is an IOKit ethernet controller (DroidVMVirtioEthernet.cpp) on Apple's IONetworkingFamily, which
 // DroidVMVirtioNetIf.cpp brings up; both are C++ in the IOKit driver universe (its net/mbuf headers redefine core types this
@@ -17,6 +17,8 @@
 #include <stdbool.h>
 #include <string.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/misc_protos.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
@@ -28,6 +30,8 @@
 extern void IOSleep(unsigned milliseconds);
 extern void delay(int usec);
 extern int thread_policy_set(thread_t, int flavor, int *policy_info, unsigned count);   // lower the worker below the monitor
+// ArmCpu (the GIC): a handler for one SPI, run in the primary interrupt context before the EOI; 0 when attached.
+extern int armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback, uint64_t *router);
 // The IOKit half (DroidVMVirtioNetIf.cpp).
 extern int droidvm_net_if_attach(const uint8_t mac[6]);
 extern void droidvm_net_if_input(const void *frame, unsigned length);
@@ -38,6 +42,7 @@ enum {
     DROIDVM_NET_FRAME = 1514,        // a full ethernet frame without the FCS
     DROIDVM_NET_BUFFER = 2048,       // DROIDVM_NET_HDR + DROIDVM_NET_FRAME, rounded up
     DROIDVM_NET_POLL_MS = 10,
+    DROIDVM_NET_GUARD_MS = 100,      // with the receive interrupt, the worker looks anyway after this long
 };
 enum { VIRTIO_NET_F_MAC = 5, VIRTQ_DESC_F_WRITE = 2, VIRTQ_AVAIL_F_NO_INTERRUPT = 1 };
 
@@ -79,11 +84,18 @@ static struct {
     uint16_t tx_used;         // our index into the transmit used ring
     volatile int tx_lock;     // a brief spin lock: the output callback and the reclaim both touch the transmit ring
     bool up;
+    bool interrupt;           // its SPI (the ADT's droidvm,intid) wakes the worker
 } droidvm_net;
 
 // For the host rig (peek.py).
 volatile uint32_t droidvm_net_found, droidvm_net_started, droidvm_net_stage;
 volatile uint64_t droidvm_net_rx_packets, droidvm_net_tx_packets, droidvm_net_rx_drops, droidvm_net_tx_drops;
+// The receive interrupt: [0] taken, [1] the worker's sleeps, [2] of those ended by their guard, [3] guard ends whose look found a
+// frame. The worker polled every 10 ms before, so 64 buffers carried at most 64 frames per 10 ms and a burst beyond that found
+// the ring empty: a TCP stream from the phone into the guest ran at 6.4 MB/s, 18 MB/s on the interrupt (50 MB, busybox nc).
+// droidvm_net_irq 0: poll so again (read before each sleep).
+volatile uint64_t droidvm_net_irq_counts[4];
+volatile uint32_t droidvm_net_irq = 1;
 char droidvm_net_status[64];
 
 // A trapped MMIO access must be a single load/store with a plain base register (see DroidVMVirtioInput.c).
@@ -253,6 +265,22 @@ static void net_rx_poll(void) {
     }
 }
 
+// The device's interrupt, in the primary interrupt context: the line is level, so the status is acknowledged here; the worker
+// takes the frames.
+static void net_interrupt(void *context) {
+    (void)context;
+    uint32_t status = net_read32(0x60) & 3;
+    if (status) net_write32(0x64, status);
+    __atomic_fetch_add(&droidvm_net_irq_counts[0], 1, __ATOMIC_RELAXED);
+    thread_wakeup_prim((event_t)&droidvm_net_irq_counts, FALSE, THREAD_AWAKENED);
+}
+
+// The receive queue's VIRTQ_AVAIL_F_NO_INTERRUPT: off while the worker sleeps on the interrupt, on while it polls.
+static void net_rx_interrupts_on(bool on) {
+    *(volatile uint16_t *)(droidvm_net_rx_ring + 1024) = on ? 0 : VIRTQ_AVAIL_F_NO_INTERRUPT;
+    net_barrier();
+}
+
 static void droidvm_net_worker(void *parameter, wait_result_t result) {
     (void)parameter; (void)result;
     // Attach the BSD interface here, not in droidvm_net_start: that runs on the board-probe thread, where the networking
@@ -266,9 +294,30 @@ static void droidvm_net_worker(void *parameter, wait_result_t result) {
     droidvm_net_started = 1;
     snprintf(droidvm_net_status, sizeof(droidvm_net_status), "en up %02x:%02x:%02x:%02x:%02x:%02x",
              droidvm_net.mac[0], droidvm_net.mac[1], droidvm_net.mac[2], droidvm_net.mac[3], droidvm_net.mac[4], droidvm_net.mac[5]);
+    bool on = false, guarded = false;
     for (;;) {
+        // The flag first, then the look: a frame written before the flag changed raised no interrupt, and the look takes it. The
+        // interrupt count before the look: one taken during it, or before the sleep is armed, ends the sleep at once.
+        const bool want = droidvm_net.interrupt && droidvm_net_irq;
+        if (want != on) net_rx_interrupts_on(on = want);
+        const uint64_t seen = __atomic_load_n(&droidvm_net_irq_counts[0], __ATOMIC_RELAXED), frames = droidvm_net_rx_packets;
         net_rx_poll();
-        IOSleep(DROIDVM_NET_POLL_MS);
+        if (guarded && droidvm_net_rx_packets != frames) droidvm_net_irq_counts[3] = droidvm_net_irq_counts[3] + 1;
+        guarded = false;
+        if (!on) {
+            IOSleep(DROIDVM_NET_POLL_MS);
+            continue;
+        }
+        uint64_t deadline;
+        clock_interval_to_deadline(DROIDVM_NET_GUARD_MS, NSEC_PER_MSEC, &deadline);
+        assert_wait_deadline((event_t)&droidvm_net_irq_counts, THREAD_UNINT, deadline);
+        droidvm_net_irq_counts[1] = droidvm_net_irq_counts[1] + 1;
+        if (__atomic_load_n(&droidvm_net_irq_counts[0], __ATOMIC_RELAXED) != seen) {
+            clear_wait(current_thread(), THREAD_AWAKENED);
+        } else if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
+            droidvm_net_irq_counts[2] = droidvm_net_irq_counts[2] + 1;
+            guarded = true;
+        }
     }
 }
 
@@ -307,6 +356,12 @@ void droidvm_net_start(void) {
     }
     droidvm_net_stage = 3;
     droidvm_net.up = true;   // the transmit path is ready before the interface can call it
+    // The window's interrupt (DarwinBoot copies it from the FDT); without one the worker keeps polling.
+    if (SecureDTGetProperty(node, "droidvm,intid", &value, &size) == kSuccess && size == sizeof(uint32_t)) {
+        uint32_t intid;
+        memcpy(&intid, value, sizeof(intid));
+        droidvm_net.interrupt = armcpu_spi_attach(intid, false, net_interrupt, NULL, NULL, NULL) == 0;
+    }
     // The worker attaches the interface (off this board-probe thread) and then polls receive, so this returns at once. It is
     // dropped well below default priority: on a busy bridged network its receive processing otherwise starves the monitor
     // thread that services the host mailbox (and everything else) on this small VM.
