@@ -398,12 +398,18 @@ void worker(void *, wait_result_t) {
             if (!status) droidvm_virtio_display_boot_frames = droidvm_virtio_display_boot_frames + 1;
         }
         // Until the next frame is offered (offer() wakes this), or 1 ms for the boot console's cadence: a frame no longer waits
-        // up to a millisecond to be taken.
+        // up to a millisecond to be taken. Once a compositor has offered a frame the boot console shows only when made dirty,
+        // which wakes this too, so there is nothing to look at between wakes: the 1 ms steps woke a vCPU a thousand times a
+        // second on a still screen (0.2 s of CPU in 10 s, 2026-11-06).
         IOLockLock(frameLock);
         if (!pending.memory && !bootDirty) {
-            uint64_t deadline;
-            clock_interval_to_deadline(1, kMillisecondScale, &deadline);
-            IOLockSleepDeadline(frameLock, &pending, deadline, THREAD_UNINT);
+            if (compositor) {
+                IOLockSleep(frameLock, &pending, THREAD_UNINT);
+            } else {
+                uint64_t deadline;
+                clock_interval_to_deadline(1, kMillisecondScale, &deadline);
+                IOLockSleepDeadline(frameLock, &pending, deadline, THREAD_UNINT);
+            }
         }
         IOLockUnlock(frameLock);
         ++idle;
