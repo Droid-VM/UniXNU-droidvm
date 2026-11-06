@@ -26,6 +26,7 @@
 #include <string.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/misc_protos.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
@@ -35,11 +36,16 @@
 #endif
 
 extern void IOSleep(unsigned milliseconds);
+// ArmCpu (the GIC): a handler for one SPI, run in the primary interrupt context before the EOI; 0 when attached.
+extern int armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback, uint64_t *router);
 
 #define DROIDVM_INPUT_DEVICES 8
 #define DROIDVM_INPUT_BUFFERS 64       // crosvm's event queue size
 #define DROIDVM_INPUT_SLOTS 10
 #define DROIDVM_INPUT_POLL_MS 4
+// With every device's interrupt attached the worker sleeps until one fires, looking anyway after this long (ms) in case one was
+// lost; while fingers are down it still looks every DROIDVM_INPUT_POLL_MS (touch_still).
+#define DROIDVM_INPUT_GUARD_MS 250
 #define DROIDVM_TOUCH_FINGERS 10       // NativeHidInput's report
 #define DROIDVM_TOUCH_AXIS_X 30480
 #define DROIDVM_TOUCH_AXIS_Y 20320
@@ -126,6 +132,7 @@ struct droidvm_input {
     // range (span 0: the device has none) and the tilt's resolution (units per radian, 0 when the device states none).
     bool pen_tip, pen_eraser, pen_touch, pen_barrel, pen_was_in_range;
     int32_t pen_x, pen_y, pen[PEN_AXES], pen_min[PEN_AXES], pen_span[PEN_AXES], pen_tilt_res;
+    bool interrupt;                    // its SPI (the ADT's droidvm,intid) wakes the worker
 };
 static struct droidvm_input droidvm_inputs[DROIDVM_INPUT_DEVICES];
 static unsigned droidvm_input_count;
@@ -136,6 +143,12 @@ volatile uint32_t droidvm_input_found, droidvm_input_started, droidvm_input_kind
 volatile uint64_t droidvm_input_events, droidvm_input_frames, droidvm_input_published, droidvm_input_key_reports,
     droidvm_input_still,   // publications of a held finger set (touch_still)
     droidvm_input_pen_reports;
+// The devices' interrupts: [0] taken (each wakes the worker), [1] the worker's sleeps, [2] of those ended by their guard or the
+// held-finger step, [3] guard ends whose look found a frame (an interrupt that never came), [4] devices attached. The worker
+// polled every 4 ms before: 250 wakes a second of a vCPU with nothing to read on a still screen. droidvm_input_irq 0: poll so
+// again (read before each sleep).
+volatile uint64_t droidvm_input_irq_counts[5];
+volatile uint32_t droidvm_input_irq = 1;
 char droidvm_input_names[DROIDVM_INPUT_DEVICES][48];
 
 // The motion sensors' latest frame and the orientation it says (DroidVMMotion.c publishes it as kern.droidvm_motion). seq is
@@ -223,7 +236,7 @@ static bool input_queue(struct droidvm_input *d, unsigned queue, uint16_t size, 
     input_write32(d, 0x30, queue);
     if (input_read32(d, 0x44) || input_read32(d, 0x34) < size) return false;
     memset(page, 0, 4096);
-    *(volatile uint16_t *)(page + 1024) = 1;   // VIRTQ_AVAIL_F_NO_INTERRUPT: this driver polls
+    *(volatile uint16_t *)(page + 1024) = 1;   // VIRTQ_AVAIL_F_NO_INTERRUPT until the worker sleeps on the interrupt
     uint64_t physical = input_physical(page);
     input_barrier();
     input_write32(d, 0x38, size);
@@ -704,12 +717,53 @@ static void touch_still(void) {
     droidvm_input_still = droidvm_input_still + 1;
 }
 
+// A device's interrupt, in the primary interrupt context: the line is level, so the status is acknowledged here; the worker reads
+// the queue.
+static void input_interrupt(void *context) {
+    const struct droidvm_input *d = context;
+    uint32_t status = input_read32(d, 0x60) & 3;
+    if (status) input_write32(d, 0x64, status);
+    __atomic_fetch_add(&droidvm_input_irq_counts[0], 1, __ATOMIC_RELAXED);
+    thread_wakeup_prim((event_t)&droidvm_input_irq_counts, FALSE, THREAD_AWAKENED);
+}
+
+// The event queues' VIRTQ_AVAIL_F_NO_INTERRUPT: off while the worker sleeps on the interrupts, on while it polls.
+static void input_interrupts_on(bool on) {
+    for (unsigned k = 0; k < droidvm_input_count; ++k)
+        *(volatile uint16_t *)(DROIDVM_INPUT_QUEUE(droidvm_inputs[k].index, 0) + 1024) = on ? 0 : 1;
+    input_barrier();
+}
+
 static void droidvm_input_worker(void *parameter, wait_result_t result) {
     (void)parameter; (void)result;
+    bool interrupts = droidvm_input_count > 0, guarded = false, on = false;
+    for (unsigned k = 0; k < droidvm_input_count; ++k) interrupts = interrupts && droidvm_inputs[k].interrupt;
     for (;;) {
+        // Before the look: a frame the device returned before the flag changed raised no interrupt, and the look takes it.
+        const bool want = interrupts && droidvm_input_irq;
+        if (want != on) input_interrupts_on(on = want);
+        // The interrupt count before the look: one taken during it, or after it but before the sleep is armed, makes the sleep
+        // end at once.
+        const uint64_t seen = __atomic_load_n(&droidvm_input_irq_counts[0], __ATOMIC_RELAXED), frames = droidvm_input_frames;
         for (unsigned k = 0; k < droidvm_input_count; ++k) input_poll(&droidvm_inputs[k]);
+        if (guarded && droidvm_input_frames != frames) droidvm_input_irq_counts[3] = droidvm_input_irq_counts[3] + 1;
         touch_still();
-        IOSleep(DROIDVM_INPUT_POLL_MS);
+        if (!on) {
+            guarded = false;
+            IOSleep(DROIDVM_INPUT_POLL_MS);
+            continue;
+        }
+        uint64_t deadline;
+        clock_interval_to_deadline(droidvm_order_count ? DROIDVM_INPUT_POLL_MS : DROIDVM_INPUT_GUARD_MS, NSEC_PER_MSEC, &deadline);
+        assert_wait_deadline((event_t)&droidvm_input_irq_counts, THREAD_UNINT, deadline);
+        droidvm_input_irq_counts[1] = droidvm_input_irq_counts[1] + 1;
+        guarded = false;
+        if (__atomic_load_n(&droidvm_input_irq_counts[0], __ATOMIC_RELAXED) != seen) {
+            clear_wait(current_thread(), THREAD_AWAKENED);
+        } else if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
+            droidvm_input_irq_counts[2] = droidvm_input_irq_counts[2] + 1;
+            guarded = !droidvm_order_count;
+        }
     }
 }
 
@@ -778,6 +832,15 @@ void droidvm_input_start(void) {
             droidvm_motion_found = true;
         }
         if (d->kind == KIND_PEN) droidvm_pen_found = true;
+        // The window's interrupt (DarwinBoot copies it from the FDT); without one the worker keeps polling.
+        if (SecureDTGetProperty(node, "droidvm,intid", &value, &size) == kSuccess && size == sizeof(uint32_t)) {
+            uint32_t intid;
+            memcpy(&intid, value, sizeof(intid));
+            if (armcpu_spi_attach(intid, false, input_interrupt, d, NULL, NULL) == 0) {
+                d->interrupt = true;
+                droidvm_input_irq_counts[4] = droidvm_input_irq_counts[4] + 1;
+            }
+        }
         droidvm_input_count++;
     }
     droidvm_input_started = droidvm_input_count;
