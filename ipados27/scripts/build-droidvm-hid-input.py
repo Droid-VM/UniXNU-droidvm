@@ -136,8 +136,12 @@ def stage_hid(original):
     # (IOHIDDigitizerEventData of IOHIDFamily-2238, as HID.framework's +polarDigitizerEvent: lays it out: 0xa0 bytes, orientationType
     # at 0x58, 0 tilt and 1 polar; IOHIDEvent::_data at +16) and the angles through IOHIDEvent::setFixedValue (slot 26, after
     # getFixedValue's 25; its discriminator that of _ZN10IOHIDEvent13setFixedValueEjij, as the others' are their methods').
-    # Pressure and Z it sets 0..1 from the report as well: backboardd gives UIKit the device's AccurateMaxDigitizerPressureValue as
-    # the maximum force (-[BKDirectTouchState handlePathCollectionEvent:]) and its MaxHoverHeight as the maximum Z, both 1 here.
+    # Pressure and Z it sets from the report as well. backboardd gives UIKit the device's AccurateMaxDigitizerPressureValue as the
+    # maximum force (-[BKDirectTouchState handlePathCollectionEvent:]) and its MaxHoverHeight as the maximum Z (1, Z runs 0..1).
+    # A pencil's UITouch force is the event's pressure as it is over 120 (-[UITouch _unclampedForce]: _pressure / (120 *
+    # _AXSForceTouchSensitivity(), 1.0 by default)), maximumPossibleForce the maximum over the same, and PencilKit widens its ink by
+    # that force itself (InputPoint.inputPointForTouch), not by its share of the maximum: so the pressure runs 0..500 under a
+    # maximum of 500, an Apple Pencil's 4.17 (0..1 under 1 gave every stroke a force below 0.01, the thinnest line).
     pen_orient = (
         '// DroidVM (build-droidvm-hid-input.py): the pen\'s stylus events get the polar angles of its last report (see stage_hid).\n'
         '#if __has_feature(ptrauth_calls)\n'
@@ -171,8 +175,9 @@ def stage_hid(original):
            '        if(!self->hasEventDriverCached())return kIOReturnNotReady;\n'
            '        const int32_t *p=static_cast<const int32_t *>(values);\n'
            '        edge::penAltitude=p[7];edge::penAzimuth=p[8];\n'
-           '        // 0..1 in IOFixed: the pressure of 4095, the distance of 255 (above the panel while not touching)\n'
-           '        edge::penPressure=(int32_t)(((int64_t)p[3]<<16)/4095);edge::penZ=(int32_t)(((int64_t)p[4]<<16)/255);\n'
+           '        // in IOFixed: the pressure of 4095 as 0..500 (the device\'s AccurateMaxDigitizerPressureValue), the distance of 255\n'
+           '        // (above the panel while not touching) as 0..1\n'
+           '        edge::penPressure=(int32_t)(((int64_t)p[3]*500<<16)/4095);edge::penZ=(int32_t)(((int64_t)p[4]<<16)/255);\n'
            '        const unsigned flags=(unsigned)p[0],x=(unsigned)p[1],y=(unsigned)p[2],pressure=(unsigned)p[3];\n'
            '        // bit 0 Tip Switch, 1 Barrel Switch, 2 In Range, 3 Eraser, as the descriptor lists them\n'
            '        const unsigned char bits=(unsigned char)(((flags&2)?1:0)|((flags&4)?2:0)|((flags&1)?4:0)|((flags&8)?8:0));\n'
@@ -245,7 +250,7 @@ def stage_hid(original):
              '        touchEnabled=PE_parse_boot_argn("sheng-touch-hid",&touch,sizeof(touch)) && touch==1 && !penOnly;\n'
              '        if(penOnly) {\n'
              '            setProperty("Built-In",true);setProperty("DisplayIntegrated",true);setProperty("DigitizerCollectionDispatch",true);\n'
-             '            setProperty("MaxHoverHeight",1ULL,32);setProperty("AccurateMaxDigitizerPressureValue",1ULL,32);\n'
+             '            setProperty("MaxHoverHeight",1ULL,32);setProperty("AccurateMaxDigitizerPressureValue",500ULL,32);\n'
              '        }\n'),
             ('        if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(&NativeHidInput::buttonsNotify,this);\n',
              '        if(penOnly)native_pen_set_sink(&NativeHidInput::penNotify,this);\n'
