@@ -156,6 +156,7 @@ void selftest3D() {
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMultiMemoryDescriptor.h>
 extern "C" void proc_selfname(char *, int);
+extern "C" int proc_selfpid(void);
 extern "C" {
 // clients now, contexts made, blobs made, maps made, submissions, fenced submissions, fence waits that timed out, refusals
 volatile uint64_t droidvm_virtgpu_stats[8];
@@ -205,6 +206,13 @@ volatile uint64_t droidvm_surface_stats[8], droidvm_surface_traps[16], droidvm_s
 // The lock trap's index (IOSurface.framework's IOSurfaceClientLock: trap 2, unlock 3) and how long a lock waits at most.
 volatile uint32_t droidvm_surface_lock_trap = 2;
 volatile uint32_t droidvm_surface_wait_ms = 500;
+// The render server's reads of other processes' surfaces (surfaceAccess's wait): how long one waits at most for the work writing
+// them, and the commands that waited, of those the ones that gave up, the time they waited (us) and the longest wait.
+volatile uint32_t droidvm_surface_read_wait_ms = 100;
+volatile uint64_t droidvm_surface_read_waits[4];
+// The process whose display holds the display's swaps wait for (the render server; 0 before its first hold): a swap waits for
+// that process's GPU work only (droidvm_virtgpu_finished_by).
+volatile int droidvm_virtgpu_compositor_pid;
 // XNU's iokit_user_client_trap calls it before each trap (droidvm-surface-gpu-wait.patch); this weak definition keeps a kernel
 // without the patch linking.
 __attribute__((weak)) void (*volatile droidvm_user_client_trap_hook)(IOUserClient *, uint32_t, uintptr_t, uintptr_t);
@@ -244,6 +252,7 @@ struct Client {
     IOLock *lock;
     IOLock *fenceLock;                 // pending, pendingCount, nextFence and completed (see above)
     char name[16];                     // the process that made the connection
+    int pid;                           // and its pid
     uint32_t blobKib, blobPagesUs;     // the last blob made: its size, and how long its guest pages took (slow-op records)
     uint32_t context, rings, nextHandle, resourceCount, resourceCapacity, pendingCount, closedCount, closedCapacity;
     Resource *resources;
@@ -284,6 +293,7 @@ Client *client(void *connection, bool create) {
         if (found) {
             found->connection = connection; found->lock = IOLockAlloc(); found->fenceLock = IOLockAlloc(); found->nextHandle = 1;
             proc_selfname(found->name, sizeof found->name);
+            found->pid = proc_selfpid();
             if (!found->lock || !found->fenceLock) {
                 if (found->lock) IOLockFree(found->lock);
                 if (found->fenceLock) IOLockFree(found->fenceLock);
@@ -830,6 +840,7 @@ IOReturn hold(Client *c, uint64_t ticket, uint64_t &answer) {
         } else {
             answer = c->holds[c->holdCount++] = __atomic_add_fetch(&gHoldsTaken, 1, __ATOMIC_ACQ_REL);
             droidvm_virtgpu_holds_stats[0] = droidvm_virtgpu_holds_stats[0] + 1;
+            droidvm_virtgpu_compositor_pid = c->pid;
         }
     } else {
         uint32_t i = 0;
@@ -925,8 +936,52 @@ void surfaceTrap(IOUserClient *client, uint32_t index, uintptr_t surface, uintpt
     droidvm_surface_lock_options[options & 3] = droidvm_surface_lock_options[options & 3] + 1;
     if (!(options & 2)) waitSurface(uint32_t(surface), !(options & 1));
 }
+// gSurfaceLock held: whether another process's GPU work begun before `ticket` writes a surface that the client's `ticket` only reads.
+bool othersWriting(Client *c, uint64_t ticket) {
+    for (uint32_t i = 0; i < gSurfaceUseCount; ++i) {
+        const SurfaceUse &mine = gSurfaceUses[i];
+        if (mine.client != c || mine.ticket != ticket || mine.write) continue;
+        for (uint32_t j = 0; j < gSurfaceUseCount; ++j) {
+            const SurfaceUse &other = gSurfaceUses[j];
+            if (other.surface == mine.surface && other.write && other.ticket < ticket && other.client->pid != c->pid) return true;
+        }
+    }
+    return false;
+}
+// The render server's command buffer `ticket` is about to be submitted: it waits for the GPU work of other processes, begun before
+// it, that writes a surface it reads, for droidvm_surface_read_wait_ms at most. The guest's GPU contexts run on the host's KGSL
+// rings, which do not order one context's work after another's: with the render server on a higher-priority ring than the apps
+// (DRM2KGSL_PRIORITIES), its composition ran before an app's drawing queued earlier and showed the surface half drawn, where
+// Apple's GPU orders a read of an IOSurface after the writes queued before it. Its own writes it orders itself, in its queue.
+void awaitWriters(Client *c, uint64_t ticket) {
+    IOLock *lock = gSurfaceLock;
+    uint64_t began = 0, deadline = 0;
+    IOLockLock(lock);
+    while (othersWriting(c, ticket)) {
+        if (!deadline) {
+            began = nowUsLocal();
+            clock_interval_to_deadline(droidvm_surface_read_wait_ms, kMillisecondScale, &deadline);
+            droidvm_surface_read_waits[0] = droidvm_surface_read_waits[0] + 1;
+        }
+        ++gSurfaceWaiters;
+        const int woke = IOLockSleepDeadline(lock, &gSurfaceUses, deadline, THREAD_UNINT);
+        --gSurfaceWaiters;
+        if (woke == THREAD_TIMED_OUT) { droidvm_surface_read_waits[1] = droidvm_surface_read_waits[1] + 1; break; }
+    }
+    IOLockUnlock(lock);
+    if (began) {
+        const uint64_t waited = nowUsLocal() - began;
+        droidvm_surface_read_waits[2] = droidvm_surface_read_waits[2] + waited;
+        if (waited > droidvm_surface_read_waits[3]) droidvm_surface_read_waits[3] = waited;
+    }
+}
+// What a caller asks of surfaceAccess in the pad word: wait for the writers of its ticket's read surfaces (awaitWriters), or
+// whether this kernel does (the answer is SurfaceWaitAnswer; an older one began a ticket of no surfaces, which the caller ends).
+enum : uint32_t { SurfaceAwaitWriters = 1, SurfaceAskAwait = 2 };
+constexpr uint64_t SurfaceWaitAnswer = 0x5265616457616974ULL;   // "ReadWait"
 // OpSurfaceAccess. In: {ticket, count, pad} then count records {IOSurface ID, written}; out: the ticket. Ticket 0 begins one with
-// these surfaces; a ticket of the caller's adds them to it; a ticket with no surfaces ends it.
+// these surfaces; a ticket of the caller's adds them to it; a ticket with no surfaces ends it. pad SurfaceAwaitWriters with a
+// ticket and no surfaces waits for the writers of its read surfaces instead; pad SurfaceAskAwait answers SurfaceWaitAnswer.
 IOReturn surfaceAccess(Client *c, const void *in, size_t inSize, uint64_t &answer) {
     struct Head { uint64_t ticket; uint32_t count, pad; };
     struct Record { uint32_t surface, written; };
@@ -937,6 +992,13 @@ IOReturn surfaceAccess(Client *c, const void *in, size_t inSize, uint64_t &answe
     IOLock *lock = surfaceLock();
     if (!lock) return kIOReturnNoMemory;
     if (!droidvm_user_client_trap_hook) droidvm_user_client_trap_hook = &surfaceTrap;   // locks wait once there is work to wait for
+    if (head.pad == SurfaceAskAwait && !head.ticket && !head.count) { answer = SurfaceWaitAnswer; return kIOReturnSuccess; }
+    if (head.pad == SurfaceAwaitWriters) {
+        if (!head.ticket || head.count) return kIOReturnBadArgument;
+        awaitWriters(c, head.ticket);
+        answer = head.ticket;
+        return kIOReturnSuccess;
+    }
     IOLockLock(lock);
     IOReturn status = kIOReturnSuccess;
     if (head.ticket && !head.count) {
@@ -1084,14 +1146,23 @@ extern "C" uint64_t droidvm_virtgpu_submitted(void) {
 // A client's fenced submissions are looked at under its fence lock, which nothing holds across a wait; the client may be in one
 // of its methods meanwhile. (droidvm_virtgpu_finished_trylock = 1: the old rule, which took a client in a method, holding its
 // lock, for one whose work was not done -- and showed nothing while a method ran long without the device.)
+extern "C" bool droidvm_virtgpu_finished_by(uint64_t order, int pid);
 extern "C" bool droidvm_virtgpu_finished(uint64_t order) {
+    return droidvm_virtgpu_finished_by(order, 0);
+}
+// The process whose display holds the swaps wait for (0 before its first): the render server, which draws what they show.
+extern "C" int droidvm_virtgpu_compositor(void) {
+    return droidvm_virtgpu_compositor_pid;
+}
+// droidvm_virtgpu_finished for one process's fenced submissions (pid 0: every client's).
+extern "C" bool droidvm_virtgpu_finished_by(uint64_t order, int pid) {
     using namespace DroidVMVirtioGpu;
     if (!order || !gClientsLock) return true;
     bool finished = true;
     IOLockLock(gClientsLock);
     for (uint32_t i = 0; i < MaxClients && finished; ++i) {
         Client *c = gClients[i];
-        if (!c) continue;
+        if (!c || (pid && c->pid != pid)) continue;
         if (droidvm_virtgpu_finished_trylock) {
             if (!IOLockTryLock(c->lock)) { finished = false; droidvm_virtgpu_finished_blocked = droidvm_virtgpu_finished_blocked + 1; break; }
             IOLockUnlock(c->lock);

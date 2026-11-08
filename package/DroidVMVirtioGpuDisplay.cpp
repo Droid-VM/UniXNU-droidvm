@@ -12,6 +12,8 @@ extern "C" void native_legacy_gpu_complete(void *, int);
 extern "C" void native_legacy_frame_observed(unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" uint64_t droidvm_virtgpu_submitted(void);
 extern "C" bool droidvm_virtgpu_finished(uint64_t);
+extern "C" bool droidvm_virtgpu_finished_by(uint64_t, int);
+extern "C" int droidvm_virtgpu_compositor(void);
 extern "C" uint64_t droidvm_virtgpu_holds(void);
 extern "C" bool droidvm_virtgpu_held(uint64_t, uint64_t *);
 extern "C" {
@@ -20,6 +22,12 @@ volatile uint64_t droidvm_virtio_display_frames, droidvm_virtio_display_boot_fra
 // Every swap waits for the GPU work submitted before it, including the first swap after reboot.
 // Setting this to 0 is an unsafe diagnostic A/B override, never the normal display path.
 volatile uint32_t droidvm_virtio_present_wait = 1;
+// 1: that work is the render server's (the process whose display holds the swaps wait for, droidvm_virtgpu_compositor), which
+// alone draws the surface a swap shows; 0: every process's, as before (an A/B switch, written in guest memory). With every
+// process's, a WebGPU page that kept the GPU busy held each swap for the page's whole queue: webgpu-samples' deferredRendering
+// showed a frame each 1.7-1.9 s while it drew 13-28 a second (shown 0.5 fps; 15.4 with the swaps not waiting at all). What the
+// render server reads of other processes' surfaces it waits for before it submits (the kernel's surface tickets, awaitWriters).
+volatile uint32_t droidvm_virtio_present_scope = 1;
 volatile uint64_t droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us;
 // Swaps shown although the GPU work before them had not finished in 2 s (a torn frame rather than a stopped display).
 volatile uint64_t droidvm_virtio_present_late;
@@ -67,8 +75,9 @@ struct Resource {
 };
 // work: the virtio GPU's fenced submissions made before the swap (droidvm_virtgpu_submitted). The frame is drawn once they have
 // finished. holds: the display holds taken before the swap (droidvm_virtgpu_holds): commits whose work was not submitted yet, which
-// the frame waits for, its work then the larger of the two.
-struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height; uint64_t work, holds; };
+// the frame waits for, its work then the larger of the two. pid: whose submissions up to work it waits for, the render server's
+// (droidvm_virtio_present_scope; 0: every process's).
+struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height; uint64_t work, holds; int pid; };
 // The compositor's surfaces: more than it keeps in flight, since during an animation it presents from a larger set than at rest
 // (8 entries were recreated on almost every frame of a page drag).
 Resource resources[32], boot;
@@ -337,7 +346,7 @@ void worker(void *, wait_result_t) {
             if (!held) droidvm_virtio_display_hold_late = droidvm_virtio_display_hold_late + 1;
             else if (order > frame.work) frame.work = order;
             droidvm_virtio_display_hold_wait_us = droidvm_virtio_display_hold_wait_us + (nowUs() - begin);
-            bool drawn = droidvm_virtgpu_finished(frame.work);
+            bool drawn = droidvm_virtgpu_finished_by(frame.work, frame.pid);
             const bool busy = !drawn;
             while (mode && !drawn && nowUs() - begin < 2000000) {
                 // GPU work: wait for the device to return a command (the transport's one watch, which sleeps on the interrupt),
@@ -346,7 +355,7 @@ void worker(void *, wait_result_t) {
                 // done 14-16 ms of a 17-19 ms frame).
                 if (!landEarly()) return;
                 const uint64_t seen = DroidVMVirtioGpu::returns();
-                drawn = droidvm_virtgpu_finished(frame.work);
+                drawn = droidvm_virtgpu_finished_by(frame.work, frame.pid);
                 if (!drawn) DroidVMVirtioGpu::awaitReturn(seen, nowUs() + 1000);
             }
             if (!drawn) droidvm_virtio_present_late = droidvm_virtio_present_late + 1;
@@ -459,7 +468,9 @@ extern "C" bool droidvm_virtio_gpu_offer(void *display, IOMemoryDescriptor *memo
     if (!accepted) droidvm_virtio_offer_refused = droidvm_virtio_offer_refused + 1;
     if (accepted) {
         auto service = static_cast<IOService *>(display);
-        memory->retain(); service->retain(); pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted(), droidvm_virtgpu_holds()};
+        const int pid = droidvm_virtio_present_scope ? droidvm_virtgpu_compositor() : 0;
+        memory->retain(); service->retain();
+        pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted(), droidvm_virtgpu_holds(), pid};
         compositor = true;
         IOLockWakeup(frameLock, &pending, true);
     }
