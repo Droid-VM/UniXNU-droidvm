@@ -17,12 +17,17 @@ extern "C" IOService *droidvm_motion_hid_allocate(unsigned kind);
 extern "C" bool droidvm_motion_present(void);
 extern "C" IOService *native_hid_pen_allocate(void);
 extern "C" bool droidvm_pen_present(void);
+// The trackpad's Magic Trackpad (DroidVMTrackpadHid.inc, in the iPadOS 27 board's staged NativeHidInput.cpp only).
+extern "C" IOService *droidvm_trackpad_hid_allocate(void) __attribute__((weak_import));
+extern "C" bool droidvm_trackpad_present(void);
 extern "C" int droidvm_sensor_processor_register(void);
 extern "C" {
 extern kern_return_t OSKextLoadKextWithIdentifier(const char *);
 volatile uint32_t native_hid_stage,native_hid_resource_found;
 volatile int native_hid_load_status=-1;
 volatile int native_hid_matching_load_status=-1;
+// The Magic Trackpad's kexts loaded with their personalities: AppleTopCaseHIDEventDriver, AppleTopCaseDriverV2.
+volatile int native_hid_trackpad_load_status[2]={-1,-1};
 volatile uint32_t native_hid_class_sizes[5];
 volatile int native_hid_input_meta_status=-1;
 volatile uint64_t native_hid_input_object;
@@ -213,6 +218,18 @@ void native_hid_input_probe(void) {
                         IOService *pen=native_hid_pen_allocate();
                         bool penStarted=pen && pen->metaCast("IOHIDDevice") && pen->init() && pen->attach(resource) && pen->start(resource);
                         if(!penStarted && pen){pen->detach(resource);OSSafeReleaseNULL(pen);}
+                    }
+                    // DroidVM: the trackpad as a Magic Trackpad 2 (DroidVMTrackpadHid.inc), when the VM has one (DroidVMVirtioInput.c).
+                    // Its event driver is AppleTopCaseHIDEventDriver's, matched by AppleTopCaseDriverV2's personalities (the board's
+                    // prelink roots): both loaded with their personalities first, as IOHIDEventDriver above.
+                    if(started && &droidvm_trackpad_hid_allocate && droidvm_trackpad_present()) {
+                        native_hid_trackpad_load_status[0]=OSKext::loadKextWithIdentifier("com.apple.driver.AppleTopCaseHIDEventDriver",
+                            true,false,kOSKextExcludeNone,kOSKextExcludeNone,nullptr);
+                        native_hid_trackpad_load_status[1]=OSKext::loadKextWithIdentifier("com.apple.driver.AppleTopCaseDriverV2",
+                            true,false,kOSKextExcludeNone,kOSKextExcludeNone,nullptr);
+                        IOService *trackpad=droidvm_trackpad_hid_allocate();
+                        bool trackpadStarted=trackpad && trackpad->metaCast("IOHIDDevice") && trackpad->init() && trackpad->attach(resource) && trackpad->start(resource);
+                        if(!trackpadStarted && trackpad){trackpad->detach(resource);OSSafeReleaseNULL(trackpad);}
                     }
                     // DroidVM: the accelerometer, the gyroscope and the device orientation, as the services locationd and
                     // backboardd look for (DroidVMMotionHid.inc), when the VM has motion sensors (DroidVMVirtioInput.c).

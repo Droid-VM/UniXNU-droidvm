@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""The touch screen, keyboard and motion sensors of the iPadOS 27 board: NativeHidInput under the original IOHIDDevice of the 24A446
-fileset, and the virtio-input transport that feeds it, for the display archive (build-droidvm-legacy-display.py).
+"""The touch screen, keyboard, pen, trackpad and motion sensors of the iPadOS 27 board: NativeHidInput under the original IOHIDDevice
+of the 24A446 fileset, and the virtio-input transport that feeds it, for the display archive (build-droidvm-legacy-display.py).
 
 As the iPadOS 17 board builds them (scripts/build-native-legacy-display.py): ShengHidInput's NativeHidInput.cpp with the board's
-keyboard sink and its motion sensors (kits/droidvm/DroidVMMotionHid.inc) in a staged copy, the board probe
+keyboard sink and its motion sensors (kits/droidvm/DroidVMMotionHid.inc) in a staged copy, with the pen digitizer and the
+trackpad's Magic Trackpad (kits/droidvm/DroidVMTrackpadHid.inc) of this board, the board probe
 (kits/droidvm/HidInputProbe.cpp), the virtio-input transport (DroidVMVirtioInput.c) and the motion sysctl (DroidVMMotion.c). The
 HID source is UniXNU-sheng's for iPadOS 27 (ShengHidInput 24f1f3f: 5f3a37c, the iPadOS 17 board's, and its arm64e edge-contact
 work), compiled against the public IOHIDFamily headers of the OS profile's pin (refer/IOHIDFamily; NATIVE_HID_SOURCE_API), so every
@@ -285,6 +286,7 @@ def stage_hid(original):
              'extern "C" IOService *native_hid_pen_allocate(void) {NativeHidInput *device=new NativeHidInput;'
              'if(device)device->setPenOnly();return device;}\n')
     text += '\n' + (ROOT / 'kits/droidvm/DroidVMMotionHid.inc').read_text()
+    text += '\n' + (ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc').read_text()
     # the same file name: the late static initializer is named after it (__GLOBAL__sub_I_NativeHidInput.cpp)
     staged = OUT / 'droidvm/NativeHidInput.cpp'
     staged.parent.mkdir(exist_ok=True)
@@ -388,7 +390,8 @@ def main():
     for i, (_, d) in enumerate(slots):
         by_diversity.setdefault(d, []).append(i)
     vtables = [n for n, _, k in found if n.startswith('__ZTV') and k != 1 and '9MetaClassE' not in n]
-    require(set(vtables) == {'__ZTV14NativeHidInput', '__ZTV17AppleSPUHIDDevice'}, f'The owned HID classes: {vtables}')
+    require(set(vtables) == {'__ZTV14NativeHidInput', '__ZTV17AppleSPUHIDDevice', '__ZTV24DroidVMTrackpadHIDDevice'},
+            f'The owned HID classes: {vtables}')
     # An original method in an owned vtable is bound to the original entry of that slot (a base-class override signs with the
     # discriminator of the introducing IOService declaration, so its own name does not identify the slot); any other import by
     # the slot whose discriminator its name has.
@@ -441,7 +444,8 @@ def main():
 
     objects = [late, OUT / 'hid-bindings.o', OUT / 'hid-addresses.o', OUT / 'HidInputProbe.o', OUT / 'DroidVMVirtioInput.o',
                OUT / 'DroidVMMotion.o']
-    sources = [original, ROOT / 'kits/droidvm/DroidVMMotionHid.inc', probe, transport, motion, HERE / 'hid-device-24A446.json']
+    sources = [original, ROOT / 'kits/droidvm/DroidVMMotionHid.inc', ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc', probe, transport,
+               motion, HERE / 'hid-device-24A446.json']
     (OUT / 'objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in objects], indent=2) + '\n')
     (OUT / 'sources.json').write_text(json.dumps([str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p) for p in sources],
                                                  indent=2) + '\n')

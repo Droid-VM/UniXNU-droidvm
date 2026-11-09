@@ -12,6 +12,10 @@
 // ABS_PRESSURE, ABS_DISTANCE, ABS_TILT_X/Y and the barrel buttons. Each of its frames goes to NativeHidInput's pen sink (the
 // digitizer's Stylus collection, report 4), with the tilt also as the polar angles iPadOS reads an Apple Pencil's by.
 //
+// A trackpad (crosvm's trackpad with contacts=N, or any evdev multi-touch pad: INPUT_PROP_POINTER, multi-touch positions and their
+// resolution) is read too: each of its frames, every contact down and every one lifted since the last, goes to the trackpad sink,
+// in hundredths of a millimetre on its surface, where DroidVMTrackpadHid.inc publishes it as a Magic Trackpad's report.
+//
 // Motion sensors (crosvm --input motion, or any evdev accelerometer: INPUT_PROP_ACCELEROMETER with ABS_X/Y/Z, the gravity vector
 // in the panel's frame, Y up the panel) are read too. Their latest values, and the device orientation they say, are published in
 // droidvm_motion for DroidVMMotion.c's sysctl, where the owner tool that tells backboardd the device orientation reads them.
@@ -66,11 +70,12 @@ extern int armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *),
 
 enum { EV_SYN = 0, EV_KEY = 1, EV_ABS = 3 };
 enum { SYN_REPORT = 0, ABS_X = 0, ABS_Y = 1, ABS_Z = 2, ABS_RZ = 5, ABS_PRESSURE = 0x18, ABS_DISTANCE = 0x19, ABS_TILT_X = 0x1a,
-       ABS_TILT_Y = 0x1b, ABS_MT_SLOT = 0x2f, ABS_MT_POSITION_X = 0x35, ABS_MT_POSITION_Y = 0x36, ABS_MT_TRACKING_ID = 0x39,
+       ABS_TILT_Y = 0x1b, ABS_MT_SLOT = 0x2f, ABS_MT_TOUCH_MAJOR = 0x30, ABS_MT_TOUCH_MINOR = 0x31, ABS_MT_POSITION_X = 0x35,
+       ABS_MT_POSITION_Y = 0x36, ABS_MT_TOOL_TYPE = 0x37, ABS_MT_TRACKING_ID = 0x39, MT_TOOL_PALM = 2,
        BTN_LEFT = 0x110, BTN_TOOL_PEN = 0x140, BTN_TOOL_RUBBER = 0x141, BTN_TOUCH = 0x14a, BTN_STYLUS = 0x14b, BTN_STYLUS2 = 0x14c,
-       INPUT_PROP_DIRECT = 1, INPUT_PROP_ACCELEROMETER = 6, KEY_ENTER = 28, KEY_A = 30 };
+       INPUT_PROP_POINTER = 0, INPUT_PROP_DIRECT = 1, INPUT_PROP_ACCELEROMETER = 6, KEY_ENTER = 28, KEY_A = 30 };
 enum { CFG_ID_NAME = 1, CFG_PROP_BITS = 0x10, CFG_EV_BITS = 0x11, CFG_ABS_INFO = 0x12 };
-enum { KIND_NONE, KIND_TOUCH, KIND_POINTER, KIND_KEYBOARD, KIND_MOTION, KIND_PEN };
+enum { KIND_NONE, KIND_TOUCH, KIND_POINTER, KIND_KEYBOARD, KIND_MOTION, KIND_PEN, KIND_TRACKPAD };
 // The pen's axes past ABS_X/Y, in its state and axis arrays.
 enum { PEN_PRESSURE, PEN_DISTANCE, PEN_TILT_X, PEN_TILT_Y, PEN_AXES };
 // What the pen sink gets (NativeHidInput's report 4 and its dispatch wrapper): flags (1 in range, 2 the tip touches, 4 the barrel
@@ -79,6 +84,10 @@ enum { PEN_PRESSURE, PEN_DISTANCE, PEN_TILT_X, PEN_TILT_Y, PEN_AXES };
 // towards -y of the panel's y-down frame) in IOFixed radians.
 enum { PEN_OUT_FLAGS, PEN_OUT_X, PEN_OUT_Y, PEN_OUT_PRESSURE, PEN_OUT_DISTANCE, PEN_OUT_TILT_X, PEN_OUT_TILT_Y, PEN_OUT_ALTITUDE,
        PEN_OUT_AZIMUTH, PEN_OUT_VALUES };
+// What the trackpad sink gets for each contact of a frame (DroidVMTrackpadHid.inc declares it as well): its tracking id, its
+// position in hundredths of a millimetre from the surface's top left corner, whether it still touches (0: lifted since the last
+// frame, where it was), whether the device calls it a palm, and its contact size, 0..255 of the device's range (0 when it has none).
+struct droidvm_trackpad_contact { int32_t id, x, y; uint8_t down, palm, major, minor; };
 // UIDeviceOrientation, as backboardd takes it: 0 not known (lying flat, or between two), 1 portrait, 2 upside down, 3 landscape
 // left (the Home side on the right: the panel's left edge down), 4 landscape right (its right edge down).
 enum { ORIENTATION_UNKNOWN, ORIENTATION_PORTRAIT, ORIENTATION_UPSIDE_DOWN, ORIENTATION_LANDSCAPE_LEFT,
@@ -122,7 +131,7 @@ struct droidvm_input {
     uint16_t size, used;
     int32_t min_x, span_x, min_y, span_y;
     unsigned slot;
-    struct { int32_t id, x, y; } slots[DROIDVM_INPUT_SLOTS];   // id -1: no finger
+    struct { int32_t id, x, y, major, minor, tool; } slots[DROIDVM_INPUT_SLOTS];   // id -1: no finger
     int32_t pointer_x, pointer_y;
     bool pointer_down;
     uint8_t key_modifiers, keys[6];   // a keyboard's boot report state: modifier bits and up to six usages held
@@ -133,16 +142,21 @@ struct droidvm_input {
     bool pen_tip, pen_eraser, pen_touch, pen_barrel, pen_was_in_range;
     int32_t pen_x, pen_y, pen[PEN_AXES], pen_min[PEN_AXES], pen_span[PEN_AXES], pen_tilt_res;
     bool interrupt;                    // its SPI (the ADT's droidvm,intid) wakes the worker
+    // A trackpad: its resolution (units per millimetre), its contact size's range (span 0: it has none) and the contacts it sent
+    // last, so that the next frame reports the ones gone from it as lifted.
+    int32_t res_x, res_y, major_min, major_span;
+    struct droidvm_trackpad_contact trackpad_last[DROIDVM_INPUT_SLOTS];
+    unsigned trackpad_last_count;
 };
 static struct droidvm_input droidvm_inputs[DROIDVM_INPUT_DEVICES];
 static unsigned droidvm_input_count;
 
-// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 4 motion, 5 pen, 0 left alone), events
-// and frames seen, keyboard and pen reports sent.
+// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 4 motion, 5 pen, 6 trackpad, 0 left
+// alone), events and frames seen, keyboard, pen and trackpad reports sent.
 volatile uint32_t droidvm_input_found, droidvm_input_started, droidvm_input_kinds[DROIDVM_INPUT_DEVICES];
 volatile uint64_t droidvm_input_events, droidvm_input_frames, droidvm_input_published, droidvm_input_key_reports,
     droidvm_input_still,   // publications of a held finger set (touch_still)
-    droidvm_input_pen_reports;
+    droidvm_input_pen_reports, droidvm_input_trackpad_reports;
 // The devices' interrupts: [0] taken (each wakes the worker), [1] the worker's sleeps, [2] of those ended by their guard or the
 // held-finger step, [3] guard ends whose look found a frame (an interrupt that never came), [4] devices attached. The worker
 // polled every 4 ms before: 250 wakes a second of a vCPU with nothing to read on a still screen. droidvm_input_irq 0: poll so
@@ -203,6 +217,20 @@ static bool input_axis(const struct droidvm_input *d, uint8_t axis, int32_t *min
     int32_t lo, hi;
     memcpy(&lo, info, 4);
     memcpy(&hi, info + 4, 4);
+    if (hi <= lo) return false;
+    *min = lo;
+    *span = hi - lo + 1;
+    return true;
+}
+
+// A multi-touch position axis with its resolution (units per millimetre; 0 when the device states none).
+static bool input_axis_res(const struct droidvm_input *d, uint8_t axis, int32_t *min, int32_t *span, int32_t *res) {
+    uint8_t info[20] = {0};
+    if (input_config(d, CFG_ABS_INFO, axis, info, sizeof(info)) < 8) return false;
+    int32_t lo, hi;
+    memcpy(&lo, info, 4);
+    memcpy(&hi, info + 4, 4);
+    memcpy(res, info + 16, 4);
     if (hi <= lo) return false;
     *min = lo;
     *span = hi - lo + 1;
@@ -295,6 +323,15 @@ static unsigned input_identify(struct droidvm_input *d) {
         input_bit(props, nprops, INPUT_PROP_DIRECT) &&
         input_axis(d, ABS_MT_POSITION_X, &d->min_x, &d->span_x) && input_axis(d, ABS_MT_POSITION_Y, &d->min_y, &d->span_y))
         return KIND_TOUCH;
+    // A trackpad: multi-touch positions on a surface that is not the screen.
+    if (input_bit(abs, nabs, ABS_MT_POSITION_X) && input_bit(abs, nabs, ABS_MT_POSITION_Y) &&
+        input_bit(props, nprops, INPUT_PROP_POINTER) && !input_bit(props, nprops, INPUT_PROP_DIRECT) &&
+        input_axis_res(d, ABS_MT_POSITION_X, &d->min_x, &d->span_x, &d->res_x) &&
+        input_axis_res(d, ABS_MT_POSITION_Y, &d->min_y, &d->span_y, &d->res_y)) {
+        if (!input_bit(abs, nabs, ABS_MT_TOUCH_MAJOR) || !input_axis(d, ABS_MT_TOUCH_MAJOR, &d->major_min, &d->major_span))
+            d->major_span = 0;
+        return KIND_TRACKPAD;
+    }
     // A pen before the pointer below, which it would also pass for (ABS_X/Y and BTN_TOUCH).
     if (input_bit(keys, nkeys, BTN_TOOL_PEN) && input_bit(props, nprops, INPUT_PROP_DIRECT) && input_bit(abs, nabs, ABS_X) &&
         input_bit(abs, nabs, ABS_Y) && input_axis(d, ABS_X, &d->min_x, &d->span_x) && input_axis(d, ABS_Y, &d->min_y, &d->span_y)) {
@@ -625,6 +662,52 @@ static void pen_publish(struct droidvm_input *d) {
     droidvm_input_pen_reports = droidvm_input_pen_reports + 1;
 }
 
+// The trackpad: its surface's size in hundredths of a millimetre, by its axes' resolution; a device that states none is taken as
+// 150 mm wide with square units.
+static void trackpad_extent(const struct droidvm_input *d, uint32_t *width, uint32_t *height) {
+    *width = d->res_x > 0 ? (uint32_t)((int64_t)d->span_x * 100 / d->res_x) : 15000;
+    *height = d->res_y > 0 ? (uint32_t)((int64_t)d->span_y * 100 / d->res_y) : (uint32_t)((int64_t)*width * d->span_y / d->span_x);
+}
+
+static void (*droidvm_trackpad_sink)(void *, const struct droidvm_trackpad_contact *, unsigned);
+static void *droidvm_trackpad_sink_context;
+void native_trackpad_set_sink(void (*sink)(void *, const struct droidvm_trackpad_contact *, unsigned), void *context) {
+    droidvm_trackpad_sink_context = context;
+    __atomic_store_n(&droidvm_trackpad_sink, sink, __ATOMIC_RELEASE);
+}
+
+// One trackpad frame to the sink: the contacts down, then those of the last frame gone from it, lifted where they were.
+static void trackpad_publish(struct droidvm_input *d) {
+    struct droidvm_trackpad_contact contacts[2 * DROIDVM_INPUT_SLOTS];
+    uint32_t width, height;
+    trackpad_extent(d, &width, &height);
+    unsigned n = 0;
+    for (unsigned s = 0; s < DROIDVM_INPUT_SLOTS; ++s) {
+        if (d->slots[s].id < 0) continue;
+        uint8_t major = d->major_span ? (uint8_t)input_scale(d->slots[s].major, d->major_min, d->major_span, 256) : 0;
+        uint8_t minor = d->major_span ? (uint8_t)input_scale(d->slots[s].minor, d->major_min, d->major_span, 256) : 0;
+        contacts[n++] = (struct droidvm_trackpad_contact){d->slots[s].id,
+                                                          input_scale(d->slots[s].x, d->min_x, d->span_x, (int32_t)width),
+                                                          input_scale(d->slots[s].y, d->min_y, d->span_y, (int32_t)height),
+                                                          1, d->slots[s].tool == MT_TOOL_PALM, major, minor};
+    }
+    const unsigned down = n;
+    for (unsigned i = 0; i < d->trackpad_last_count; ++i) {
+        bool kept = false;
+        for (unsigned k = 0; k < down && !kept; ++k) kept = contacts[k].id == d->trackpad_last[i].id;
+        if (kept) continue;
+        contacts[n] = d->trackpad_last[i];
+        contacts[n++].down = 0;
+    }
+    memcpy(d->trackpad_last, contacts, down * sizeof(contacts[0]));
+    d->trackpad_last_count = down;
+    void (*sink)(void *, const struct droidvm_trackpad_contact *, unsigned) =
+        __atomic_load_n(&droidvm_trackpad_sink, __ATOMIC_ACQUIRE);
+    if (!sink || !n) return;
+    sink(droidvm_trackpad_sink_context, contacts, n);
+    droidvm_input_trackpad_reports = droidvm_input_trackpad_reports + 1;
+}
+
 static bool input_event(struct droidvm_input *d, const struct droidvm_input_event *e) {
     droidvm_input_events = droidvm_input_events + 1;
     if (e->type == EV_SYN) return e->code == SYN_REPORT;
@@ -634,6 +717,22 @@ static bool input_event(struct droidvm_input *d, const struct droidvm_input_even
             if (e->code == ABS_MT_TRACKING_ID) d->slots[d->slot].id = e->value < 0 ? -1 : e->value;
             else if (e->code == ABS_MT_POSITION_X) d->slots[d->slot].x = e->value;
             else if (e->code == ABS_MT_POSITION_Y) d->slots[d->slot].y = e->value;
+        }
+    } else if (d->kind == KIND_TRACKPAD && e->type == EV_ABS) {
+        if (e->code == ABS_MT_SLOT) d->slot = e->value >= 0 && e->value < DROIDVM_INPUT_SLOTS ? (unsigned)e->value : DROIDVM_INPUT_SLOTS;
+        else if (d->slot < DROIDVM_INPUT_SLOTS) {
+            switch (e->code) {
+            case ABS_MT_TRACKING_ID:
+                d->slots[d->slot].id = e->value < 0 ? -1 : e->value;
+                if (e->value >= 0) d->slots[d->slot].tool = 0;
+                break;
+            case ABS_MT_POSITION_X: d->slots[d->slot].x = e->value; break;
+            case ABS_MT_POSITION_Y: d->slots[d->slot].y = e->value; break;
+            case ABS_MT_TOUCH_MAJOR: d->slots[d->slot].major = e->value; break;
+            case ABS_MT_TOUCH_MINOR: d->slots[d->slot].minor = e->value; break;
+            case ABS_MT_TOOL_TYPE: d->slots[d->slot].tool = e->value; break;
+            default: break;
+            }
         }
     } else if (d->kind == KIND_POINTER) {
         if (e->type == EV_ABS && e->code == ABS_X) d->pointer_x = e->value;
@@ -683,6 +782,7 @@ static void input_poll(struct droidvm_input *d) {
                 if (d->kind == KIND_KEYBOARD) keyboard_publish(d);
                 else if (d->kind == KIND_MOTION) motion_publish(d);
                 else if (d->kind == KIND_PEN) pen_publish(d);
+                else if (d->kind == KIND_TRACKPAD) trackpad_publish(d);
                 else touch_frame();
             }
             available[2 + (head + returned) % d->size] = (uint16_t)id;
@@ -768,11 +868,22 @@ static void droidvm_input_worker(void *parameter, wait_result_t result) {
 }
 
 static bool droidvm_motion_found, droidvm_pen_found;
+static const struct droidvm_input *droidvm_trackpad;
 
 // Whether the VM has a pen: HidInputProbe.cpp publishes the pen digitizer then (after droidvm_input_start, as for the motion
 // sensors).
 bool droidvm_pen_present(void) {
     return droidvm_pen_found;
+}
+
+// Whether the VM has a trackpad, and its surface's size in hundredths of a millimetre: HidInputProbe.cpp publishes a Magic Trackpad
+// for it (DroidVMTrackpadHid.inc).
+bool droidvm_trackpad_present(void) {
+    return droidvm_trackpad != NULL;
+}
+void droidvm_trackpad_surface(uint32_t *width, uint32_t *height) {
+    *width = *height = 0;
+    if (droidvm_trackpad) trackpad_extent(droidvm_trackpad, width, height);
 }
 
 // Whether the VM has motion sensors. HidInputProbe.cpp publishes the accelerometer and gyroscope HID services (DroidVMMotionHid.inc)
@@ -826,12 +937,14 @@ void droidvm_input_start(void) {
             continue;
         }
         printf("droidvm input %s: %s, %s\n", path, droidvm_input_names[d->index], d->kind == KIND_TOUCH ? "touch" :
-               d->kind == KIND_POINTER ? "pointer" : d->kind == KIND_MOTION ? "motion sensors" : d->kind == KIND_PEN ? "pen" : "keyboard");
+               d->kind == KIND_POINTER ? "pointer" : d->kind == KIND_MOTION ? "motion sensors" : d->kind == KIND_PEN ? "pen" :
+               d->kind == KIND_TRACKPAD ? "trackpad" : "keyboard");
         if (d->kind == KIND_MOTION) {
             droidvm_motion_register();
             droidvm_motion_found = true;
         }
         if (d->kind == KIND_PEN) droidvm_pen_found = true;
+        if (d->kind == KIND_TRACKPAD && !droidvm_trackpad) droidvm_trackpad = d;
         // The window's interrupt (DarwinBoot copies it from the FDT); without one the worker keeps polling.
         if (SecureDTGetProperty(node, "droidvm,intid", &value, &size) == kSuccess && size == sizeof(uint32_t)) {
             uint32_t intid;

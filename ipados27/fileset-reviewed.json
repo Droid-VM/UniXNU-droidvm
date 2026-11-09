@@ -425,6 +425,16 @@
       "original": "0xfffffe000b41ea9c",
       "native_symbol": "_os_log_coprocessor_register_with_type",
       "evidence": "Paired by reference-order before the 24 MHz timebase (patches/xnu-12377/droidvm-timebase-24mhz.patch) changed the inlined timebase read of the clock functions, which broke the order chain the matcher follows; the function itself is unchanged in both builds. microuptime unpaired panicked at boot (\"original component called an unmapped kernel function\")."
+    },
+    {
+      "original": "0xfffffe000b41d888",
+      "native_symbol": "_os_log_info_enabled",
+      "evidence": "Called by AppleInputDeviceSupport (in the collection since the Magic Trackpad's kexts, board.toml [kernel.prelink]). Original: bti c; ldrb of a __DATA_CONST byte (oslog_disabled); ldr of a __DATA word and tst #0x400, cset eq; bic: !(oslog_disabled || atm_diagnostic_config & ATM_TRACE_OFF), the body of libkern/os/log.c os_log_info_enabled and os_log_debug_enabled (identical); the native one calls atm_get_diagnostic_config for the word. Between _os_log_key_equ and _os_log_encoded_metadata in the paired order."
+    },
+    {
+      "original": "0xfffffe000b4a693c",
+      "native_symbol": "__ZN24IOBufferMemoryDescriptor20inTaskWithGuardPagesEP4taskjy",
+      "evidence": "Called by IOSlaveProcessor (in the collection since the Magic Trackpad's kexts). The one native function between the paired neighbours IOBufferMemoryDescriptor::inTaskWithPhysicalMask and ::withOptions; same body start: arguments kept in x20/x19/x21 (task, options, capacity), OSMetaClass alloc through vtable +0x68 (discriminators 0xcda1/0x1601), 0x20 stored at +0xe0 (initWithGuardPages inlined), then the capacity rounded to a page: 0x3fff in the 16K original, the runtime page mask in this 4K kernel."
     }
   ],
   "data": [

@@ -59,6 +59,27 @@ archives = [
   "build-droidvm-legacy-display.py",
 ]
 
+# The kexts of the original kernelcache in the collection: the OS profile's roots (the whole list: a layer's list replaces the one below
+# it) and the Magic Trackpad's event driver the VM's trackpad is published for (package/DroidVMTrackpadHid.inc): AppleTopCaseDriverV2,
+# whose personality "Magic Trackpad BT iOS/tvOS Event Driver - TopCase - 613" matches it, and AppleTopCaseHIDEventDriver, whose
+# AppleMultitouchTrackpadHIDEventDriver that personality starts. Their dependencies (AppleMultitouchDriver, AppleInputDeviceSupport,
+# AppleMultitouchSPI, AppleHIDKeyboard, IOSlaveProcessor) come with them, without their personalities (only roots keep theirs). All
+# their __DATA lies above Libm's, so the native __DATA keeps its room.
+[kernel.prelink]
+roots = [
+  "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib", "com.apple.driver.AppleARMPlatform",
+  "com.apple.driver.AppleARMWatchdogTimer", "com.apple.driver.AppleAudioClockLibs", "com.apple.driver.AppleEffaceableStorage",
+  "com.apple.driver.AppleIISController", "com.apple.driver.AppleM2ScalerCSCDriver", "com.apple.driver.AppleMobileFileIntegrity",
+  "com.apple.driver.ApplePMGR", "com.apple.driver.IODARTFamily", "com.apple.filesystems.apfs",
+  "com.apple.iokit.CoreAnalyticsFamily", "com.apple.iokit.IOAVFamily", "com.apple.iokit.IOAudio2Family",
+  "com.apple.iokit.IOCECFamily", "com.apple.iokit.IOCryptoAcceleratorFamily", "com.apple.iokit.IOGPUFamily",
+  "com.apple.iokit.IOHDCPFamily", "com.apple.iokit.IOMobileGraphicsFamily", "com.apple.iokit.IOReportFamily",
+  "com.apple.iokit.IOSlowAdaptiveClockingFamily", "com.apple.iokit.IOStorageFamily", "com.apple.iokit.IOSurface",
+  "com.apple.kec.Libm", "com.apple.kec.corecrypto", "com.apple.kext.AppleMatch", "com.apple.kext.CoreTrust",
+  "com.apple.security.AppleImage4", "com.apple.security.sandbox", "com.apple.iokit.IOHIDFamily",
+  "com.apple.iokit.IOHIDEventDriver", "com.apple.driver.AppleTopCaseDriverV2", "com.apple.driver.AppleTopCaseHIDEventDriver"
+]
+
 # The FAT volume of the boot disk (scripts/make-droidvm-disk.sh one level up adds UniXNU.efi and DarwinBoot.efi), as on iPadOS 17.
 # The root policies of the OS and SystemOS disks (scripts/build-droidvm-root-policies.py, bundled by the source storage step)
 # travel beside the kernel as kernel.macho.vroot, which DarwinBoot hands over as /chosen/memory-map RootPolicies: 117 MiB of block
