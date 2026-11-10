@@ -25,8 +25,8 @@ struct droidvm_trackpad_contact { int32_t id, x, y; uint8_t down, palm, major, m
 void native_trackpad_set_sink(void (*sink)(void *, const struct droidvm_trackpad_contact *, unsigned), void *context);
 void droidvm_trackpad_surface(uint32_t *width, uint32_t *height);
 // For the host rig (peek.py): [0] reports sent, [1] feature reports asked for, [2] set reports, [3] contacts beyond the 15
-// identifiers dropped; and the last feature report asked for.
-volatile uint32_t droidvm_trackpad_hid[4], droidvm_trackpad_hid_last_get;
+// identifiers dropped; the last feature report asked for; and the reports that repeated still fingers.
+volatile uint32_t droidvm_trackpad_hid[4], droidvm_trackpad_hid_last_get, droidvm_trackpad_hid_repeats;
 }
 
 #if defined(NATIVE_HID_SOURCE_API) && NATIVE_HID_SOURCE_API
@@ -56,6 +56,14 @@ class DroidVMTrackpadHIDDevice : public IOHIDDevice {
     // The contacts not yet reported: the latest state of each since the last report.
     struct droidvm_trackpad_contact pending[kIdentifiers] = {};
     unsigned pendingCount = 0;
+    // The fingers on the trackpad after the last report, reported again each interval while no frame comes: a Magic Trackpad reports
+    // every 8 ms for as long as a finger touches it, still or not, and the multitouch stack takes a pause from those reports (three
+    // fingers that stop after swiping up open the app switcher; without them it saw the swipe's last speed at the lift, and went
+    // home). The VM's trackpad sends a still finger every 50 ms. Repeating stops when no frame came for kHeldMS (a lost trackpad).
+    enum { kHeldMS = 250 };
+    struct droidvm_trackpad_contact held[kIdentifiers] = {};
+    unsigned heldCount = 0;
+    uint64_t lastFrame = 0;
     // The Magic Trackpad's finger identifiers 1..15: the tracking id each stands for, the finger it is taken for, and whether its
     // contact was reported already (its next report is not its first). Taken round robin, so that a new contact does not get the
     // identifier of the one that just lifted.
@@ -105,6 +113,7 @@ class DroidVMTrackpadHIDDevice : public IOHIDDevice {
     // A frame from the trackpad: its contacts merged into the pending ones (a contact's latest state wins; one lifted stays lifted), sent
     // at once when the last report is an interval old, else when the timer says it is.
     void merge(const struct droidvm_trackpad_contact *contacts, unsigned count) {
+        lastFrame = mach_absolute_time();
         for (unsigned c = 0; c < count; ++c) {
             unsigned i = 0;
             while (i < pendingCount && pending[i].id != contacts[c].id) ++i;
@@ -126,9 +135,18 @@ class DroidVMTrackpadHIDDevice : public IOHIDDevice {
         frame(pending, pendingCount);
         pendingCount = 0;
         lastSent = mach_absolute_time();
+        if (heldCount && timer) timer->setTimeoutMS(kIntervalMS);
     }
+    // The timer: the pending contacts when a frame came within the interval, else the fingers still down again.
     static void flushTimer(OSObject *owner, IOTimerEventSource *) {
-        if (DroidVMTrackpadHIDDevice *self = OSDynamicCast(DroidVMTrackpadHIDDevice, owner)) self->flush();
+        DroidVMTrackpadHIDDevice *self = OSDynamicCast(DroidVMTrackpadHIDDevice, owner);
+        if (!self) return;
+        if (!self->pendingCount && self->heldCount && self->elapsedMS(self->lastFrame) < kHeldMS) {
+            memcpy(self->pending, self->held, sizeof(self->held[0]) * self->heldCount);
+            self->pendingCount = self->heldCount;
+            droidvm_trackpad_hid_repeats = droidvm_trackpad_hid_repeats + 1;
+        }
+        self->flush();
     }
     // One frame of the trackpad as a Magic Trackpad 2's report; after the last finger lifts, the reports the device ends a touch with
     // (as VoodooInput sends them): the lifted fingers again a report interval later, the first one gone, and the header alone.
@@ -165,6 +183,9 @@ class DroidVMTrackpadHIDDevice : public IOHIDDevice {
         if (!n) return;
         stamp(report, touching, lastStamp = milliseconds);
         send(report, kHeader + kFingerBytes * n);
+        heldCount = 0;
+        for (unsigned c = 0; c < count; ++c)
+            if (contacts[c].down) held[heldCount++] = contacts[c];
         if (touching) return;
         stamp(report, false, lastStamp += kIntervalMS);
         send(report, kHeader + kFingerBytes * n);
