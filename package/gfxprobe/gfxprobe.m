@@ -51,6 +51,13 @@
 //                                       the GPU time per pass, against ROT 0 for what the turned copies cost; then every texel of
 //                                       the surface checked against where Metal stores the frame's texel (x, y) for ROT, and the
 //                                       texels that land as each other turn or mirror would put them, to name a wrong one
+//   gfxprobe rotfetch W H ROT [FLAGS]   CoreAnimation's path coverage (a mask of cubics) in a pass over a W x H framebuffer-only
+//                                       target of rotation ROT: draws clear an R32Float attachment (c2), add a rectangle's coverage
+//                                       into it, and read it back (framebuffer fetch) to draw red by it into c0; how many of the
+//                                       rectangle's texels in the surface came out red. FLAGS (default 15): 1 c2 memoryless (else
+//                                       private), 2 the coverage blended, 4 a memoryless RGBA16F c1 in the pass, 8 the coverage from
+//                                       [[position]] as path_rect_frag computes it (else 1), 16 c0 cleared (else loaded), 32 the
+//                                       coverage through c1 as the pointer's composite reads it, 64 the draws scissored to it
 //   gfxprobe cpu SECONDS [THREADS]      CPU time each process used over SECONDS (proc_pid_rusage), busiest first, as a share of one
 //                                       CPU; then the threads (PROC_PIDTHREADINFO, named where they have a name) of the THREADS
 //                                       (default 3) busiest processes: what the guest's vCPUs run during an animation
@@ -3535,17 +3542,34 @@ static int caHostProbe(unsigned seconds, int count, char **ids) {
 // SECONDS: 0 a backdrop with an inverting colorMatrix (shows that the backdrop sampled anything), 1 a backdrop with gaussianBlur
 // and a white wash (the glass a toolbar is), 2 a backdrop with the pointer's matrix, 3 that masked by a circle, 4 that in a 0.85
 // group, 5 tile 4 through a portal in the same context (source hidden, matchesPosition), 6 through a portal in another context.
-// 7-9 nest it as pointeruid does, 10-11 host it as SpringBoard does (see below). KEY=VALUE sets a number on every backdrop layer (KVC), e.g.
-// allowsInPlaceFiltering=1 as pointeruid's; portal.KEY=VALUE sets a number on every portal (portal.matchesOpacity=1).
+// 7-9 nest it as pointeruid does, 10-11 host it as SpringBoard does, 12-13 a row below: the pointer's arrow path as a mask
+// (see below). KEY=VALUE sets a number on every backdrop layer (KVC), e.g.
+// allowsInPlaceFiltering=1 as pointeruid's; portal.KEY=VALUE sets a number on every portal (portal.matchesOpacity=1); rotate=1
+// (or -1) turns every root a quarter, as a landscape window on the portrait display; prot=1 turns only the roots of the portals'
+// own contexts (tiles 6, 10, 11), as UIKit turns pointeruid's system pointer window but not its rendering window; top=Y puts the
+// row at y (default 400).
 static int caBackdropPairs;
 static char **caBackdropPairList;
+// rotate=1: every root layer turned a quarter as a landscape window's is on the portrait display (bounds 1366 x 1024 about the
+// display's centre), which is how iPadOS's pointer windows are when the interface is landscape.
+static int caBackdropRotate;
+static int caBackdropPortalRotate;   // prot=1: only the portals' own roots turned (pointeruid's system window turns, its source not)
+static double caBackdropTop = 400;   // top=Y: the row's y (a portrait coordinate past 1024 lies off a landscape frame)
+static void caBackdropTurnBy(CALayer *root, int quarters) {
+    if (!quarters) return;
+    root.bounds = CGRectMake(0, 0, 1366, 1024);
+    root.position = CGPointMake(512, 683);
+    root.transform = CATransform3DMakeRotation(quarters * M_PI / 2, 0, 0, 1);
+}
+static void caBackdropTurn(CALayer *root) { caBackdropTurnBy(root, caBackdropRotate); }
 static CALayer *caBackdrop(CGFloat size, NSArray *filters, BOOL masked) {
     CALayer *backdrop = ((CALayer * (*)(id, SEL))objc_msgSend)((id)objc_getClass("CABackdropLayer"), sel_registerName("layer"));
     backdrop.frame = CGRectMake(0, 0, size, size);
     backdrop.filters = filters;
     for (int k = 0; k < caBackdropPairs; k++) {
         char *eq = strchr(caBackdropPairList[k], '=');
-        if (eq && strncmp(caBackdropPairList[k], "portal.", 7))
+        if (eq && strncmp(caBackdropPairList[k], "portal.", 7) && strncmp(caBackdropPairList[k], "rotate=", 7) &&
+            strncmp(caBackdropPairList[k], "top=", 4) && strncmp(caBackdropPairList[k], "prot=", 5))
             [backdrop setValue:@(strtod(eq + 1, NULL)) forKey:[[[NSString alloc] initWithBytes:caBackdropPairList[k]
                                     length:eq - caBackdropPairList[k] encoding:NSUTF8StringEncoding] autorelease]];
     }
@@ -3574,7 +3598,12 @@ static void caBackdropPortal(CALayer *portal) {
 static int caBackdropProbe(unsigned seconds, int count, char **pairs) {
     caBackdropPairs = count;
     caBackdropPairList = pairs;
-    const CGFloat size = 60, step = 70, top = 400;
+    for (int k = 0; k < count; k++) {
+        if (!strncmp(pairs[k], "rotate=", 7)) caBackdropRotate = atoi(pairs[k] + 7);
+        if (!strncmp(pairs[k], "top=", 4)) caBackdropTop = strtod(pairs[k] + 4, NULL);
+        if (!strncmp(pairs[k], "prot=", 5)) caBackdropPortalRotate = atoi(pairs[k] + 5);
+    }
+    const CGFloat size = 60, step = 70, top = caBackdropTop;
     const float pointerMatrix[20] = {0.03331f, -0.14078f, -0.02729f, 0, 1.05f, -0.07167f, -0.03573f, -0.02735f, 0, 1.05f,
                                      -0.07173f, -0.14068f, 0.07767f, 0, 1.05f, 0.20796f, 0.23153f, 0.04501f, 1, -0.40335f};
     const float invertMatrix[20] = {-1, 0, 0, 0, 1, 0, -1, 0, 0, 1, 0, 0, -1, 0, 1, 0, 0, 0, 1, 0};
@@ -3695,11 +3724,55 @@ static int caBackdropProbe(unsigned seconds, int count, char **pairs) {
             [host setValue:@(hosted[h]) forKey:@"contextId"];
             [hostRoot addSublayer:host];
         }
+        caBackdropTurn(sourceRoot);
+        caBackdropTurnBy(portalRootLayer, caBackdropRotate ? caBackdropRotate : caBackdropPortalRotate);
         caShowContext(sourceContext, sourceRoot, 0);
         caShowContext(hostedPortalContext, portalRootLayer, 0);
         caShowContext(hostContext, hostRoot, 10000051 + i);
         [hostedContexts addObjectsFromArray:@[sourceContext, hostedPortalContext, hostContext]];
     }
+    // 12 and 13: the pointer's own arrow (its path as the render tree prints it, 82.7 x 63.1) as the mask of a plain red layer (12)
+    // and of the pointer's backdrop (13). A circle masks through CoreAnimation's analytic shapes; a path of cubics through its path
+    // coverage passes, which the pointer's composite reads back.
+    for (int i = 12; i <= 13; i++) {
+        CALayer *tile = [CALayer layer];
+        tile.frame = CGRectMake(10 + (i - 12) * 100, top + 90, 90, 70);
+        tile.borderWidth = 1;
+        [root addSublayer:tile];
+        CALayer *masked = i == 12 ? [CALayer layer]
+                                  : caBackdrop(90, @[caFilter(@"colorMatrix", @{@"inputColorMatrix": matrix(pointerMatrix)})], NO);
+        masked.frame = CGRectMake(0, 0, 82.7285, 63.09);
+        if (i == 12) {
+            const CGFloat redValues[] = {0.9, 0.1, 0.1, 1};
+            CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+            CGColorRef red = CGColorCreate(rgb, redValues);
+            masked.backgroundColor = red;
+            CGColorRelease(red);
+            CGColorSpaceRelease(rgb);
+        }
+        CGMutablePathRef arrow = CGPathCreateMutable();
+        CGPathMoveToPoint(arrow, NULL, 0, 55.59);
+        CGPathAddCurveToPoint(arrow, NULL, 0, 53.5568, 0.825485, 51.6107, 2.287335, 50.1976);
+        CGPathAddLineToPoint(arrow, NULL, 51.2375, 2.879);
+        CGPathAddCurveToPoint(arrow, NULL, 54.216, 0, 58.964, 0.0805, 61.843, 3.0585);
+        CGPathAddCurveToPoint(arrow, NULL, 63.1945, 4.457, 63.9505, 6.326, 63.9505, 8.2715);
+        CGPathAddLineToPoint(arrow, NULL, 63.9505, 30.1726);
+        CGPathAddCurveToPoint(arrow, NULL, 63.9505, 32.04905, 64.6535, 33.85735, 65.9215, 35.24055);
+        CGPathAddLineToPoint(arrow, NULL, 79.9295, 50.52205);
+        CGPathAddCurveToPoint(arrow, NULL, 82.7285, 53.57545, 82.5225, 58.319715, 79.469, 61.118655);
+        CGPathAddCurveToPoint(arrow, NULL, 78.086, 62.38661, 76.2775, 63.09, 74.401, 63.09);
+        CGPathAddLineToPoint(arrow, NULL, 7.5, 63.09);
+        CGPathAddCurveToPoint(arrow, NULL, 3.357865, 63.09, 0, 59.732135, 0, 55.59);
+        CGPathCloseSubpath(arrow);
+        CAShapeLayer *mask = [CAShapeLayer layer];
+        mask.frame = masked.bounds;
+        mask.path = arrow;
+        CGPathRelease(arrow);
+        masked.mask = mask;
+        [tile addSublayer:masked];
+    }
+    caBackdropTurn(root);
+    caBackdropTurnBy(portalRoot, caBackdropRotate ? caBackdropRotate : caBackdropPortalRotate);
     caShowContext(plainContext, root, 10000050);
     caShowContext(portalContext, portalRoot, 10000049);
     [CATransaction commit];
@@ -4146,6 +4219,141 @@ int main(int argc, char **argv) {
                 if (hits[k] && k != (int)(rotation & 3))
                     printf(" %s %zu", names[k], hits[k]);
             printf("\n");
+        } else if (!strcmp(argv[1], "rotfetch")) {
+            unsigned rotation = (unsigned)strtoul(argv[4], NULL, 0), flags = argc > 5 ? (unsigned)strtoul(argv[5], NULL, 0) : 15;
+            unsigned sw = rotation % 2 ? h : w, sh = rotation % 2 ? w : h;
+            IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth: @(sw), (id)kIOSurfaceHeight: @(sh),
+                (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @((unsigned)'BGRA')});
+            if (surface) {
+                IOSurfaceLock(surface, 0, NULL);
+                memset(IOSurfaceGetBaseAddress(surface), 0x40, IOSurfaceGetAllocSize(surface));
+                IOSurfaceUnlock(surface, 0, NULL);
+            }
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h
+                                                                                    mipmapped:NO];
+            d.usage = MTLTextureUsageRenderTarget;
+            ((void (*)(id, SEL, NSUInteger))objc_msgSend)(d, sel_registerName("setRotation:"), rotation);
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(d, sel_registerName("setFramebufferOnly:"), YES);
+            id<MTLTexture> target = surface ? [device newTextureWithDescriptor:d iosurface:surface plane:0] : nil;
+            MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:w height:h
+                                                                                     mipmapped:NO];
+            md.usage = MTLTextureUsageRenderTarget;
+            md.storageMode = flags & 1 ? MTLStorageModeMemoryless : MTLStorageModePrivate;
+            id<MTLTexture> mask = [device newTextureWithDescriptor:md];
+            id<MTLTexture> layer = nil;
+            if (flags & 36) {
+                MTLTextureDescriptor *ld = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:w
+                                                                                          height:h mipmapped:NO];
+                ld.usage = MTLTextureUsageRenderTarget;
+                ld.storageMode = MTLStorageModeMemoryless;
+                layer = [device newTextureWithDescriptor:ld];
+            }
+            static const char *source =
+                "#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; float2 lo; float2 hi; };\n"
+                "vertex V vq(uint i [[vertex_id]], constant float4 &r [[buffer(0)]], constant float2 &vp [[buffer(1)]]) {\n"
+                "  float2 q = float2(i & 1, i >> 1), px = mix(r.xy, r.zw, q); V v;\n"
+                "  v.p = float4(px / vp * float2(2, -2) + float2(-1, 1), 0, 1); v.lo = r.xy; v.hi = r.zw; return v; }\n"
+                "struct M { float m [[color(2)]]; };\n"
+                "fragment M clear2() { M o; o.m = 0; return o; }\n"
+                "fragment M cover(V v [[stage_in]], constant uint &bypos [[buffer(0)]]) {\n"
+                "  M o; o.m = bypos ? saturate(min(v.p.y + 1, v.hi.y) - max(v.p.y, v.lo.y)) : 1; return o; }\n"
+                "struct B { half4 c [[color(0)]]; float m [[color(2)]]; };\n"
+                "fragment B blit(V v [[stage_in]], float d [[color(2)]]) {\n"
+                "  B o; o.c = half4(1, 0, 0, 1) * half(saturate(abs(d))); o.m = 0; return o; }\n"
+                "struct L { half4 l [[color(1)]]; float m [[color(2)]]; };\n"
+                "fragment L blitl(V v [[stage_in]], float d [[color(2)]]) { L o; o.l = half4(half(saturate(abs(d)))); o.m = 0; return o; }\n"
+                "struct C { half4 c [[color(0)]]; };\n"
+                "fragment C compose(V v [[stage_in]], half4 l [[color(1)]]) { C o; o.c = half4(1, 0, 0, 1) * l.a; return o; }\n";
+            NSError *error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:@(source) options:nil error:&error];
+            // name, color(0..2) write masks, blend of color(0) (source over) and of color(2) (add)
+            id<MTLRenderPipelineState> (^pipeline)(NSString *, MTLColorWriteMask, MTLColorWriteMask, MTLColorWriteMask, BOOL) =
+                ^id<MTLRenderPipelineState>(NSString *name, MTLColorWriteMask m0, MTLColorWriteMask m1, MTLColorWriteMask m2, BOOL add) {
+                    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+                    pd.vertexFunction = [library newFunctionWithName:@"vq"];
+                    pd.fragmentFunction = [library newFunctionWithName:name];
+                    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                    pd.colorAttachments[0].writeMask = m0;
+                    pd.colorAttachments[0].blendingEnabled = m0 != MTLColorWriteMaskNone;
+                    pd.colorAttachments[0].sourceRGBBlendFactor = pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+                    pd.colorAttachments[0].destinationRGBBlendFactor = pd.colorAttachments[0].destinationAlphaBlendFactor =
+                        MTLBlendFactorOneMinusSourceAlpha;
+                    pd.colorAttachments[1].pixelFormat = layer ? MTLPixelFormatRGBA16Float : MTLPixelFormatInvalid;
+                    pd.colorAttachments[1].writeMask = layer ? m1 : MTLColorWriteMaskNone;
+                    pd.colorAttachments[1].blendingEnabled = layer && m1 != MTLColorWriteMaskNone;
+                    pd.colorAttachments[1].sourceRGBBlendFactor = pd.colorAttachments[1].sourceAlphaBlendFactor = MTLBlendFactorOne;
+                    pd.colorAttachments[1].destinationRGBBlendFactor = pd.colorAttachments[1].destinationAlphaBlendFactor =
+                        MTLBlendFactorOneMinusSourceAlpha;
+                    pd.colorAttachments[2].pixelFormat = MTLPixelFormatR32Float;
+                    pd.colorAttachments[2].writeMask = m2;
+                    pd.colorAttachments[2].blendingEnabled = add;
+                    pd.colorAttachments[2].sourceRGBBlendFactor = pd.colorAttachments[2].sourceAlphaBlendFactor = MTLBlendFactorOne;
+                    pd.colorAttachments[2].destinationRGBBlendFactor = pd.colorAttachments[2].destinationAlphaBlendFactor = MTLBlendFactorOne;
+                    NSError *e = nil;
+                    id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:pd error:&e];
+                    if (!state) printf("rotfetch: pipeline %s: %s\n", name.UTF8String, e.description.UTF8String);
+                    return state;
+                };
+            const MTLColorWriteMask none = MTLColorWriteMaskNone, red = MTLColorWriteMaskRed, all = MTLColorWriteMaskAll;
+            id<MTLRenderPipelineState> clearing = library ? pipeline(@"clear2", none, none, red, NO) : nil,
+                                       covering = library ? pipeline(@"cover", none, none, red, (flags & 2) != 0) : nil,
+                                       blitting = library ? (flags & 32 ? pipeline(@"blitl", none, all, red, NO)
+                                                                        : pipeline(@"blit", all, none, red, NO)) : nil,
+                                       composing = library && flags & 32 ? pipeline(@"compose", all, none, none, NO) : nil;
+            id<MTLCommandQueue> queue = [device newCommandQueue];
+            if (!target || !mask || !clearing || !covering || !blitting || (flags & 32 && !composing) || !queue) {
+                printf("rotfetch: surface %p target %p mask %p library %p: %s\n", surface, target, mask, library,
+                       error.description.UTF8String);
+                return 1;
+            }
+            const float x0 = floorf(w * 0.3f), y0 = floorf(h * 0.3f), rect[4] = {x0, y0, x0 + 80, y0 + 60}, viewport[2] = {w, h};
+            const unsigned bypos = (flags & 8) != 0;
+            id<MTLCommandBuffer> commands = [queue commandBuffer];
+            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = target;
+            pass.colorAttachments[0].loadAction = flags & 16 ? MTLLoadActionClear : MTLLoadActionLoad;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0.5, 1);
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            if (layer) {
+                pass.colorAttachments[1].texture = layer;
+                pass.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+                pass.colorAttachments[1].storeAction = MTLStoreActionDontCare;
+            }
+            pass.colorAttachments[2].texture = mask;
+            pass.colorAttachments[2].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[2].storeAction = MTLStoreActionDontCare;
+            id<MTLRenderCommandEncoder> draw = [commands renderCommandEncoderWithDescriptor:pass];
+            if (flags & 64)
+                [draw setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, 80, 60}];
+            [draw setVertexBytes:rect length:sizeof(rect) atIndex:0];
+            [draw setVertexBytes:viewport length:sizeof(viewport) atIndex:1];
+            [draw setFragmentBytes:&bypos length:sizeof(bypos) atIndex:0];
+            id<MTLRenderPipelineState> steps[4] = {clearing, covering, blitting, composing};
+            for (int i = 0; i < 4 && steps[i]; i++) {
+                [draw setRenderPipelineState:steps[i]];
+                [draw drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+            }
+            [draw endEncoding];
+            [commands commit];
+            [commands waitUntilCompleted];
+            IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+            const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+            const size_t row = IOSurfaceGetBytesPerRow(surface);
+            size_t inside = 0, outside = 0, untouched = 0, texels = 0;
+            for (unsigned y = 0; y < h; y++)
+                for (unsigned x = 0; x < w; x++) {
+                    const unsigned map[4][2] = {{x, y}, {h - 1 - y, x}, {w - 1 - x, h - 1 - y}, {y, w - 1 - x}};
+                    const uint8_t *t = base + map[rotation & 3][1] * row + map[rotation & 3][0] * 4; // B G R A
+                    const bool lit = t[2] > 200 && t[1] < 60 && t[0] < 60, in = x >= x0 && x < x0 + 80 && y >= y0 && y < y0 + 60;
+                    texels += in;
+                    inside += in && lit;
+                    outside += !in && lit;
+                    untouched += in && t[0] == 0x40 && t[1] == 0x40 && t[2] == 0x40;
+                }
+            IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+            printf("rotfetch %ux%u rotation %u flags 0x%x: %zu of %zu texels of the rectangle red (%zu as they were), %zu red outside;"
+                   " status %ld %s\n", w, h, rotation, flags, inside, texels, untouched, outside, (long)commands.status,
+                   commands.error ? commands.error.description.UTF8String : "");
         } else if (!strcmp(argv[1], "gpubw")) {
             unsigned rounds = (unsigned)strtoul(argv[4], NULL, 0);
             NSArray<NSString *> *kinds = @[@"private", @"shared", @"iosurface", @"iosurface-wc", @"ca", @"buffer"];
