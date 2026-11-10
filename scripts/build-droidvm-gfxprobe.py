@@ -37,9 +37,16 @@ subprocess.run(['xcrun', 'clang', '-target', TARGET, '-isysroot', sdk, '-O2', '-
 entitlements = OUT / 'entitlements.plist'
 # The platform sandbox refuses IOServiceOpen of a user-client class a process is not granted: the surface and GPU clients it opens.
 # com.apple.backboardd.setDeviceOrientation: backboardd's handler of the automation device orientation (MIG 6000013) checks it
-# and otherwise drops the one-way message (`gfxprobe orient`).
+# and otherwise drops the one-way message (`gfxprobe orient`). The render server takes snapshots (secure contexts too) and debug
+# options only from a client with the QuartzCore ones (`gfxprobe casnap`, `cadebug`); `cafilter` puts contexts of its own, a secure
+# one too, on the display.
 entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True,
                                          'com.apple.backboardd.setDeviceOrientation': True,
+                                         'com.apple.QuartzCore.global-capture': True,
+                                         'com.apple.QuartzCore.secure-capture': True,
+                                         'com.apple.QuartzCore.debug': True,
+                                         'com.apple.QuartzCore.displayable-context': True,
+                                         'com.apple.QuartzCore.secure-mode': True,
                                          'com.apple.security.iokit-user-client-class': ['IOSurfaceRootUserClient',
                                                                                         'AGXDeviceUserClient']}))
 subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'org.droidvm.gfxprobe',

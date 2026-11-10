@@ -56,6 +56,23 @@
 //                                       (default 3) busiest processes: what the guest's vCPUs run during an animation
 //   gfxprobe display                    what CoreAnimation makes of the main display: CADisplay's refresh rates, minimum frame
 //                                       duration, modes and VRR, as QuartzCore answers them (KVC, each key that answers)
+//   gfxprobe casnap OUT W H [KEY=VALUE...]
+//                                       what the render server draws (CARenderServerSnapshot) into a W x H BGRA surface, as a PNG:
+//                                       the display, one layer (mode=layer context=ID layer=ID) or the display with only some
+//                                       contexts (mode=include list=ID,...); masks=1 keeps layers captures leave out (disableUpdateMask)
+//   gfxprobe cabackdrop [SECONDS [KEY=VALUE...]]
+//                                       the pointer's construction tile by tile (a backdrop, its color matrix, its mask, its 0.85 group,
+//                                       a portal of it) over what is below, a row at y 400 for SECONDS (default 30); KEY=VALUE sets a
+//                                       number on each backdrop
+//   gfxprobe cahost SECONDS [level=L] ID...
+//                                       other processes' contexts (hex ids) through CALayerHosts, a quarter size, over white and
+//                                       black, at the top of the display for SECONDS: what each draws, apart from its host; a level
+//                                       below SpringBoard's (level=-1e6) hides them but puts them first in CA_PRINT_TREE's output
+//   gfxprobe cadebug N [VALUE]          the render server's debug option N (CARenderServerSetDebugOption; CA_COLOR_FLUSH is 0)
+//   gfxprobe cafilter OUT [SECONDS [KEY=VALUE...]]
+//                                       a row of tiles on top of the display, each one thing the pointer is drawn with (filters,
+//                                       portals, a secure context), for SECONDS (default 20), and a snapshot of the display in OUT;
+//                                       KEY=VALUE sets a number on each portal
 //   gfxprobe mg [KEY...]                MobileGestalt's answers (MGCopyAnswer) to KEY, by default the main screen's: its scale,
 //                                       size, class, the per-display extended properties QuartzCore takes the display's scale from
 //                                       (DisplayExtendedProperties[i] DisplayScale before main-screen-scale) and the artwork traits
@@ -216,6 +233,7 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -3228,6 +3246,469 @@ static int displayInfo(void) {
     return 0;
 }
 
+// QuartzCore, private. The render server answers both only to a client with com.apple.QuartzCore.global-capture (snapshots;
+// secure-capture for secure contexts) and com.apple.QuartzCore.debug (debug options).
+extern BOOL CARenderServerSnapshot(mach_port_t server, NSDictionary *options);
+extern void CARenderServerSetDebugOption(mach_port_t server, int option, int value);
+extern int CARenderServerGetDebugOption(mach_port_t server, int option);
+
+// What the render server draws, into a W x H BGRA surface written to OUT as a PNG, with the area that is not transparent.
+// KEY=VALUE options (kCASnapshot*): mode=display (the default), layer, include or exclude; context=ID and layer=ID (hex, a
+// context's id and a layer's render id, as PointerUI logs them); list=ID,ID... (the contexts include or exclude names);
+// masks=1 draws layers whose disableUpdateMask leaves them out of captures; display=NAME (default LCD, the main display:
+// the render server refuses a snapshot that names none).
+static int caSnapshot(const char *outPath, unsigned width, unsigned height, int count, char **pairs) {
+    IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth: @(width), (id)kIOSurfaceHeight: @(height),
+                                                              (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @((unsigned)'BGRA')});
+    if (!surface) { printf("no %ux%u surface\n", width, height); return 1; }
+    NSMutableDictionary *options = [NSMutableDictionary dictionaryWithObjectsAndKeys:(__bridge id)surface, @"destination",
+                                                                                     @"modeDisplay", @"mode",
+                                                                                     @"LCD", @"displayName", nil];
+    NSDictionary *modes = @{@"display": @"modeDisplay", @"layer": @"modeLayer", @"include": @"includeContextList",
+                            @"exclude": @"excludeContextList"};
+    for (int i = 0; i < count; i++) {
+        NSString *pair = @(pairs[i]);
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) { printf("not KEY=VALUE: %s\n", pairs[i]); return 2; }
+        NSString *key = [pair substringToIndex:eq.location], *value = [pair substringFromIndex:eq.location + 1];
+        if ([key isEqualToString:@"mode"] && modes[value]) options[@"mode"] = modes[value];
+        else if ([key isEqualToString:@"context"]) options[@"contextId"] = @((uint32_t)strtoull(value.UTF8String, NULL, 16));
+        else if ([key isEqualToString:@"layer"]) options[@"layerId"] = @(strtoull(value.UTF8String, NULL, 16));
+        else if ([key isEqualToString:@"masks"]) options[@"ignoreDisableUpdateMasks"] = @(value.intValue != 0);
+        else if ([key isEqualToString:@"display"]) options[@"displayName"] = value;
+        else if ([key isEqualToString:@"list"]) {
+            NSMutableArray *ids = [NSMutableArray array];
+            for (NSString *one in [value componentsSeparatedByString:@","]) [ids addObject:@((uint32_t)strtoull(one.UTF8String, NULL, 16))];
+            options[@"contextList"] = ids;
+        } else { printf("unknown option %s\n", pairs[i]); return 2; }
+    }
+    BOOL done = CARenderServerSnapshot(0, options);
+    printf("snapshot %s: %s\n", done ? "done" : "refused", [[options description] UTF8String]);
+    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+    size_t stride = IOSurfaceGetBytesPerRow(surface);
+    unsigned left = width, right = 0, top = height, bottom = 0;
+    uint64_t drawn = 0;
+    for (unsigned y = 0; y < height; y++)
+        for (unsigned x = 0; x < width; x++)
+            if (base[y * stride + x * 4 + 3]) {
+                drawn++;
+                if (x < left) left = x;
+                if (x > right) right = x;
+                if (y < top) top = y;
+                if (y > bottom) bottom = y;
+            }
+    if (drawn) printf("drawn %llu pixels, x %u..%u, y %u..%u\n", (unsigned long long)drawn, left, right, top, bottom);
+    else printf("drawn 0 pixels\n");
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef bitmap = CGBitmapContextCreate((void *)base, width, height, 8, stride, space,
+                                                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGImageRef image = CGBitmapContextCreateImage(bitmap);
+    CGImageDestinationRef file = CGImageDestinationCreateWithURL((CFURLRef)[NSURL fileURLWithPath:@(outPath)], CFSTR("public.png"), 1, NULL);
+    CGImageDestinationAddImage(file, image, NULL);
+    bool written = CGImageDestinationFinalize(file);
+    CFRelease(file);
+    CGImageRelease(image);
+    CGContextRelease(bitmap);
+    CGColorSpaceRelease(space);
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    CFRelease(surface);
+    printf("%s %s\n", outPath, written ? "written" : "not written");
+    return done && written ? 0 : 1;
+}
+
+// QuartzCore, private (com.apple.QuartzCore.displayable-context puts a context on the display, secure-mode makes it secure).
+extern NSString *const kCAContextDisplayable;
+extern NSString *const kCAContextSecure;
+extern uint64_t CALayerGetRenderId(CALayer *layer);
+
+static CALayer *caFilterDot(CGFloat size, CGColorRef color) {
+    CALayer *dot = [CALayer layer];
+    dot.frame = CGRectMake(size / 6, size / 6, size * 2 / 3, size * 2 / 3);
+    dot.cornerRadius = size / 3;
+    dot.backgroundColor = color;
+    return dot;
+}
+
+static id caFilter(NSString *type, NSDictionary *values) {
+    id filter = ((id (*)(id, SEL, NSString *))objc_msgSend)((id)objc_getClass("CAFilter"), sel_registerName("filterWithType:"), type);
+    for (NSString *key in values) [filter setValue:values[key] forKey:key];
+    return filter;
+}
+
+static id caRemoteContext(NSDictionary *options) {
+    return ((id (*)(id, SEL, NSDictionary *))objc_msgSend)((id)objc_getClass("CAContext"), sel_registerName("remoteContextWithOptions:"),
+                                                            options);
+}
+
+static uint32_t caContextId(id context) {
+    return ((uint32_t (*)(id, SEL))objc_msgSend)(context, sel_registerName("contextId"));
+}
+
+static void caShowContext(id context, CALayer *layer, float level) {
+    ((void (*)(id, SEL, CALayer *))objc_msgSend)(context, sel_registerName("setLayer:"), layer);
+    ((void (*)(id, SEL, float))objc_msgSend)(context, sel_registerName("setLevel:"), level);
+}
+
+// A portal of SOURCE (a layer of the context SOURCEID), with KEY=VALUE numbers set on it (KVC).
+static CALayer *caPortal(CALayer *source, uint32_t sourceId, CGFloat size, int count, char **pairs) {
+    CALayer *portal = ((CALayer * (*)(id, SEL))objc_msgSend)((id)objc_getClass("CAPortalLayer"), sel_registerName("layer"));
+    portal.frame = CGRectMake(0, 0, size, size);
+    [portal setValue:@(CALayerGetRenderId(source)) forKey:@"sourceLayerRenderId"];
+    [portal setValue:@(sourceId) forKey:@"sourceContextId"];
+    for (int k = 0; k < count; k++) {
+        char *eq = strchr(pairs[k], '=');
+        if (eq) [portal setValue:@(strtod(eq + 1, NULL)) forKey:[[NSString alloc] initWithBytes:pairs[k] length:eq - pairs[k]
+                                                                                         encoding:NSUTF8StringEncoding]];
+    }
+    return portal;
+}
+
+// What the pointer is made of (pointeruid: PUIDPointerShapeView and its filter background view, in a secure window, shown
+// through a portal from another context), one tile each, in a row at the top of the display for SECONDS: 0 a plain dot (the
+// portals' source A), 1 blurred (gaussianBlur 4), 2 alphaThreshold + gaussianBlur on a clear tile (the pointer's gooey edge),
+// 3 plusL over gray (its compositing filter), 4 colorMatrix, 5 opacityPair 0.5; portals of A: 6 by render id alone, 7 with its
+// context's id, 8 by setSourceLayer:; in a secure context: 9 a plain dot, 10 a dot with disableUpdateMask 0x20 (pointeruid's
+// window layer), 11 a portal of A from the other context; then 12 a dot B and 13 a portal of B hiding its source (B gone: the
+// server found the source). KEY=VALUE sets a number on every portal (KVC: matchesPosition, crossDisplay, ...). A snapshot of
+// the display goes to OUT after a second; a tile missing from it, or from the phone's screen, is what the render server does
+// not draw. A second row (y + 60) puts a portal beside its source across two contexts: 0 plain to plain, 1 secure to secure,
+// 2 plain portal of a secure source, 3 the source's context above the portal's, then contexts not on the display but hosted by
+// CALayerHosts in a third (as SpringBoard hosts pointeruid's windows): 4 plain, 5 secure.
+static int caFilterProbe(const char *outPath, unsigned seconds, int count, char **pairs) {
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    const CGFloat redValues[] = {0.9, 0.1, 0.1, 1}, grayValues[] = {0.45, 0.45, 0.45, 1}, panelValues[] = {1, 1, 1, 1};
+    CGColorRef red = CGColorCreate(space, redValues), gray = CGColorCreate(space, grayValues), panel = CGColorCreate(space, panelValues);
+    const CGFloat size = 44, step = 50, top = 120;
+    id plainContext = caRemoteContext(@{kCAContextDisplayable: @YES});
+    id secureContext = caRemoteContext(@{kCAContextDisplayable: @YES, kCAContextSecure: @YES});
+    if (!plainContext || !secureContext) { printf("no context (plain %p, secure %p)\n", plainContext, secureContext); return 1; }
+    const uint32_t plainId = caContextId(plainContext);
+    [CATransaction begin];
+    CALayer *plainRoot = [CALayer layer], *secureRoot = [CALayer layer];
+    plainRoot.frame = secureRoot.frame = CGRectMake(0, 0, 1024, 400);
+    NSMutableArray<CALayer *> *tiles = [NSMutableArray array];
+    for (int i = 0; i < 14; i++) {
+        CALayer *tile = [CALayer layer];
+        tile.frame = CGRectMake(10 + i * step, top, size, size);
+        if (i != 2) tile.backgroundColor = i == 3 ? gray : panel;
+        [(i >= 9 && i <= 11 ? secureRoot : plainRoot) addSublayer:tile];
+        [tiles addObject:tile];
+    }
+    CALayer *source = caFilterDot(size, red), *hidden = caFilterDot(size, red);
+    [tiles[0] addSublayer:source];
+    [tiles[12] addSublayer:hidden];
+    for (int i = 1; i <= 5; i++) {
+        CALayer *dot = caFilterDot(size, red);
+        [tiles[i] addSublayer:dot];
+        if (i == 3) dot.compositingFilter = caFilter(@"plusL", @{});
+    }
+    tiles[1].filters = @[caFilter(@"gaussianBlur", @{@"inputRadius": @4})];
+    tiles[2].filters = @[caFilter(@"alphaThreshold", @{}), caFilter(@"gaussianBlur", @{@"inputRadius": @4})];
+    tiles[4].filters = @[caFilter(@"colorMatrix", @{})];
+    tiles[5].filters = @[caFilter(@"opacityPair", @{@"inputAmount": @0.5})];
+    [tiles[9] addSublayer:caFilterDot(size, red)];
+    CALayer *masked = caFilterDot(size, red);
+    [masked setValue:@0x20 forKey:@"disableUpdateMask"];
+    [tiles[10] addSublayer:masked];
+    NSMutableArray<CALayer *> *portals = [NSMutableArray array];
+    const int portalTiles[] = {6, 7, 8, 11, 13};
+    for (unsigned t = 0; t < sizeof portalTiles / sizeof *portalTiles; t++) {
+        const int i = portalTiles[t];
+        CALayer *portal = ((CALayer * (*)(id, SEL))objc_msgSend)((id)objc_getClass("CAPortalLayer"), sel_registerName("layer"));
+        portal.frame = CGRectMake(0, 0, size, size);
+        CALayer *from = i == 13 ? hidden : source;
+        if (i == 8) [portal setValue:from forKey:@"sourceLayer"];
+        else [portal setValue:@(CALayerGetRenderId(from)) forKey:@"sourceLayerRenderId"];
+        if (i == 7 || i == 11 || i == 13) [portal setValue:@(plainId) forKey:@"sourceContextId"];
+        if (i == 13) [portal setValue:@YES forKey:@"hidesSourceLayer"];
+        for (int k = 0; k < count; k++) {
+            char *eq = strchr(pairs[k], '=');
+            if (eq) [portal setValue:@(strtod(eq + 1, NULL)) forKey:[[NSString alloc] initWithBytes:pairs[k] length:eq - pairs[k]
+                                                                                             encoding:NSUTF8StringEncoding]];
+        }
+        [tiles[i] addSublayer:portal];
+        [portals addObject:portal];
+    }
+    caShowContext(plainContext, plainRoot, 10000020);
+    caShowContext(secureContext, secureRoot, 10000021);
+    NSMutableArray *pairContexts = [NSMutableArray array];
+    for (int j = 0; j < 6; j++) {
+        const BOOL secure = j == 1 || j == 5, sourceSecure = secure || j == 2, hosted = j >= 4;
+        NSDictionary *options = hosted ? @{} : @{kCAContextDisplayable: @YES};
+        NSMutableDictionary *secureOptions = [[options mutableCopy] autorelease];
+        secureOptions[kCAContextSecure] = @YES;
+        id sourceContext = caRemoteContext(sourceSecure ? secureOptions : options);
+        id portalContext = caRemoteContext(secure ? secureOptions : options);
+        const CGRect sourceTile = CGRectMake(10 + j * 2 * step, top + 60, size, size), portalTile = CGRectOffset(sourceTile, step, 0);
+        CALayer *sourceRoot = [CALayer layer], *portalRoot = [CALayer layer];
+        sourceRoot.frame = hosted ? CGRectMake(0, 0, size, size) : sourceTile;
+        portalRoot.frame = hosted ? CGRectMake(0, 0, size, size) : portalTile;
+        sourceRoot.backgroundColor = portalRoot.backgroundColor = panel;
+        CALayer *dot = caFilterDot(size, red);
+        [sourceRoot addSublayer:dot];
+        [portalRoot addSublayer:caPortal(dot, caContextId(sourceContext), size, count, pairs)];
+        const float level = 10000030 + j * 2;
+        caShowContext(sourceContext, sourceRoot, j == 3 ? level + 1 : level);
+        caShowContext(portalContext, portalRoot, j == 3 ? level : level + 1);
+        [pairContexts addObjectsFromArray:@[sourceContext, portalContext]];
+        if (hosted) {
+            id hostContext = caRemoteContext(secure ? @{kCAContextDisplayable: @YES, kCAContextSecure: @YES} : @{kCAContextDisplayable: @YES});
+            CALayer *hostRoot = [CALayer layer];
+            hostRoot.frame = CGRectMake(0, 0, 1024, 400);
+            const CGRect tiles2[] = {sourceTile, portalTile};
+            const uint32_t ids[] = {caContextId(sourceContext), caContextId(portalContext)};
+            for (int h = 0; h < 2; h++) {
+                CALayer *host = ((CALayer * (*)(id, SEL))objc_msgSend)((id)objc_getClass("CALayerHost"), sel_registerName("layer"));
+                host.frame = tiles2[h];
+                [host setValue:@(ids[h]) forKey:@"contextId"];
+                [hostRoot addSublayer:host];
+            }
+            caShowContext(hostContext, hostRoot, level + 5);
+            [pairContexts addObject:hostContext];
+        }
+        printf("row 2, %d: source context %x, portal context %x\n", j, caContextId(sourceContext), caContextId(portalContext));
+    }
+    [CATransaction commit];
+    [CATransaction flush];
+    printf("plain context %x, secure context %x, source layers %llx %llx; tiles at y %g..%g, x 10 + 50 i\n", plainId,
+           caContextId(secureContext), (unsigned long long)CALayerGetRenderId(source), (unsigned long long)CALayerGetRenderId(hidden),
+           top, top + size);
+    for (CALayer *portal in portals) {
+        printf("portal:");
+        for (NSString *key in @[@"sourceContextId", @"sourceLayerRenderId", @"matchesPosition", @"matchesTransform", @"matchesOpacity",
+                                @"hidesSourceLayer", @"crossDisplay", @"allowsBackdropGroups", @"sourceLayerOpacityScale"])
+            @try { printf(" %s=%s", key.UTF8String, [[[portal valueForKey:key] description] UTF8String]); } @catch (NSException *e) {}
+        printf("\n");
+    }
+    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1]];
+    char *display[] = {(char *)"mode=display"};
+    caSnapshot(outPath, 1024, 1366, 1, display);
+    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
+    return 0;
+}
+
+// Other processes' contexts shown through CALayerHosts of a displayable context of this one, a row along the top of the display at
+// a quarter of their size, each over a white and a black half (translucent content shows on one), for SECONDS: what a context
+// draws, apart from where its host puts it (pointeruid's pointer windows, as PointerUI logs their context ids). level=L first
+// orders the hosting context elsewhere.
+static int caHostProbe(unsigned seconds, int count, char **ids) {
+    float level = 10000040;
+    if (count && !strncmp(ids[0], "level=", 6)) { level = strtof(ids[0] + 6, NULL); ids++; count--; }
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    const CGFloat whiteValues[] = {1, 1, 1, 1}, blackValues[] = {0, 0, 0, 1};
+    CGColorRef white = CGColorCreate(space, whiteValues), black = CGColorCreate(space, blackValues);
+    id context = caRemoteContext(@{kCAContextDisplayable: @YES});
+    if (!context) { printf("no context\n"); return 1; }
+    [CATransaction begin];
+    CALayer *root = [CALayer layer];
+    root.frame = CGRectMake(0, 0, 1024, 1366);
+    const CGFloat width = 256, height = 342;
+    for (int i = 0; i < count; i++) {
+        CALayer *panel = [CALayer layer], *dark = [CALayer layer];
+        panel.frame = CGRectMake(10 + i * (width + 10), 10, width, height);
+        panel.backgroundColor = white;
+        panel.borderWidth = 1;
+        dark.frame = CGRectMake(0, height / 2, width, height / 2);
+        dark.backgroundColor = black;
+        [panel addSublayer:dark];
+        CALayer *host = ((CALayer * (*)(id, SEL))objc_msgSend)((id)objc_getClass("CALayerHost"), sel_registerName("layer"));
+        host.anchorPoint = CGPointZero;
+        host.frame = CGRectMake(0, 0, 1024, 1366);
+        host.affineTransform = CGAffineTransformMakeScale(0.25, 0.25);
+        host.position = CGPointZero;
+        [host setValue:@((uint32_t)strtoull(ids[i], NULL, 16)) forKey:@"contextId"];
+        [panel addSublayer:host];
+        [root addSublayer:panel];
+    }
+    caShowContext(context, root, level);
+    [CATransaction commit];
+    [CATransaction flush];
+    printf("context %x at level %g hosts %d contexts for %u s\n", caContextId(context), level, count, seconds);
+    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
+    return 0;
+}
+
+// The pointer's own construction (pointeruid's render tree): a CABackdropLayer masked by the pointer's shape, its colorMatrix the
+// vibrant one PointerUI applies (alpha = 0.208 r + 0.232 g + 0.045 b + a - 0.403: a backdrop sampled transparent leaves nothing), in a
+// group at opacity 0.85, shown through a portal. Tiles over whatever is below (no background of their own), a row at y 400 for
+// SECONDS: 0 a backdrop with an inverting colorMatrix (shows that the backdrop sampled anything), 1 a backdrop with gaussianBlur
+// and a white wash (the glass a toolbar is), 2 a backdrop with the pointer's matrix, 3 that masked by a circle, 4 that in a 0.85
+// group, 5 tile 4 through a portal in the same context (source hidden, matchesPosition), 6 through a portal in another context.
+// 7-9 nest it as pointeruid does, 10-11 host it as SpringBoard does (see below). KEY=VALUE sets a number on every backdrop layer (KVC), e.g.
+// allowsInPlaceFiltering=1 as pointeruid's; portal.KEY=VALUE sets a number on every portal (portal.matchesOpacity=1).
+static int caBackdropPairs;
+static char **caBackdropPairList;
+static CALayer *caBackdrop(CGFloat size, NSArray *filters, BOOL masked) {
+    CALayer *backdrop = ((CALayer * (*)(id, SEL))objc_msgSend)((id)objc_getClass("CABackdropLayer"), sel_registerName("layer"));
+    backdrop.frame = CGRectMake(0, 0, size, size);
+    backdrop.filters = filters;
+    for (int k = 0; k < caBackdropPairs; k++) {
+        char *eq = strchr(caBackdropPairList[k], '=');
+        if (eq && strncmp(caBackdropPairList[k], "portal.", 7))
+            [backdrop setValue:@(strtod(eq + 1, NULL)) forKey:[[[NSString alloc] initWithBytes:caBackdropPairList[k]
+                                    length:eq - caBackdropPairList[k] encoding:NSUTF8StringEncoding] autorelease]];
+    }
+    if (masked) {
+        CAShapeLayer *mask = [CAShapeLayer layer];
+        mask.frame = backdrop.bounds;
+        CGPathRef circle = CGPathCreateWithEllipseInRect(CGRectInset(backdrop.bounds, size / 8, size / 8), NULL);
+        mask.path = circle;
+        CGPathRelease(circle);
+        backdrop.mask = mask;
+    }
+    return backdrop;
+}
+
+// portal.KEY=VALUE pairs of cabackdrop, set on each of its portals (pointeruid's system pointer portal: matchesOpacity, matchesTransform
+// and matchesPosition, not hiding its source).
+static void caBackdropPortal(CALayer *portal) {
+    for (int k = 0; k < caBackdropPairs; k++) {
+        char *eq = strchr(caBackdropPairList[k], '=');
+        if (eq && !strncmp(caBackdropPairList[k], "portal.", 7))
+            [portal setValue:@(strtod(eq + 1, NULL)) forKey:[[[NSString alloc] initWithBytes:caBackdropPairList[k] + 7
+                                    length:eq - caBackdropPairList[k] - 7 encoding:NSUTF8StringEncoding] autorelease]];
+    }
+}
+
+static int caBackdropProbe(unsigned seconds, int count, char **pairs) {
+    caBackdropPairs = count;
+    caBackdropPairList = pairs;
+    const CGFloat size = 60, step = 70, top = 400;
+    const float pointerMatrix[20] = {0.03331f, -0.14078f, -0.02729f, 0, 1.05f, -0.07167f, -0.03573f, -0.02735f, 0, 1.05f,
+                                     -0.07173f, -0.14068f, 0.07767f, 0, 1.05f, 0.20796f, 0.23153f, 0.04501f, 1, -0.40335f};
+    const float invertMatrix[20] = {-1, 0, 0, 0, 1, 0, -1, 0, 0, 1, 0, 0, -1, 0, 1, 0, 0, 0, 1, 0};
+    NSValue *(^matrix)(const float *) = ^(const float *m) { return [NSValue valueWithBytes:m objCType:"{CAColorMatrix=ffffffffffffffffffff}"]; };
+    id plainContext = caRemoteContext(@{kCAContextDisplayable: @YES});
+    id portalContext = caRemoteContext(@{kCAContextDisplayable: @YES});
+    if (!plainContext || !portalContext) { printf("no context\n"); return 1; }
+    [CATransaction begin];
+    CALayer *root = [CALayer layer], *portalRoot = [CALayer layer];
+    root.frame = portalRoot.frame = CGRectMake(0, 0, 1024, 1366);
+    NSMutableArray<CALayer *> *tiles = [NSMutableArray array];
+    for (int i = 0; i < 7; i++) {
+        CALayer *tile = [CALayer layer];
+        tile.frame = CGRectMake(10 + i * step, top, size, size);
+        tile.borderWidth = 1;
+        [(i == 6 ? portalRoot : root) addSublayer:tile];
+        [tiles addObject:tile];
+    }
+    [tiles[0] addSublayer:caBackdrop(size, @[caFilter(@"colorMatrix", @{@"inputColorMatrix": matrix(invertMatrix)})], NO)];
+    [tiles[1] addSublayer:caBackdrop(size, @[caFilter(@"gaussianBlur", @{@"inputRadius": @8}),
+                                             caFilter(@"colorMatrix", @{@"inputColorMatrix": matrix(pointerMatrix)})], NO)];
+    [tiles[2] addSublayer:caBackdrop(size, @[caFilter(@"colorMatrix", @{@"inputColorMatrix": matrix(pointerMatrix)})], NO)];
+    [tiles[3] addSublayer:caBackdrop(size, @[caFilter(@"colorMatrix", @{@"inputColorMatrix": matrix(pointerMatrix)})], YES)];
+    CALayer *group = [CALayer layer], *source = [CALayer layer];
+    group.frame = source.frame = CGRectMake(0, 0, size, size);
+    group.opacity = 0.85;
+    group.allowsGroupOpacity = YES;
+    [group addSublayer:caBackdrop(size, @[caFilter(@"colorMatrix", @{@"inputColorMatrix": matrix(pointerMatrix)})], YES)];
+    [tiles[4] addSublayer:group];
+    // The portal's source: tile 4's construction at tile 5's place, hidden there and shown by the portals (pointeruid hides its
+    // rendering window's root and shows the pointer through portals that match its position).
+    CALayer *hiddenGroup = [CALayer layer];
+    hiddenGroup.frame = CGRectMake(0, 0, size, size);
+    hiddenGroup.opacity = 0.85;
+    hiddenGroup.allowsGroupOpacity = YES;
+    [hiddenGroup addSublayer:caBackdrop(size, @[caFilter(@"colorMatrix", @{@"inputColorMatrix": matrix(pointerMatrix)})], YES)];
+    [source addSublayer:hiddenGroup];
+    [tiles[5] addSublayer:source];
+    for (int i = 5; i <= 6; i++) {
+        CALayer *portal = caPortal(source, caContextId(plainContext), size, 0, NULL);
+        if (i == 5) [portal setValue:@YES forKey:@"hidesSourceLayer"];
+        caBackdropPortal(portal);
+        [tiles[i] addSublayer:portal];
+    }
+    // pointeruid's exact nesting: a zero-sized layer with a gaussianBlur of radius 0 (an offscreen filter group), in it a zero-sized
+    // layer at opacity 0.85, in it the masked backdrop: 7 as is, 8 with the outer layers tile-sized, 9 shown through a portal that
+    // matches its position, its source the child of a hidden root (the rendering window's root view is hidden).
+    for (int i = 7; i <= 9; i++) {
+        CALayer *tile = [CALayer layer];
+        tile.frame = CGRectMake(10 + i * step, top, size, size);
+        tile.borderWidth = 1;
+        [root addSublayer:tile];
+        [tiles addObject:tile];
+        CALayer *outer = [CALayer layer], *inner = [CALayer layer];
+        outer.frame = inner.frame = i == 8 ? CGRectMake(0, 0, size, size) : CGRectZero;
+        outer.filters = @[caFilter(@"gaussianBlur", @{@"inputRadius": @0})];
+        inner.opacity = 0.85;
+        inner.allowsGroupOpacity = YES;
+        [inner addSublayer:caBackdrop(size, @[caFilter(@"colorMatrix", @{@"inputColorMatrix": matrix(pointerMatrix)})], YES)];
+        [outer addSublayer:inner];
+        if (i < 9) {
+            [tile addSublayer:outer];
+            continue;
+        }
+        CALayer *hiddenRoot = [CALayer layer], *child = [CALayer layer];
+        hiddenRoot.frame = child.frame = CGRectMake(0, 0, 1024, 1366);
+        hiddenRoot.hidden = YES;
+        outer.position = CGPointMake(10 + i * step, top);
+        [child addSublayer:outer];
+        [hiddenRoot addSublayer:child];
+        [root addSublayer:hiddenRoot];
+        CALayer *portal = caPortal(child, caContextId(plainContext), 1024, 0, NULL);
+        portal.frame = CGRectMake(0, 0, 1024, 1366);
+        [portal setValue:@YES forKey:@"matchesPosition"];
+        caBackdropPortal(portal);
+        [root addSublayer:portal];
+    }
+    // 10 and 11 as SpringBoard hosts pointeruid's windows: a context on the display hosts, bottom to top, the source's context (the
+    // nesting of 7 under a hidden root, as the rendering window at level -1000), an opaque layer over the tile (the wallpaper and
+    // home screen above that window) and the portal's context (the system pointer window at the top), both hosted contexts plain
+    // (10) or secure (11). A backdrop sampled where the source lies finds nothing under it; one sampled at the portal finds the
+    // opaque layer.
+    NSMutableArray *hostedContexts = [NSMutableArray array];
+    for (int i = 10; i <= 11; i++) {
+        NSDictionary *options = i == 11 ? @{kCAContextSecure: @YES} : @{};
+        id sourceContext = caRemoteContext(options), hostedPortalContext = caRemoteContext(options);
+        id hostContext = caRemoteContext(i == 11 ? @{kCAContextDisplayable: @YES, kCAContextSecure: @YES} : @{kCAContextDisplayable: @YES});
+        const CGRect tile = CGRectMake(10 + i * step, top, size, size);
+        CALayer *sourceRoot = [CALayer layer], *hiddenRoot = [CALayer layer], *child = [CALayer layer], *outer = [CALayer layer],
+                *inner = [CALayer layer], *portalRootLayer = [CALayer layer], *hostRoot = [CALayer layer], *cover = [CALayer layer];
+        sourceRoot.frame = hiddenRoot.frame = child.frame = portalRootLayer.frame = hostRoot.frame = CGRectMake(0, 0, 1024, 1366);
+        hiddenRoot.hidden = YES;
+        outer.frame = inner.frame = CGRectZero;
+        outer.position = CGPointMake(CGRectGetMinX(tile), CGRectGetMinY(tile));
+        outer.filters = @[caFilter(@"gaussianBlur", @{@"inputRadius": @0})];
+        inner.opacity = 0.85;
+        inner.allowsGroupOpacity = YES;
+        [inner addSublayer:caBackdrop(size, @[caFilter(@"colorMatrix", @{@"inputColorMatrix": matrix(pointerMatrix)})], YES)];
+        [outer addSublayer:inner];
+        [child addSublayer:outer];
+        [hiddenRoot addSublayer:child];
+        [sourceRoot addSublayer:hiddenRoot];
+        CALayer *portal = caPortal(child, caContextId(sourceContext), 1024, 0, NULL);
+        portal.frame = CGRectMake(0, 0, 1024, 1366);
+        [portal setValue:@YES forKey:@"matchesPosition"];
+        caBackdropPortal(portal);
+        [portalRootLayer addSublayer:portal];
+        const float coverValues[] = {0.2f, 0.35f, 0.6f, 1};
+        CGColorSpaceRef coverSpace = CGColorSpaceCreateDeviceRGB();
+        CGColorRef coverColor = CGColorCreate(coverSpace, (const CGFloat[]){coverValues[0], coverValues[1], coverValues[2], coverValues[3]});
+        cover.frame = tile;
+        cover.backgroundColor = coverColor;
+        const uint32_t hosted[] = {caContextId(sourceContext), 0, caContextId(hostedPortalContext)};
+        for (int h = 0; h < 3; h++) {
+            if (h == 1) { [hostRoot addSublayer:cover]; continue; }
+            CALayer *host = ((CALayer * (*)(id, SEL))objc_msgSend)((id)objc_getClass("CALayerHost"), sel_registerName("layer"));
+            host.frame = CGRectMake(0, 0, 1024, 1366);
+            [host setValue:@(hosted[h]) forKey:@"contextId"];
+            [hostRoot addSublayer:host];
+        }
+        caShowContext(sourceContext, sourceRoot, 0);
+        caShowContext(hostedPortalContext, portalRootLayer, 0);
+        caShowContext(hostContext, hostRoot, 10000051 + i);
+        [hostedContexts addObjectsFromArray:@[sourceContext, hostedPortalContext, hostContext]];
+    }
+    caShowContext(plainContext, root, 10000050);
+    caShowContext(portalContext, portalRoot, 10000049);
+    [CATransaction commit];
+    [CATransaction flush];
+    printf("contexts %x %x; tiles at y %g..%g, x 10 + %g i\n", caContextId(plainContext), caContextId(portalContext), top, top + size, step);
+    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
+    return 0;
+}
+
 static int compileMetal(const char *sourcePath, const char *outPath, const char *options) {
     void *library = dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_NOW);
     void *(*create)(const char *) = library ? dlsym(library, "MTLCodeGenServiceCreate") : NULL;
@@ -3375,6 +3856,20 @@ int main(int argc, char **argv) {
             return ioregDump(argv[2]);
         if (argc >= 2 && !strcmp(argv[1], "motion"))
             return motionProbe(argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 5);
+        if (argc >= 5 && !strcmp(argv[1], "casnap"))
+            return caSnapshot(argv[2], (unsigned)strtoul(argv[3], NULL, 0), (unsigned)strtoul(argv[4], NULL, 0), argc - 5, argv + 5);
+        if (argc >= 2 && !strcmp(argv[1], "cabackdrop"))
+            return caBackdropProbe(argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 30, argc > 3 ? argc - 3 : 0, argv + 3);
+        if (argc >= 4 && !strcmp(argv[1], "cahost"))
+            return caHostProbe((unsigned)strtoul(argv[2], NULL, 0), argc - 3, argv + 3);
+        if (argc >= 3 && !strcmp(argv[1], "cafilter"))
+            return caFilterProbe(argv[2], argc >= 4 ? (unsigned)strtoul(argv[3], NULL, 0) : 20, argc > 4 ? argc - 4 : 0, argv + 4);
+        if (argc >= 3 && !strcmp(argv[1], "cadebug")) {
+            int option = atoi(argv[2]);
+            if (argc >= 4) CARenderServerSetDebugOption(0, option, atoi(argv[3]));
+            printf("debug option %d = %d\n", option, CARenderServerGetDebugOption(0, option));
+            return 0;
+        }
         if (argc >= 2 && !strcmp(argv[1], "display")) {
             dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_NOW);
             return displayInfo();
