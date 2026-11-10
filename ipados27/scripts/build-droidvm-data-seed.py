@@ -41,7 +41,13 @@ import tomllib
 
 SCRATCH = Path('/tmp') / f'droidvm27-seed-{os.environ.get("USER", "build")}'
 # The preferences the seed carries (seed-data-prefs.py USER:DOMAIN:KEY=VALUE).
-PREFS = ['mobile:com.apple.coreanimation:CAEnableMedina=false', 'root:com.apple.coreanimation:CAEnableMedina=false']
+# BKForceMirroredOrientation: backboardd turns the main CoreAnimation display with the interface (its mirrored-display orientation,
+# whose source is the main display itself); a display that does not rotate its scanout (this one: no compressed framebuffer) then
+# has CoreAnimation render every frame into a rotated framebuffer texture, where its path coverage (shape masks of curves: the
+# pointer's arrow) takes the surface's unrotated extent for the frame's and draws nothing. Held at portrait, the display renders
+# unrotated: the same pixels, the masks drawn, and no rotated framebuffer to turn in and out on each pass.
+PREFS = ['mobile:com.apple.coreanimation:CAEnableMedina=false', 'root:com.apple.coreanimation:CAEnableMedina=false',
+         'mobile:com.apple.backboardd:BKForceMirroredOrientation=portrait']
 # The processes besides the render server that get a native Metal device (the board's droidvm-gpu-clients), as on iPadOS 17.
 GPU_CLIENTS = 'WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService'
 

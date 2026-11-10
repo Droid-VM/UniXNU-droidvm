@@ -59,6 +59,7 @@ the environment wins):
 | `touch.py tap X Y`, `touch.py swipe X0 Y0 X1 Y1` | Touch the guest screen (pixels of the framebuffer) by writing NativeHidInput's finger set |
 | `load-modules.sh` | Load the DroidVM app's kernel modules after the phone itself restarted |
 | `show-vm.sh` | Bring a fresh native VM display to the front; selects the enabled `gpu-0` or `simplefb` screen and dimensions from config (a VM restart closes it) |
+| `guest-pref.py USER DOMAIN KEY=VALUE... [--restart PROCESS]` | Merge preference values into a running guest's Data (what `build-droidvm-data-seed.py`'s PREFS put in a new seed, e.g. `mobile com.apple.backboardd BKForceMirroredOrientation=portrait --restart backboardd`) |
 | `export.py kill PID [SIGNAL]` | Signal a guest process, e.g. a SpringBoard deadlocked at launch (launchd restarts it) |
 | `export.py mem PID ADDRESS [LENGTH]`, `umem.py` | Read a guest process's user memory (hex dump; `umem.read`/`umem.q` for scripted pointer walks) |
 | `logarchive.py OUT` | Mirror the guest's unified log (diagnostics + uuidtext) for a tracev3 parser such as mandiant/macos-UnifiedLogs (`unifiedlog_iterator -m log-archive`) or macOS `log show --archive`; each tree is listed with its sizes in one request (`export.py tree`), and reruns fetch only what changed |
