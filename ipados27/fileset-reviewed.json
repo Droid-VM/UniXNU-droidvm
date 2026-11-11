@@ -473,6 +473,15 @@
         "__DATA,__common"
       ],
       "evidence": "The arg1 of the sandbox's sysctl OID \"audio_active\" (\"Audio active\", format I): a 32-bit kernel global that the EXC_RESOURCE path reads as `disable_exc_resource_during_audio && audio_active && task->task_jetsam_realtime_audio` (osfmk/kern/task.c, exported in Private.exports)."
+    },
+    {
+      "original": "0xfffffe0007e00ad8",
+      "native_symbol": "_PAGE_SHIFT_CONST",
+      "sections": [
+        "__DATA_CONST,__const",
+        "__DATA_CONST,__const"
+      ],
+      "evidence": "The kernel's page shift (vm_param.h PAGE_SHIFT_CONST), read by the kexts that size pages themselves: APFS's cluster pagein divides a byte range by it. The matcher paired it by its users until the serial console (droidvm-serial-uarts.patch) gave cons_ops_index, another word of __DATA_CONST,__const, references of the same shape; reference-data then bound it to cons_ops_index (0 or 1), APFS asked upl_page_present(upl, 0x7fff) for an eight-page UPL, and every boot panicked in launchd's first page-ins."
     }
   ]
 }

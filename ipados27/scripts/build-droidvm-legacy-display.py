@@ -421,8 +421,8 @@ compile_cpp(support, OUT / 'LegacyDisplaySupport27.o')
 # first poll, as the native __DATA must fit the original kernel's slot of the fileset before the first kext's data), answered
 # every 100 ms by a worker that native_touch_probe starts with droidvm-monitor=<ms>, as the iPadOS 17 board's DroidVMStubs.c
 # does; native_touch_probe also sets the calendar clock (DroidVMClock.c), starts the virtio-input devices (DroidVMVirtioInput.c,
-# build-droidvm-hid-input.py), the network, sound and media devices, the battery and the vCPUs' performance requests to the
-# host (DroidVMCpufreq.c; build-droidvm-devices.py), and holds the touch globals the input devices publish (without the iPadOS
+# build-droidvm-hid-input.py), the network, sound, media and virtio-console devices, the battery and the vCPUs' performance
+# requests to the host (DroidVMCpufreq.c; build-droidvm-devices.py), and holds the touch globals the input devices publish (without the iPadOS
 # 17 board's process and trace probes).
 monitor = OUT / 'DroidVMMonitor27.c'
 monitor.write_text('''// SPDX-License-Identifier: BSD-2-Clause-Patent
@@ -436,6 +436,7 @@ extern void droidvm_input_start(void);
 extern void droidvm_net_start(void);
 extern void droidvm_snd_start(void);
 extern void droidvm_media_start(void);
+extern void droidvm_console_start(void);
 extern int droidvm_battery_attach(void);
 extern int droidvm_software_aes_attach(void);
 extern int droidvm_vt_paravirt_attach(void);
@@ -476,6 +477,7 @@ void native_touch_probe(void) {
     droidvm_net_start();
     droidvm_snd_start();
     droidvm_media_start();
+    droidvm_console_start();
     droidvm_vt_paravirt_attach();
     droidvm_battery_attach();
     droidvm_cpufreq_attach();

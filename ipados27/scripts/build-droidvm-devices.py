@@ -10,7 +10,8 @@ iPadOS 17 board's scripts/build-native-legacy-display.py builds them:
   - the speaker and microphone (DroidVMAudio.cpp, linked under the original IOAudio2Family's classes at attach) over virtio-snd
     (DroidVMVirtioSnd.c), the battery (DroidVMBattery.cpp, an IOPMPowerSource over crosvm's goldfish battery), the motion sensors'
     command channel CoreMotion opens as the sensor processor's (DroidVMSensorProcessor.cpp), the virtio-media
-    devices (DroidVMVirtioMedia.c), VideoToolbox's paravirtualization channel (DroidVMVTParavirt.cpp, Apple's names), the vCPUs' performance requests to the host (DroidVMCpufreq.c, crosvm's virtual cpufreq) and
+    devices (DroidVMVirtioMedia.c), the virtio-console ports as BSD terminals (DroidVMVirtioConsole.c, /dev/cu.NAME, compiled with a
+    BSD file's flags for the tty and devfs interfaces), VideoToolbox's paravirtualization channel (DroidVMVTParavirt.cpp, Apple's names), the vCPUs' performance requests to the host (DroidVMCpufreq.c, crosvm's virtual cpufreq) and
     the scheduler trace the host reads from guest RAM (DroidVMSchedTrace.c, droidvm-sched-trace.patch).
 
 The transports take their rings and buffers from a region allocated when the device starts (DROIDVM_DEVICE_DYNAMIC,
@@ -146,6 +147,10 @@ def main():
         source = ROOT / 'kits/droidvm' / f'{name}.c'
         objects.append(command(c_mach, source, OUT / f'{name}.o', ('-DDROIDVM_DEVICE_DYNAMIC=1',)))
         sources.append(source)
+    console_source = ROOT / 'kits/droidvm/DroidVMVirtioConsole.c'
+    objects.append(command(record('bsd/DEVELOPMENT/kern_exec.o.json'), console_source, OUT / 'DroidVMVirtioConsole.o',
+                           ('-DDROIDVM_DEVICE_DYNAMIC=1',)))
+    sources.append(console_source)
     sources += [ROOT / 'kits/droidvm/DroidVMDmaRegion.h', ROOT / 'kits/droidvm/DroidVMWifi.inc', ROOT / 'kits/droidvm/DroidVMVTWire.h']
     # SoftwareAES's NativeAES, from a staged copy compiled with component:SoftwareAES's own command: the hardware keys the guest is
     # asked for derived in software (SoftwareAESKeys.inc), its static initializer staged for DroidVMSoftwareAES.cpp's registration,
@@ -183,7 +188,7 @@ def main():
     (OUT / 'sources.json').write_text(json.dumps([rel(p) for p in sources], indent=2) + '\n')
     (OUT / 'report.json').write_text(json.dumps(dict(
         ionetworking=dict(tag=IONET_TAG, commit=IONET_COMMIT), objects={rel(p): sha(p) for p in objects}), indent=2) + '\n')
-    print(f'devices: {len(objects)} objects ({IONET_TAG}, ethernet, sound, battery, media, cpufreq, sched trace)')
+    print(f'devices: {len(objects)} objects ({IONET_TAG}, ethernet, sound, battery, media, console, cpufreq, sched trace)')
 
 
 if __name__ == '__main__':

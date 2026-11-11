@@ -301,15 +301,23 @@ def describe(fdt):
     battery = [pair for path, props in fdt.items()
                if 'google,goldfish-battery' in strings_of(props.get('compatible', b''))
                for pair in reg_pairs(props['reg'])]
-    # The SBSA UART (crosvm pl011@6000, FDT stdout-path): XNU's VMAPPLE_UART path is a PL011 driver and finds it by the ADT
-    # node named "uart0" (soc_base + reg). It gives XNU a working serial console on this crosvm VM -- BCM2837's own PI3 mini-UART
-    # (the board default) is not emulated by crosvm, so without this XNU's console is silent. REQUIRES the kernel built with
-    # VMAPPLE_UART defined for this board (not yet; see plans/UNIXNUSETTING.md). Inert otherwise -- an unused ADT node.
+    # The serial ports, as DarwinBoot's FdtAdt.c adds them with --dynamic. The SBSA UART (crosvm pl011@6000, --serial
+    # hardware=sbsa) is /arm-io/uart0: xnu-12377's PL011_UART driver (patches/xnu-12377/droidvm-serial-uarts.patch) takes it by
+    # its compatible, iPadOS 17's VMAPPLE_UART path by its name. The 16550 COM ports (ns16550a, always four in crosvm, the
+    # unconnected ones writing nowhere) are com1..com4 in the FDT's order, crosvm's num; they lie below the arm-io base, so
+    # their reg offset wraps (the kernel's serial driver adds it to the base). /defaults droidvm,serial-device names the console:
+    # the UART /chosen stdout-path names (crosvm writes it for an SBSA console), else the SBSA UART. Not the standard
+    # serial-device, which xnu-12377 panics on when it has no driver for the UART (a kernel without droidvm-serial-uarts.patch).
     pl011 = [reg_pairs(props['reg'])[0] for path, props in fdt.items()
              if 'arm,pl011' in strings_of(props.get('compatible', b''))]
     sbsa_uart = pl011[0] if pl011 else None
     if sbsa_uart and not (ARMIO_BASE <= sbsa_uart[0] < sbsa_uart[0] + sbsa_uart[1] <= ARMIO_BASE + ARMIO_SIZE):
         raise SystemExit(f'pl011 window {sbsa_uart[0]:#x}+{sbsa_uart[1]:#x} lies outside the arm-io window')
+    coms = [reg_pairs(props['reg'])[0] for path, props in fdt.items()
+            if 'ns16550a' in strings_of(props.get('compatible', b''))][:4]
+    stdout = fdt.get('/chosen', {}).get('stdout-path', b'').rstrip(b'\0').decode()
+    unit = re.match(r'[0-9a-fA-F]+', stdout.split('@', 1)[1]) if '@' in stdout else None
+    stdout_address = int(unit.group(0), 16) if unit else None
     # Each CPU's cluster type from its capacity-dmips-mhz (crosvm --cpu-capacity, the host core under the vCPU), as DarwinBoot
     # derives it at boot: P for the highest, E below it, P for all when they are equal or one has none. An AMP kernel panics on a
     # CPU of no cluster type (cluster_type_to_pset_type), so every cpu node carries one.
@@ -318,7 +326,8 @@ def describe(fdt):
     cluster_types = {reg: ('E' if differ and capacity < max(capacities) else 'P') for (reg, _), capacity in zip(cpus, capacities)}
     return dict(cpu_regs=[reg for reg, _ in cpus], cluster_types=cluster_types, gic=(dist, dist_size, redist, redist_size),
                 psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size,
-                virtio_mmio=virtio, drm_host_pool=drm_host, media_host_pool=media_host, battery=battery, sbsa_uart=sbsa_uart)
+                virtio_mmio=virtio, drm_host_pool=drm_host, media_host_pool=media_host, battery=battery, sbsa_uart=sbsa_uart,
+                coms=coms, stdout_address=stdout_address)
 
 
 def main():
@@ -375,6 +384,9 @@ def main():
                         help='Comma-separated bases of the FDT virtio-mmio windows of the virtio-media devices (/arm-io/virtio-media-N)')
     parser.add_argument('--dynamic', action='store_true',
                         help='/chosen darwinboot-fdt: DarwinBoot fills in the RAM and the /arm-io devices from the firmware FDT at boot')
+    parser.add_argument('--console-mmio', default='',
+                        help='Comma-separated virtio-mmio window bases of crosvm --virtio-mmio-console devices '
+                             '(/arm-io/virtio-console-N, package/DroidVMVirtioConsole.c)')
     parser.add_argument('--battery', action='store_true',
                         help='Emit /arm-io/battery from the FDT goldfish-battery node (crosvm --battery type=goldfish)')
     parser.add_argument('--boot-video-mib', type=int, default=0,
@@ -456,9 +468,29 @@ def main():
         media_bases = [int(value, 0) for value in args.media_mmio.split(',') if value]
     except ValueError:
         parser.error('--media-mmio takes comma-separated addresses')
+    try:
+        console_bases = [int(value, 0) for value in args.console_mmio.split(',') if value]
+    except ValueError:
+        parser.error('--console-mmio takes comma-separated addresses')
     virtio_mmio = [window for window in vm['virtio_mmio']
                    if window[0] not in (args.data_store_mmio, args.net_mmio, args.virtio_gpu_mmio, args.snd_mmio)
-                   and window[0] not in input_bases and window[0] not in media_bases]
+                   and window[0] not in input_bases and window[0] not in media_bases and window[0] not in console_bases]
+    consoles = [window for base in console_bases for window in vm['virtio_mmio'] if window[0] == base]
+    if len(consoles) != len(console_bases) or len(set(console_bases)) != len(console_bases) or \
+            any(base in input_bases or base in media_bases or
+                base in (args.data_store_mmio, args.net_mmio, args.virtio_gpu_mmio, args.snd_mmio) for base in console_bases):
+        parser.error('each --console-mmio address must be a virtio-mmio window of the FDT of its own')
+    # The serial console (/defaults droidvm,serial-device), as DarwinBoot picks it: the UART stdout-path names, else the SBSA UART.
+    uart_phandle = 0x44560000
+    console_phandle = None
+    if not args.dynamic:
+        if vm.get('sbsa_uart'):
+            console_phandle = uart_phandle
+        for index, (address, _) in enumerate(vm['coms']):
+            if address == vm['stdout_address']:
+                console_phandle = uart_phandle + 1 + index
+        if vm.get('sbsa_uart') and vm['sbsa_uart'][0] == vm['stdout_address']:
+            console_phandle = uart_phandle
     data_store = [window for window in vm['virtio_mmio'] if window[0] == args.data_store_mmio]
     if args.data_store_mmio is not None and not data_store:
         parser.error(f'the FDT has no virtio-mmio window at {args.data_store_mmio:#x} for --data-store-mmio')
@@ -549,7 +581,8 @@ def main():
         # the BCM2837 configuration this 4K kernel is built from clips the limit to its CONFIG_VNODES (1024, a Raspberry Pi 3), and the
         # vnode jetsam then kills every idle process, an app's prewarmed instance among them, as soon as the system holds ~2000 vnodes.
         node('defaults', [('sleep-disabled', struct.pack('<I', 1)), ('vmm-present', struct.pack('<I', 1)),
-                          ('kern.maxvnodes', struct.pack('<I', kernel_memory // 0x10000 + 1024))]),
+                          ('kern.maxvnodes', struct.pack('<I', kernel_memory // 0x10000 + 1024)),
+                          *([('droidvm,serial-device', struct.pack('<I', console_phandle))] if console_phandle is not None else [])]),
         node('options', []),
         # bluetoothd: the controller it finds by name (IOServiceNameMatching "marconi-bt", then "bluetooth"; a top-level node gets
         # its nub from the platform expert as wlan's does). transport-encoding 10 is iPadOS 27's virtual transport ("HCI Transport
@@ -623,13 +656,23 @@ def main():
                                                     *[('media-host-pool', struct.pack('<QQ', *pool))
                                                       for pool in vm['media_host_pool']]])
                   for index, (address, size) in enumerate(media)],
+                *[node('virtio-console-%d' % index, [('compatible', b'droidvm,virtio-console\0'),
+                                                      ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
+                                                      ('dma-coherent', b'')])
+                  for index, (address, size) in enumerate(consoles)],
                 *[node('battery', [('compatible', b'google,goldfish-battery\0'),
                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size))])
                   for address, size in (vm['battery'] if args.battery else [])],
-                # XNU's VMAPPLE_UART (PL011) console: found by name "uart0", mapped at soc_base + reg (soc_base = ARMIO_BASE).
+                # The serial ports (see describe): uart0 for the SBSA UART, com1..com4 for the COM ports, a reg offset below the
+                # arm-io base wrapping, each with the AAPL,phandle /defaults droidvm,serial-device may name.
                 *([node('uart0', [('compatible', b'arm,pl011\0'),
-                                  ('reg', struct.pack('<QQ', vm['sbsa_uart'][0] - ARMIO_BASE, vm['sbsa_uart'][1]))])]
-                  if vm.get('sbsa_uart') else [])
+                                  ('reg', struct.pack('<QQ', vm['sbsa_uart'][0] - ARMIO_BASE, vm['sbsa_uart'][1])),
+                                  ('AAPL,phandle', struct.pack('<I', uart_phandle))])]
+                  if vm.get('sbsa_uart') else []),
+                *[node('com%d' % (index + 1), [('compatible', b'ns16550a\0'),
+                                               ('reg', struct.pack('<QQ', (address - ARMIO_BASE) % (1 << 64), size)),
+                                               ('AAPL,phandle', struct.pack('<I', uart_phandle + 1 + index))])
+                  for index, (address, size) in enumerate(vm['coms'])]
               ])]),
     ])
     args.output.parent.mkdir(parents=True, exist_ok=True)

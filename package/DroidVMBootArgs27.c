@@ -52,6 +52,10 @@ char PE_builtin_boot_args[] =
     // timebase ticks: 12.5 ms here): a stackshot takes the debugger, and a vCPU the host keeps off its core longer than that made it
     // a panic ("Resuming from debugger synchronization failed", osanalyticshelper's stackshot at boot, 2026-11-01)
     "ml-timeout-debug-ack-scale=40 "
+    // the serial console on the VM's console UART, when it has one (patches/xnu-12377/droidvm-serial-uarts.patch; DarwinBoot names
+    // it in /defaults droidvm,serial-device): the kernel's output there, and the serial keyboard feeding /dev/console what the host types
+    // (ownervisor's serial-shell). A VM without a console UART clears it at boot and runs as a kernel without it.
+    "serial=3 "
     // the processes besides the render server that get the accelerator's user client and a native Metal device (the launch
     // policy writes the plugin's NativeAdrenoMetal.clients from it at every boot): "*", every process, as on an iPad, the sandbox
     // deciding each open as for Apple's GPU (DroidVMGpu.cpp grantedProcesses, droidvm-gpu-sandbox-first.patch). A named list

@@ -1,0 +1,200 @@
+The serial devices crosvm emulates as the kernel's serial console: the SBSA UART (a PL011 subset, xnu-12377's own PL011_UART
+driver, "arm,pl011") and a 16550 COM port (a new NS16550_UART driver, "ns16550a": byte registers one byte apart, polled). xnu-12377
+takes the one device a phandle names: the ADT's /defaults serial-device, the boot-arg serial-device-name=NODE, and here
+/defaults droidvm,serial-device as well, which DarwinBoot sets to the VM's console UART (FdtAdt.c) under a name only this kernel
+reads -- the standard property naming a UART an unpatched kernel has no driver for panics it before its console. serial=3 is built
+in (DroidVMBootArgs27.c): output and the serial keyboard (the 16 ms poll feeding /dev/console); a VM without a console UART
+clears it, so it runs as before and polls nothing.
+
+The fileset matcher paired the original kernel's PAGE_SHIFT_CONST with cons_ops_index once this code referenced it (APFS then
+paged in with a page shift of 0 or 1): ipados27/fileset-reviewed.json holds the pairing.
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index e8db5d8..c76a291 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -637,6 +637,13 @@ arm_init(
+ 	if (kern_feature_override(KF_SERIAL_OVRD)) {
+ 		serialmode = 0;
+ 	}
++	/*
++	 * DroidVM: the board builds serial=3 in (DroidVMBootArgs27.c); a VM with no console UART (no /defaults droidvm,serial-device)
++	 * runs as a kernel without the argument, and starts no serial keyboard thread to poll a device that is not there.
++	 */
++	if (!serial_exists) {
++		serialmode = 0;
++	}
+ 
+ 	/* Start serial if requested and a serial device was enumerated in serial_init(). */
+ 	if ((serialmode & SERIALMODE_OUTPUT) && serial_exists) {
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 032d9e0..4a283ec 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -733,6 +733,108 @@ pl011_uart_setup(const DeviceTreeNode *const devicetree_node)
+ 
+ /*****************************************************************************/
+ 
++#ifdef NS16550_UART
++
++/*
++ * DroidVM: a 16550 UART ("ns16550a"), as crosvm emulates its four COM ports: byte-wide registers one byte apart (no
++ * reg-shift), polled, no FIFO interrupts. Each access is one ldrb/strb on a plain base register, which a hypervisor's MMIO
++ * trap decodes (no writeback, no pair). The devicetree node's reg is relative to the SoC base, as the other drivers'; a
++ * COM port below that base gives an offset that wraps, and the sum is its address.
++ */
++static vm_offset_t ns16550_base = 0;
++
++#define NS16550_RBR_THR 0x0     /* receive buffer / transmit holding (DLAB 0), divisor latch low (DLAB 1) */
++#define NS16550_IER     0x1     /* interrupt enable (DLAB 0), divisor latch high (DLAB 1) */
++#define NS16550_FCR     0x2     /* FIFO control (write) */
++#define NS16550_LCR     0x3     /* line control */
++#define NS16550_MCR     0x4     /* modem control */
++#define NS16550_LSR     0x5     /* line status */
++#define NS16550_LSR_DR   0x01   /* a received byte is waiting */
++#define NS16550_LSR_THRE 0x20   /* the transmit holding register is empty */
++
++static uint8_t
++ns16550_read(unsigned int offset)
++{
++	uint32_t value;
++	__asm__ volatile ("ldrb %w0, [%1]" : "=r"(value) : "r"(ns16550_base + offset) : "memory");
++	return (uint8_t)value;
++}
++
++static void
++ns16550_write(unsigned int offset, uint8_t value)
++{
++	__asm__ volatile ("strb %w0, [%1]" :: "r"((uint32_t)value), "r"(ns16550_base + offset) : "memory");
++}
++
++static unsigned int
++ns16550_uart_transmit_ready(void)
++{
++	return (ns16550_read(NS16550_LSR) & NS16550_LSR_THRE) != 0;
++}
++
++static void
++ns16550_uart_transmit_data(uint8_t c)
++{
++	ns16550_write(NS16550_RBR_THR, c);
++}
++
++static unsigned int
++ns16550_uart_receive_ready(void)
++{
++	return (ns16550_read(NS16550_LSR) & NS16550_LSR_DR) != 0;
++}
++
++static uint8_t
++ns16550_uart_receive_data(void)
++{
++	return ns16550_read(NS16550_RBR_THR);
++}
++
++static void
++ns16550_uart_init(void)
++{
++	ns16550_write(NS16550_IER, 0x00);        // no interrupts: polled
++	ns16550_write(NS16550_LCR, 0x80);        // DLAB: the divisor latch
++	ns16550_write(NS16550_RBR_THR, 0x01);    // 115200 baud from the 1.8432 MHz clock
++	ns16550_write(NS16550_IER, 0x00);
++	ns16550_write(NS16550_LCR, 0x03);        // 8-N-1, DLAB off
++	ns16550_write(NS16550_FCR, 0x07);        // FIFOs on and cleared
++	ns16550_write(NS16550_MCR, 0x03);        // DTR and RTS, no loopback
++}
++
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) ns16550_uart_serial_functions =
++{
++	.init = ns16550_uart_init,
++	.transmit_ready = ns16550_uart_transmit_ready,
++	.transmit_data = ns16550_uart_transmit_data,
++	.receive_ready = ns16550_uart_receive_ready,
++	.receive_data = ns16550_uart_receive_data,
++	.device = SERIAL_NS16550_UART
++};
++
++static void
++ns16550_uart_setup(const DeviceTreeNode *const devicetree_node)
++{
++	const struct {
++		uint64_t block_offset;
++		uint64_t block_size;
++	} *reg;
++	unsigned int reg_size;
++	if (SecureDTGetProperty(devicetree_node, "reg", (const void **)&reg, &reg_size) != kSuccess) {
++		panic("Unable to find the 'reg' property on the 16550 UART devicetree node");
++	}
++	assert(reg_size == sizeof(*reg));
++
++	const vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++	ns16550_base = ml_io_map(soc_base_phys + reg->block_offset, reg->block_size);
++
++	register_serial_functions(&ns16550_uart_serial_functions);
++}
++
++#endif /* NS16550_UART */
++
++/*****************************************************************************/
++
+ /**
+  * Output @str onto every registered serial interface by polling.
+  *
+@@ -809,6 +911,9 @@ static const struct {
+ #ifdef PL011_UART
+ 	{ .compatible = "arm,pl011", .setup = pl011_uart_setup },
+ #endif // PL011_UART
++#ifdef NS16550_UART
++	{ .compatible = "ns16550a", .setup = ns16550_uart_setup },
++#endif // NS16550_UART
+ };
+ 
+ /**
+@@ -838,6 +943,14 @@ get_serial_device_phandle(uint32_t * const phandle)
+ 		assert(defaults_phandle_size == sizeof(*defaults_phandle));
+ 		*phandle = *defaults_phandle;
+ 		serial_device_phandle_specified = true;
++	} else if (SecureDTGetProperty(defaults_node, "droidvm,serial-device", (const void **)&defaults_phandle,
++	    &defaults_phandle_size) == kSuccess && defaults_phandle_size == sizeof(*defaults_phandle)) {
++		/*
++		 * DroidVM: DarwinBoot names the VM's console UART under a name of its own, which only a kernel with these
++		 * drivers reads; a serial-device naming a UART a kernel has no driver for panics below.
++		 */
++		*phandle = *defaults_phandle;
++		serial_device_phandle_specified = true;
+ 	}
+ 
+ 	// Allow people to manually specify a serial device phandle via bootarg.
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index f8fcbc2..5785ba7 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -47,7 +47,8 @@ typedef enum serial_device {
+ 	SERIAL_APPLE_UART=0x1,
+ 	SERIAL_DOCKCHANNEL=0x2,
+ 	SERIAL_PL011_UART=0x4,
+-	SERIAL_DCC_UART=0x8
++	SERIAL_DCC_UART=0x8,
++	SERIAL_NS16550_UART=0x10
+ } serial_device_t;
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);
+diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
+index 6ace0b0..17cb1ab 100644
+--- a/pexpert/pexpert/arm64/BCM2837.h
++++ b/pexpert/pexpert/arm64/BCM2837.h
+@@ -18,6 +18,14 @@
+ #define BCM2837
+ #define ARM_ARCH_TIMER
+ 
++/*
++ * DroidVM: the serial devices crosvm emulates. pe_serial.c takes the one the ADT's /defaults droidvm,serial-device names (DarwinBoot
++ * points it at the VM's console UART), by its compatible: "arm,pl011" for the SBSA UART (a PL011 subset), "ns16550a" for a
++ * 16550 COM port. A VM without either has no such property and no serial console, as before.
++ */
++#define PL011_UART
++#define NS16550_UART
++
+ #define __ARM_ARCH__              8
+ #define __ARM_VMSA__              8
+ #define __ARM_VFP__               4
