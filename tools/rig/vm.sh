@@ -5,6 +5,8 @@
 #   vm.sh start [WAIT]     the same, without stopping it first
 #   vm.sh stop             stop it
 #   vm.sh attach           put its display on the phone's screen again, until a touch reaches the guest
+#   vm.sh pool             the hugepage pool; exits 1 when it would be short after a stop (pages neither in the pool nor
+#                          held by a running VM)
 #   vm.sh health           health.py
 # The VM is stopped the way the app's own stop does it, but without the daemon (which can abort on a VM stop;
 # daemon-recover.sh brings it back): crosvm's `stop` on the VM's control socket, so crosvm exits through its devices'
@@ -42,6 +44,16 @@ pool_line() {
   local avail want vms live orphan acquiring state
   read -r avail want vms live orphan acquiring state < <(pool)
   echo "pool $avail/$want 2 MiB pages, active VMs $vms, live $live, orphan $orphan, acquiring $acquiring"
+}
+# Before a stop: would the pool be whole again afterwards? What is in the pool and what the running VMs hold must add up to
+# pool_want; pages missing from both would have to be gathered from the host's memory before the next start, and a host whose
+# contiguous memory is used up does not give them (the VM then stays down).
+pool_covers() {
+  local avail want vms live orphan acquiring state
+  have_pool || { echo "no gh_hugepage_reserve on the phone: no pool to check"; return 0; }
+  read -r avail want vms live orphan acquiring state < <(pool)
+  echo "pool $avail/$want 2 MiB pages, active VMs $vms, live $live, orphan $orphan, acquiring $acquiring"
+  [ "$((avail + live))" -ge "$want" ] 2>/dev/null
 }
 have_pool() { [ -n "$($A shell "su -c 'test -d $POOL && echo y'")" ]; }
 pool_whole() {
@@ -197,6 +209,7 @@ case "${1:-}" in
   start) start "${2:-240}" ;;
   stop) stop ;;
   attach) attach ;;
+  pool) pool_covers ;;
   health) python3 "$RIG/health.py" ;;
-  *) sed -n '2,12p' "$0"; exit 2 ;;
+  *) sed -n '2,14p' "$0"; exit 2 ;;
 esac

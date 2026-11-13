@@ -5,3 +5,23 @@
 kind = "soc"
 name = "crosvm-gunyah"
 local = "../socs/crosvm-gunyah"
+
+# ownervisor, the debug shell (github.com/Droid-VM/ownervisor), at the commit that builds for arm64e
+# (DROIDVM_IOS_TARGET=arm64e-apple-ios27.0). The iPadOS 17 board takes it as a kit (../feeds.toml); a schema 2 tree holds only the
+# catalog's components as kits, so here it is a reference source (refer/ownervisor), which scripts/build-droidvm-all.py passes
+# to ../scripts/build-droidvm-ownervisor.py as OWNERVISOR.
+[[source]]
+name = "ownervisor"
+kind = "refer"
+git = "https://github.com/Droid-VM/ownervisor.git"
+ref = "main"
+commit = "c6c8b2ac078cd04c0c2abc959bc46084d2e65d95"
+
+# applebox, the debug shell's multicall binary of Apple's command-line tools: ownervisor's build.py pins an older commit, which
+# does not build for arm64e; the build passes this checkout (refer/applebox) as APPLEBOX.
+[[source]]
+name = "applebox"
+kind = "refer"
+git = "https://github.com/Droid-VM/applebox.git"
+ref = "main"
+commit = "6e3b47149e0e460636e7a95bba9d48e12170a925"

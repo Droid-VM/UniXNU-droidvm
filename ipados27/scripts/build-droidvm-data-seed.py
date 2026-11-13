@@ -175,11 +175,11 @@ def main():
         if args.tools:
             # The debug shell and the tools, where add-ownervisor-data.py looks for them (the seed tree's build/).
             for name in ('debug-shell', 'toybox', 'gfxprobe', 'ipatool', 'lsdiag'):
-                source, target = args.tools.resolve() / 'build' / name, root / 'build' / name
+                built, target = args.tools.resolve() / 'build' / name, root / 'build' / name
                 if target.exists():
                     shutil.rmtree(target)
-                if source.is_dir():
-                    shutil.copytree(source, target, symlinks=True)
+                if built.is_dir():
+                    shutil.copytree(built, target, symlinks=True)
             with_tools = work / f'data-{args.gib}g-27-ov.dbr'
             run(['python3', root / 'scripts/add-ownervisor-data.py', staged, with_tools], cwd=root)
             staged = with_tools
