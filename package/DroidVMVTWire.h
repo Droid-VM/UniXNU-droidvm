@@ -242,6 +242,7 @@ public:
     void u32(uint32_t key, uint32_t v) { uint8_t b[4]; put32(b, v); para(key, cc("=u32"), b, 4); }
     void s64(uint32_t key, int64_t v) { uint8_t b[8]; put64(b, uint64_t(v)); para(key, cc("=s64"), b, 8); }
     void uuid(uint32_t key, const uint8_t *u) { para(key, cc("=uui"), u, 16); }
+    void uuids(uint32_t key, const uint8_t *u, uint32_t count) { para(key, cc("=uu+"), u, 16 * count); }   // a CFUUID array
     void plist(uint32_t key, const Plist &p, int top) {
         uint8_t prefix[16];
         const uint32_t start = len;

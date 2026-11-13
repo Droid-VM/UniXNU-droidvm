@@ -49,6 +49,7 @@
 #include <kern/thread.h>
 #include <stdarg.h>
 #include "DroidVMVTWire.h"
+#include <pexpert/pexpert.h>
 
 using namespace vtwire;
 
@@ -73,6 +74,7 @@ kern_return_t mach_port_deallocate(ipc_space_t space, mach_port_name_t name);
 // For the host rig (peek.py): sessions made, frames given, frames emitted, errors; the last error's stage and value.
 volatile uint32_t droidvm_vthost_sessions, droidvm_vthost_frames_in, droidvm_vthost_frames_out, droidvm_vthost_errors;
 volatile uint32_t droidvm_vthost_frames_dropped;   // handed over as dropped (frame thinning), no pixels
+volatile uint32_t droidvm_vthost_frames_skipped;   // of those, never given to the device (a temporal layer above the kept ones)
 volatile uint32_t droidvm_vthost_error_stage;
 volatile int32_t droidvm_vthost_error_value;
 volatile uint32_t droidvm_vthost_replies, droidvm_vthost_unknown, droidvm_vthost_last_unknown;
@@ -130,6 +132,12 @@ struct V4l2Format {   // struct v4l2_format with v4l2_pix_format_mplane
 static_assert(sizeof(V4l2Format) == 208, "v4l2_format");
 
 constexpr unsigned OutputBuffers = 4, MaxCaptureBuffers = 32, MaxInputs = 4096;
+constexpr uint32_t IdleCloseMs = 1000;   // workerMain: the lock screen's player opens a new session every 3 s or so
+uint64_t idleCloseTicks() {
+    static uint64_t ticks;
+    if (!ticks) nanoseconds_to_absolutetime(uint64_t(IdleCloseMs) * 1000000, &ticks);
+    return ticks;
+}
 // Frame thinning. The lock screen's aerials are 4K HEVC at 240 frames a second (idleassetsd's 4KSDR240FPS); its player decodes
 // every frame and shows about 30 of them a second, and nothing in AVFoundation asks for fewer (ReducedFrameDelivery is set by no
 // one but VideoToolbox's own callers). A pixel buffer and a 4K copy for each of the 240 is ten times what this path does, so the
@@ -271,9 +279,14 @@ struct Mapped {
     uint64_t length = 0;
     IOBufferMemoryDescriptor *buffer = nullptr, *sg = nullptr;   // the bytes; their {start, length} list (physically contiguous)
     uint64_t sgAddress = 0;
-    uint32_t sgBytes = 0;
+    uint32_t sgBytes = 0, sgCapacity = 0;   // sgCapacity: what m.sg holds (a direct slot keeps its list from surface to surface)
+    bool sharedSg = false;                  // m.sg is one of gSgLists', given back, not freed
     uint8_t *bytes = nullptr;
     bool queued = false;
+    // A CAPTURE buffer that is one of the guest's pool surfaces (Session::direct): its pages in the guest process, wired; the
+    // pixel buffer's UUID, which the frame decoded into it is handed over (Demt) with.
+    IOMemoryDescriptor *memory = nullptr;
+    uint8_t uuid[16] = {};
 };
 
 struct Event {
@@ -289,6 +302,13 @@ struct Session {
     bool encoder = false;
     uint32_t nalLength = 4;
     bool tenBit = false;   // hvcC's bitDepthLumaMinus8 above 0: the pixel buffers asked for are x420
+    // Temporal layers (hvcC's numTemporalLayers; 0 unknown, 1 none). The lock screen's aerials are five: TID 0-1 are 30 of the
+    // 240 frames a second, and no frame of a lower layer refers to a higher one (any sub-layer cut is a stream), so the layers
+    // above the ones that make about 30 a second are never given to the device: neither decoded nor copied (Z0).
+    uint8_t temporalLayers = 0;
+    int64_t lastInputUs = INT64_MIN, minStepUs = INT64_MAX;   // the frame period, the least step between two inputs' times
+    unsigned steps = 0;
+    bool skipLogged = false;
     uint8_t parameterSets[512] = {};
     uint32_t parameterSetsSize = 0;
     bool parametersSent = false;
@@ -300,13 +320,21 @@ struct Session {
     Mapped capture[MaxCaptureBuffers];
     unsigned captureCount = 0;
     uint32_t captureWidth = 0, captureHeight = 0, captureStride = 0;
+    bool captureP010 = false;   // CAPTURE is P010 (16 bits a sample, the value in the top 10), not NV12: a 10-bit stream on msm_vidc
+    // P3: the CAPTURE buffers are the guest's own pool surfaces, taken ahead with Dbuf (which the guest answers from the pool,
+    // whatever the frame), the device decoding into them in place: a decoded frame goes over with its buffer's UUID, no copy,
+    // and the slot takes another surface; a frame thinned out keeps its surface. Unused ones go back with Dfub. Only where the
+    // surface's planes lie as the device's single-plane layout has them (the luma rows the device pads to, the chroma right
+    // after): Dpba asks for ExtendedPixelsBottom up to the padded height.
+    bool direct = false;
+    uint32_t extendBottom = 0;   // the ExtendedPixelsBottom the last Dpba asked for
 
     IOLock *lock = nullptr;
     // Frames given (dfrm) and not yet in an OUTPUT buffer: Annex B, IOMalloc'd.
     // The frames sent and not yet given to the device. MaxInputs, not 128: the lock screen's video player sends 100-200 frames at
     // once when a session starts; refused at 128 (-12911), VideoToolbox opened another session without invalidating the first, every
     // few seconds, and each kept a 4K hardware decoder and its buffers on the host (500 MB apiece) until the host ran out of memory.
-    struct Input { int64_t frame; uint8_t *bytes; uint32_t size, capacity; int64_t ptsUs; } inputs[MaxInputs];
+    struct Input { int64_t frame; uint8_t *bytes; uint32_t size, capacity; int64_t ptsUs; uint8_t tid; } inputs[MaxInputs];
     // The presentation times (microseconds, -1 unknown) of the frames given to the device, by frame % FrameTimes; and that of the
     // last frame handed over with pixels (INT64_MIN: none yet).
     struct FrameTime { int64_t frame = -1, ptsUs = -1; } frameTimes[FrameTimes];
@@ -319,6 +347,11 @@ struct Session {
     Event events[64];
     unsigned eventHead = 0, eventTail = 0;
     bool stopping = false, workerRunning = false;
+    // The device session let go while VideoToolbox's lives on (workerMain): the dsta that started it, to start it again with.
+    bool idleClosed = false, finished = false;
+    uint8_t *startMessage = nullptr;
+    uint32_t startSize = 0;
+    uint64_t lastInputAt = 0;   // mach_absolute_time of the last dfrm queued
     thread_t worker = nullptr;
     uint32_t pendingFrames = 0;
     // The frames given and not yet handed over, by ID: at dfin's deadline each gets a Demt with an error, or VideoToolbox would
@@ -438,10 +471,43 @@ int ioctl(Session *s, uint32_t code, void *payload, uint32_t out, uint32_t in) {
 }
 
 struct SgEntry { uint64_t start; uint32_t length, padding; };   // virtio-media's struct virtio_media_sg_entry
-constexpr uint32_t MaxSgEntries = 4096;                         // the device's MAX_SG_ENTRIES
+constexpr uint32_t MaxSgEntries = 16384;                        // the device's MAX_SG_ENTRIES: a 4K P010 frame is 6528 pages
+
+// The lists of direct slots: physically contiguous (the device reads each from one descriptor), about 100 KB for a 4K P010
+// frame whose pages are all apart, and a guest that has been up a while has no such run free; made once and kept for every
+// session after (MaxSgLists of them, any session's slots).
+constexpr unsigned MaxSgLists = 64;
+constexpr uint32_t SgListBytes = 128u << 10;   // 8192 entries: 32 MiB of pages
+IOLock *gSgLock;
+IOBufferMemoryDescriptor *gSgLists[MaxSgLists];
+bool gSgBusy[MaxSgLists];
+
+IOBufferMemoryDescriptor *takeSgList() {
+    IOLockLock(gSgLock);
+    IOBufferMemoryDescriptor *list = nullptr;
+    for (unsigned i = 0; i < MaxSgLists && !list; ++i) {
+        if (gSgBusy[i]) continue;
+        if (!gSgLists[i])
+            gSgLists[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionOut) |
+                                                                           IOOptionBits(kIOMemoryPhysicallyContiguous), SgListBytes,
+                                                                           0x0000fffffffff000ULL);
+        if (gSgLists[i]) { gSgBusy[i] = true; list = gSgLists[i]; }
+        else break;
+    }
+    IOLockUnlock(gSgLock);
+    return list;
+}
+
+void giveSgList(IOBufferMemoryDescriptor *list) {
+    IOLockLock(gSgLock);
+    for (unsigned i = 0; i < MaxSgLists; ++i) if (gSgLists[i] == list) gSgBusy[i] = false;
+    IOLockUnlock(gSgLock);
+}
 
 void unmapBuffer(Session *s, Mapped &m) {
     if (m.buffer) { m.buffer->complete(); m.buffer->release(); }
+    if (m.memory) { m.memory->complete(); m.memory->release(); }
+    if (m.sharedSg && m.sg) { giveSgList(m.sg); m.sg = nullptr; }
     OSSafeReleaseNULL(m.sg);
     m = Mapped();
 }
@@ -451,6 +517,7 @@ void unmapBuffer(Session *s, Mapped &m) {
 // Pageable kernel memory that prepare() wires: the wiring waits for the pageout daemon to reclaim and compress pages where few are
 // free. A wired allocation (inTaskWithOptions without kIOMemoryPageable) does not: at the lock screen, with 20-50 MB free, every
 // 4K buffer (13 MB capture, 6.6 MB bitstream) came back null, and VideoToolbox fell back to software decoding.
+bool scatter(Mapped &m, IOMemoryDescriptor *memory);
 bool mapBuffer(Session *s, uint32_t type, uint32_t index, Mapped &m) {
     V4l2Buffer b = {};
     b.index = index; b.type = type; b.memory = MemoryUserPtr; b.length = 1;
@@ -461,33 +528,46 @@ bool mapBuffer(Session *s, uint32_t type, uint32_t index, Mapped &m) {
                                                            m.length, 16384);
     if (!m.buffer || m.buffer->prepare() != kIOReturnSuccess) { OSSafeReleaseNULL(m.buffer); failed(11, int32_t(m.length)); return false; }
     m.bytes = static_cast<uint8_t *>(m.buffer->getBytesNoCopy());
+    if (!scatter(m, m.buffer)) { unmapBuffer(s, m); return false; }
+    return true;
+}
+
+// The list of the pages of `memory` (prepared), adjacent ones merged, for the device: m.sg, m.sgAddress, m.sgBytes.
+bool scatter(Mapped &m, IOMemoryDescriptor *memory) {
+    m.sgAddress = 0;
     SgEntry *entries = static_cast<SgEntry *>(IOMalloc(MaxSgEntries * sizeof(SgEntry)));
-    if (!entries) { unmapBuffer(s, m); failed(12, 0); return false; }
+    if (!entries) { failed(12, 0); return false; }
     uint32_t count = 0;
     for (uint64_t at = 0; at < m.length;) {
         IOByteCount segment = 0;
-        const uint64_t pa = m.buffer->getPhysicalSegment(at, &segment, kIOMemoryMapperNone);
-        if (!pa || !segment) { count = 0; break; }
+        const uint64_t pa = memory->getPhysicalSegment(at, &segment, kIOMemoryMapperNone);
+        if (!pa || !segment) { IOLog("DroidVMVTHost: no physical segment at %llu of %llu\n", at, m.length); count = 0; break; }
         if (segment > m.length - at) segment = IOByteCount(m.length - at);
         if (count && entries[count - 1].start + entries[count - 1].length == pa && entries[count - 1].length + segment < (1ull << 31))
             entries[count - 1].length += uint32_t(segment);
         else if (count < MaxSgEntries)
             entries[count++] = {pa, uint32_t(segment), 0};
-        else { count = 0; break; }
+        else { IOLog("DroidVMVTHost: %llu bytes past %u segments at %llu\n", m.length, MaxSgEntries, at); count = 0; break; }
         at += segment;
     }
     if (count) {
         m.sgBytes = count * uint32_t(sizeof(SgEntry));
-        m.sg = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionOut) |
-                                                                IOOptionBits(kIOMemoryPhysicallyContiguous), m.sgBytes,
-                                                                0x0000fffffffff000ULL);
+        if (!m.sg || m.sgCapacity < m.sgBytes) {
+            if (m.sharedSg && m.sg) giveSgList(m.sg);
+            m.sharedSg = false;
+            OSSafeReleaseNULL(m.sg);
+            m.sgCapacity = m.sgBytes;
+            m.sg = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionOut) |
+                                                                    IOOptionBits(kIOMemoryPhysicallyContiguous), m.sgCapacity,
+                                                                    0x0000fffffffff000ULL);
+        }
         if (m.sg) {
             memcpy(m.sg->getBytesNoCopy(), entries, m.sgBytes);
             m.sgAddress = m.sg->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
         }
     }
     IOFree(entries, MaxSgEntries * sizeof(SgEntry));
-    if (!m.sgAddress) { unmapBuffer(s, m); failed(12, int32_t(count)); return false; }
+    if (!m.sgAddress) { if (!m.sharedSg) { OSSafeReleaseNULL(m.sg); m.sgCapacity = 0; } failed(12, int32_t(count)); return false; }
     return true;
 }
 
@@ -503,6 +583,7 @@ int queueBuffer(Session *s, V4l2Buffer &b, const Mapped &m) {
 // The parameter sets of an avcC or hvcC, as Annex B, and the NAL length size.
 bool parameterSets(Session *s, const ImageDescription &d) {
     s->tenBit = false;
+    s->temporalLayers = 0;
     Atom ext;
     const uint8_t start[4] = {0, 0, 0, 1};
     s->parameterSetsSize = 0;
@@ -535,6 +616,7 @@ bool parameterSets(Session *s, const ImageDescription &d) {
         if (ext.size < 23) return false;
         s->nalLength = (p[21] & 3) + 1;
         s->tenBit = (p[17] & 7) != 0;
+        s->temporalLayers = (p[21] >> 3) & 7;
         const unsigned arrays = p[22];
         p += 23;
         for (unsigned a = 0; a < arrays; ++a) {
@@ -588,6 +670,142 @@ bool hostRequest(Session *s, Writer &w, const uint8_t *buffer, uint64_t request)
     return replied;
 }
 
+// --- P3: the guest's pool surfaces as CAPTURE buffers --------------------------------------------------------------------
+void pixelBufferAttributes(Session *s);
+
+// droidvm-vt-direct=0: never (the pixel buffers as before P3 too, copied into); =2: P3's pixel buffers, copied into.
+int directMode() {
+    static int mode = -1;
+    if (mode < 0) {
+        int value = 1;
+        PE_parse_boot_argn("droidvm-vt-direct", &value, sizeof value);
+        mode = value;
+    }
+    return mode;
+}
+bool directAllowed() { return directMode() == 1; }
+bool directLayout() { return directMode() != 0; }
+
+// Whether a pool surface lies as the device's CAPTURE layout does: one plane of `length` bytes from the luma's first byte, the
+// chroma at captureStride rows times captureHeight after it, both planes captureStride a row, page aligned.
+bool surfaceFits(const Session *s, const SurfaceView &v, uint64_t length) {
+    const bool format = s->captureP010 ? v.format == cc("x420") || v.format == cc("xf20")
+                                       : v.format == 875704438 || v.format == 875704422;   // 420v, 420f
+    return format && v.planes == 2 && v.plane[0].bytesPerRow == s->captureStride && v.plane[1].bytesPerRow == s->captureStride &&
+           v.plane[1].offset == v.plane[0].offset + uint64_t(s->captureStride) * s->captureHeight &&
+           v.plane[0].offset + length <= v.size && !((v.base + v.plane[0].offset) & 4095) && !(length & 4095);
+}
+
+// Dfub: the guest's pending pixel buffers `uuids` (taken with Dbuf, never handed over) back to its pool.
+void forgetSurfaces(Session *s, const uint8_t (*uuids)[16], unsigned count) {
+    if (!count) return;
+    uint8_t message[64 + 16 * MaxCaptureBuffers];
+    Writer w(message, sizeof message);
+    w.header(cc("Dfub"), FlagHostRequest, s->uuid, __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED));
+    w.uuids(cc(",uu+"), uuids[0], count);
+    sendToGuest(s->client, w, message);
+}
+
+// A pool surface for CAPTURE slot `index` (its length already the device's): Dbuf, the layout checked, its pages wired and
+// listed. False, the surface given back, when it does not fit or anything fails.
+bool takeSurface(Session *s, unsigned index) {
+    Mapped &m = s->capture[index];
+    uint8_t message[128];
+    const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
+    Writer w(message, sizeof message);
+    w.header(cc("Dbuf"), FlagHostRequest, s->uuid, request);
+    w.s64(cc(",frm"), 0);   // the guest answers from the pool whatever the frame (VTDecoderSessionCreatePixelBufferWithOptions)
+    if (!hostRequest(s, w, message, request) || s->replyError || !s->replyHasSurface) { failed(80, s->replyError); return false; }
+    const SurfaceView view = s->replySurface;
+    uint8_t uuid[16];
+    memcpy(uuid, s->replyUuid, 16);
+    if (!surfaceFits(s, view, m.length)) {
+        static uint32_t told;
+        if (told++ < 4)
+            IOLog("DroidVMVTHost: life v4l2 %u surface %c%c%c%c planes %u at %llu/%llu rows %llu/%llu size %llu base %#llx does not "
+                  "fit capture %ux%u stride %u length %llu\n", s->v4l2, char(view.format >> 24), char(view.format >> 16),
+                  char(view.format >> 8), char(view.format), view.planes, view.plane[0].offset, view.plane[1].offset,
+                  view.plane[0].bytesPerRow, view.plane[1].bytesPerRow, view.size, view.base, s->captureWidth, s->captureHeight,
+                  s->captureStride, m.length);
+        forgetSurfaces(s, &uuid, 1);
+        return false;
+    }
+    IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddressRange(view.base + view.plane[0].offset, m.length,
+                                                                       kIODirectionInOut, s->client->task);
+    if (!memory || memory->prepare() != kIOReturnSuccess) {
+        OSSafeReleaseNULL(memory);
+        failed(81, 0);
+        forgetSurfaces(s, &uuid, 1);
+        return false;
+    }
+    m.memory = memory;
+    if (!scatter(m, memory)) {
+        m.memory = nullptr;
+        memory->complete();
+        memory->release();
+        forgetSurfaces(s, &uuid, 1);
+        return false;
+    }
+    // The device writes the pages by DMA, past the guest's caches: whatever lines of them the guest holds dirty (the pool's own
+    // clearing, an earlier frame's reader) go to memory now, before the device's frame would be overwritten by their eviction.
+    memory->performOperation(kIOMemoryIncoherentIOFlush, 0, m.length);
+    m.bytes = reinterpret_cast<uint8_t *>(uintptr_t(view.base + view.plane[0].offset));   // echoed by the device, never read here
+    memcpy(m.uuid, uuid, 16);
+    return true;
+}
+
+// Slot `index` without its surface (handed over, or going back): unwired; its list's memory and the device's length kept, a
+// physically contiguous allocation per frame being what a fragmented guest fails first.
+void dropSurface(Mapped &m) {
+    if (m.memory) { m.memory->complete(); m.memory->release(); m.memory = nullptr; }
+    m.bytes = nullptr;
+}
+
+// Every surface the slots still hold, back to the guest's pool (the session's end).
+void giveSurfacesBack(Session *s) {
+    uint8_t uuids[MaxCaptureBuffers][16];
+    unsigned count = 0;
+    for (unsigned i = 0; i < s->captureCount; ++i)
+        if (s->capture[i].memory) memcpy(uuids[count++], s->capture[i].uuid, 16);
+    forgetSurfaces(s, uuids, count);
+}
+
+// The CAPTURE slots in direct mode: each with a pool surface, queued. Slot 0 decides: a surface that does not fit (or none)
+// leaves the session copying into buffers of its own.
+bool setUpDirect(Session *s) {
+    if (!s->captureP010 || !s->tenBit || !directAllowed()) return false;
+    const uint32_t extend = s->captureHeight > s->height ? s->captureHeight - s->height : 0;
+    if (extend != s->extendBottom) {
+        IOLog("DroidVMVTHost: life v4l2 %u pixel buffers again: ExtendedPixelsBottom %u, not %u\n", s->v4l2, extend, s->extendBottom);
+        s->extendBottom = extend;
+        pixelBufferAttributes(s);
+    }
+    for (unsigned i = 0; i < s->captureCount; ++i) {
+        V4l2Buffer b = {};
+        b.index = i; b.type = TypeCaptureMplane; b.memory = MemoryUserPtr; b.length = 1;
+        const int r = ioctl(s, IocQuerybuf, &b, sizeof b, sizeof b);
+        if (r || !b.plane.length) { failed(10, r ? r : -1); return false; }
+        Mapped &m = s->capture[i];
+        m.length = b.plane.length;
+        // A list for any surface of this length (every page apart), kept across sessions.
+        if (!m.sg && m.length / 4096 + 2 <= SgListBytes / sizeof(SgEntry)) {
+            m.sg = takeSgList();
+            m.sharedSg = m.sg != nullptr;
+            m.sgCapacity = m.sg ? SgListBytes : 0;
+            if (!m.sg) failed(83, int32_t(i));
+        }
+        if (!takeSurface(s, i)) {
+            if (i == 0) return false;
+            giveSurfacesBack(s);
+            for (unsigned j = 0; j < i; ++j) dropSurface(s->capture[j]);
+            return false;
+        }
+    }
+    s->direct = true;
+    IOLog("DroidVMVTHost: life v4l2 %u decodes into %u pool surfaces in place\n", s->v4l2, s->captureCount);
+    return true;
+}
+
 // --- The worker: the device's events ---------------------------------------------------------------------------------------
 bool setUpCapture(Session *s) {
     V4l2Format f = {};
@@ -597,6 +815,7 @@ bool setUpCapture(Session *s) {
     s->captureWidth = f.width;
     s->captureHeight = f.height;
     s->captureStride = f.planes[0].bytesperline ? f.planes[0].bytesperline : f.width;
+    s->captureP010 = f.pixelformat == cc("010P");   // V4L2_PIX_FMT_P010
     uint32_t control[2] = {CidMinBuffersForCapture, 0};
     unsigned count = ioctl(s, IocGCtrl, control, sizeof control, sizeof control) ? 8 : control[1] + 2;
     if (count > MaxCaptureBuffers) count = MaxCaptureBuffers;
@@ -604,8 +823,9 @@ bool setUpCapture(Session *s) {
     r = ioctl(s, IocReqbufs, request, sizeof request, sizeof request);
     if (r || !request[0]) { failed(51, r); return false; }
     s->captureCount = request[0] < MaxCaptureBuffers ? request[0] : MaxCaptureBuffers;
+    const bool direct = setUpDirect(s);
     for (unsigned i = 0; i < s->captureCount; ++i) {
-        if (!mapBuffer(s, TypeCaptureMplane, i, s->capture[i])) return false;
+        if (!direct && !mapBuffer(s, TypeCaptureMplane, i, s->capture[i])) return false;
         V4l2Buffer b = {};
         b.index = i; b.type = TypeCaptureMplane;
         r = queueBuffer(s, b, s->capture[i]);
@@ -616,15 +836,19 @@ bool setUpCapture(Session *s) {
     r = ioctl(s, IocStreamon, &type, 4, 0);
     if (r) { failed(53, r); return false; }
     s->captureStreaming = true;
-    IOLog("DroidVMVTHost: capture %ux%u stride %u, %u buffers\n", s->captureWidth, s->captureHeight, s->captureStride, s->captureCount);
+    IOLog("DroidVMVTHost: capture %ux%u stride %u, %u buffers%s\n", s->captureWidth, s->captureHeight, s->captureStride, s->captureCount,
+          s->captureP010 ? ", P010" : "");
     return true;
 }
 
 void copyFrame(Session *s, const Mapped &from, const SurfaceView &to) {
+    // Wired and mapped for this frame only: the pool frees a surface it no longer needs, and one the kernel still wired (kept
+    // from frame to frame) took the player down when it did.
     IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddressRange(to.base, to.size, kIODirectionInOut, s->client->task);
     if (!memory || memory->prepare() != kIOReturnSuccess) { OSSafeReleaseNULL(memory); failed(60, 0); return; }
     IOMemoryMap *map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
     uint8_t *surface = map ? reinterpret_cast<uint8_t *>(map->getVirtualAddress()) : nullptr;
+    if (!surface) failed(61, 0);
     if (surface) {
         const uint32_t width = s->captureWidth < to.plane[0].width ? s->captureWidth : uint32_t(to.plane[0].width);
         const uint32_t height = s->captureHeight < to.plane[0].height ? s->captureHeight : uint32_t(to.plane[0].height);
@@ -632,27 +856,42 @@ void copyFrame(Session *s, const Mapped &from, const SurfaceView &to) {
         // A 10-bit stream's player asks for x420/xf20 pixel buffers (16 bits a sample, the value in the top 10): the 8 bits the
         // device gives widened, not copied as they are -- 8-bit samples in the low byte of each word read as black.
         const bool wide = to.format == cc("x420") || to.format == cc("xf20");
+        // P010 from the device is x420's layout already, row for row; into a 420v buffer its top bytes.
+        const bool p010 = s->captureP010;
         auto row = [&](uint8_t *out, const uint8_t *in, uint32_t samples, uint64_t room) {
+            if (p010 && wide) { memcpy(out, in, uint64_t(samples) * 2 < room ? samples * 2 : uint32_t(room)); return; }
+            if (p010) {
+                const uint16_t *words = reinterpret_cast<const uint16_t *>(in);
+                const uint32_t n = samples < room ? samples : uint32_t(room);
+                for (uint32_t x = 0; x < n; ++x) out[x] = uint8_t(words[x] >> 8);
+                return;
+            }
             if (!wide) { memcpy(out, in, samples < room ? samples : uint32_t(room)); return; }
             uint16_t *words = reinterpret_cast<uint16_t *>(out);
             const uint32_t n = samples < room / 2 ? samples : uint32_t(room / 2);
             for (uint32_t x = 0; x < n; ++x) words[x] = uint16_t(in[x] << 8);
         };
-        for (uint32_t y = 0; y < height; ++y)
-            row(surface + to.plane[0].offset + y * to.plane[0].bytesPerRow, luma + uint64_t(y) * s->captureStride, width,
-                to.plane[0].bytesPerRow);
-        for (uint32_t y = 0; y < (height + 1) / 2 && y < to.plane[1].height; ++y)
-            row(surface + to.plane[1].offset + y * to.plane[1].bytesPerRow, chroma + uint64_t(y) * s->captureStride, width,
-                to.plane[1].bytesPerRow);
-    } else {
-        failed(61, 0);
+        const uint32_t chromaRows = (height + 1) / 2 < to.plane[1].height ? (height + 1) / 2 : uint32_t(to.plane[1].height);
+        if (p010 && wide && to.plane[0].bytesPerRow == s->captureStride && to.plane[1].bytesPerRow == s->captureStride) {
+            // The same rows the same distance apart: each plane one copy.
+            memcpy(surface + to.plane[0].offset, luma, uint64_t(s->captureStride) * height);
+            memcpy(surface + to.plane[1].offset, chroma, uint64_t(s->captureStride) * chromaRows);
+        } else {
+            for (uint32_t y = 0; y < height; ++y)
+                row(surface + to.plane[0].offset + y * to.plane[0].bytesPerRow, luma + uint64_t(y) * s->captureStride, width,
+                    to.plane[0].bytesPerRow);
+            for (uint32_t y = 0; y < chromaRows; ++y)
+                row(surface + to.plane[1].offset + y * to.plane[1].bytesPerRow, chroma + uint64_t(y) * s->captureStride, width,
+                    to.plane[1].bytesPerRow);
+        }
     }
     OSSafeReleaseNULL(map);
     memory->complete();
     memory->release();
 }
 
-void emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
+// Returns whether the slot's pool surface went with the frame (direct): the slot then needs another.
+bool emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
     Mapped &buffer = s->capture[index];
     uint8_t message[256];
     const Session::FrameTime &time = s->frameTimes[uint64_t(frame) % FrameTimes];
@@ -660,32 +899,45 @@ void emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
     if (bytesused && pts >= 0) {
         // Shown when ThinUs have passed since the last shown, or when time went back (a loop, a seek, a new segment).
         if (s->lastShownUs != INT64_MIN && pts >= s->lastShownUs && pts - s->lastShownUs < ThinUs) {
-            const uint64_t emit = s->nextHostRequest++;
+            const uint64_t emit = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
             Writer e(message, sizeof message);
             e.header(cc("Demt"), FlagHostRequest, s->uuid, emit);
             e.s64(cc(",frm"), frame);
             e.s32(cc(",err"), 0);
             e.u32(cc(",inf"), 1 | 2);   // kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped
             if (sendToGuest(s->client, e, message)) droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
-            return;
+            return false;
         }
         s->lastShownUs = pts;
     }
+    if (s->direct) {
+        // Decoded in place: the surface goes as it is, once no line the guest's caches hold of it (prefetched while the device
+        // wrote) can stand in for what the device put there.
+        if (buffer.memory) buffer.memory->performOperation(kIOMemoryIncoherentIOFlush, 0, buffer.length);
+        Writer e(message, sizeof message);
+        e.header(cc("Demt"), FlagHostRequest, s->uuid, __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED));
+        e.s64(cc(",frm"), frame);
+        e.s32(cc(",err"), 0);
+        e.u32(cc(",inf"), 1);
+        e.uuid(cc(",uui"), buffer.uuid);
+        if (sendToGuest(s->client, e, message)) droidvm_vthost_frames_out = droidvm_vthost_frames_out + 1;
+        return true;
+    }
     // Dbuf: a pixel buffer for the frame.
-    const uint64_t request = s->nextHostRequest++;
+    const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
     Writer w(message, sizeof message);
     w.header(cc("Dbuf"), FlagHostRequest, s->uuid, request);
     w.s64(cc(",frm"), frame);
     if (!hostRequest(s, w, message, request) || s->replyError || !s->replyHasSurface) {
         failed(31, s->replyError);
-        return;
+        return false;
     }
     uint8_t pixelBuffer[16];
     memcpy(pixelBuffer, s->replyUuid, 16);
     const SurfaceView surface = s->replySurface;
     if (bytesused) copyFrame(s, buffer, surface);
     // Demt: the frame, decoded into that pixel buffer.
-    const uint64_t emit = s->nextHostRequest++;
+    const uint64_t emit = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
     Writer e(message, sizeof message);
     e.header(cc("Demt"), FlagHostRequest, s->uuid, emit);
     e.s64(cc(",frm"), frame);
@@ -696,6 +948,7 @@ void emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
     // droidvm_vthost_message), and waiting for it was a round trip to the player's process for every frame -- 40 ms a frame
     // for the lock screen's (a background process), the ceiling of the whole path (21 frames a second of 240).
     if (sendToGuest(s->client, e, message)) droidvm_vthost_frames_out = droidvm_vthost_frames_out + 1;
+    return false;
 }
 
 void forgetFrame(Session *s, int64_t frame) {
@@ -713,7 +966,7 @@ void dropOutstanding(Session *s) {
         const int64_t frame = s->outstanding[--s->outstandingCount];
         IOLockUnlock(s->lock);
         uint8_t message[160];
-        const uint64_t request = s->nextHostRequest++;
+        const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
         Writer e(message, sizeof message);
         e.header(cc("Demt"), FlagHostRequest, s->uuid, request);
         e.s64(cc(",frm"), frame);
@@ -731,11 +984,51 @@ void requeueCapture(Session *s, unsigned index) {
     else s->capture[index].queued = true;
 }
 
+// The highest temporal layer given to the device: the least that still makes about 30 frames a second, layers taken as halving
+// the rate (the aerials' do), once 16 steps between inputs' times have shown the frame period; every layer till then.
+bool hevcSession(const Session *s);
+unsigned keptLayer(const Session *s) {
+    if (!hevcSession(s) || s->temporalLayers < 2 || s->steps < 16 || s->minStepUs <= 0 || s->minStepUs == INT64_MAX) return 7;
+    const int64_t rate = 1000000 / s->minStepUs;
+    unsigned drop = 0;
+    while (drop + 1 < s->temporalLayers && (rate >> (drop + 1)) >= 30) ++drop;
+    return s->temporalLayers - 1 - drop;
+}
+
 // The oldest kept frame into a free OUTPUT buffer, if both exist (the lock held, and released while the buffer is filled).
 bool feedInput(Session *s) {
+    if (s->inputHead == s->inputTail) return false;
+    // A frame to skip needs no OUTPUT buffer: one waiting for one would hold the 7 in 8 behind it that never go to the device.
+    if (s->inputs[s->inputTail % MaxInputs].tid > keptLayer(s)) {
+        const Session::Input input = s->inputs[s->inputTail++ % MaxInputs];
+        // Z0: a frame of a temporal layer no kept frame refers to, handed over as dropped without the device seeing it.
+        for (unsigned i = 0; i < s->outstandingCount; ++i)
+            if (s->outstanding[i] == input.frame) { s->outstanding[i] = s->outstanding[--s->outstandingCount]; break; }
+        if (s->pendingFrames) --s->pendingFrames;
+        const bool first = !s->skipLogged;
+        s->skipLogged = true;
+        IOLockUnlock(s->lock);
+        IOFree(input.bytes, input.capacity);
+        if (first)
+            IOLog("DroidVMVTHost: life v4l2 %u keeps temporal layers 0-%u of %u (frame period %lld us)\n", s->v4l2, keptLayer(s),
+                  s->temporalLayers, s->minStepUs);
+        uint8_t message[160];
+        const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
+        Writer e(message, sizeof message);
+        e.header(cc("Demt"), FlagHostRequest, s->uuid, request);
+        e.s64(cc(",frm"), input.frame);
+        e.s32(cc(",err"), 0);
+        e.u32(cc(",inf"), 1 | 2);   // kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped
+        if (sendToGuest(s->client, e, message)) {
+            droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
+            droidvm_vthost_frames_skipped = droidvm_vthost_frames_skipped + 1;
+        }
+        IOLockLock(s->lock);
+        return true;
+    }
     unsigned index = OutputBuffers;
     for (unsigned i = 0; i < OutputBuffers; ++i) if (!s->output[i].queued) { index = i; break; }
-    if (index == OutputBuffers || s->inputHead == s->inputTail) return false;
+    if (index == OutputBuffers) return false;
     const Session::Input input = s->inputs[s->inputTail++ % MaxInputs];
     s->frameTimes[uint64_t(input.frame) % FrameTimes] = {input.frame, input.ptsUs};
     s->output[index].queued = true;
@@ -787,6 +1080,7 @@ void answerFinish(Session *s) {
     memcpy(h.uuid, s->uuid, 16);
     h.request = s->finishRequest;
     s->finishWanted = false;
+    s->finished = true;
     IOLockUnlock(s->lock);
     replyStatus(s->client, h, 0);
     IOLockLock(s->lock);
@@ -805,8 +1099,18 @@ void endDrain(Session *s) {
     }
 }
 
+// Whether the session has nothing to do: no frame waiting to be fed, no dfin, no event. Frames may still be inside the codec,
+// which keeps the last few of a stream until it is drained.
+bool sessionQuiet(const Session *s) {
+    return s->inputHead == s->inputTail && !s->finishWanted && !s->draining && s->eventHead == s->eventTail;
+}
+
+void closeDevice(Session *s);
+void forgetStartMessage(Session *s);
+
 void workerMain(void *argument, wait_result_t) {
     Session *s = static_cast<Session *>(argument);
+    bool idle = false;
     for (;;) {
         IOLockLock(s->lock);
         for (;;) {
@@ -814,8 +1118,33 @@ void workerMain(void *argument, wait_result_t) {
             if (feedInput(s)) continue;
             answerFinish(s);
             if (s->stopping || s->eventHead != s->eventTail) break;
+            // The lock screen's player reads each clip to its end with a new session and lets the old one go only much later
+            // (its -dec): each held its device session, some 300 MB of the host's memory and one of msm_vidc's eight, until
+            // the host ran out (and msm_vidc refused the ninth). A session with every frame handed over after a dfin, or given
+            // none for IdleCloseMs (the frames still inside the codec then dropped), lets its device session go.
+            if (sessionQuiet(s) && ((s->finished && !s->pendingFrames) || mach_absolute_time() - s->lastInputAt >= idleCloseTicks())) {
+                idle = true;
+                break;
+            }
             if (s->finishWanted) IOLockSleepDeadline(s->lock, &s->events, s->finishDeadline, THREAD_UNINT);
-            else IOLockSleep(s->lock, &s->events, THREAD_UNINT);
+            else if (sessionQuiet(s)) {
+                AbsoluteTime deadline;
+                clock_interval_to_deadline(IdleCloseMs, kMillisecondScale, &deadline);
+                IOLockSleepDeadline(s->lock, &s->events, deadline, THREAD_UNINT);
+            } else IOLockSleep(s->lock, &s->events, THREAD_UNINT);
+        }
+        if (idle) {
+            if (s->outstandingCount) {
+                IOLockUnlock(s->lock);
+                dropOutstanding(s);
+                IOLockLock(s->lock);
+            }
+            s->pendingFrames = 0;
+            s->idleClosed = true;
+            IOLockUnlock(s->lock);
+            closeDevice(s);
+            IOLockLock(s->lock);
+            break;
         }
         if (s->stopping) break;
         const Event e = s->events[s->eventTail++ % 64];
@@ -828,15 +1157,26 @@ void workerMain(void *argument, wait_result_t) {
             IOLockUnlock(s->lock);
         } else if (e.kind == MediaEvtDqbuf && e.type == TypeCaptureMplane && e.index < s->captureCount) {
             s->capture[e.index].queued = false;
+            bool handedOver = false;
             if (e.bytesused && !(e.flags & BufFlagError)) {
-                emitFrame(s, e.index, e.sec, e.bytesused);
+                handedOver = emitFrame(s, e.index, e.sec, e.bytesused);
                 forgetFrame(s, e.sec);
                 IOLockLock(s->lock);
                 if (s->pendingFrames) --s->pendingFrames;
                 IOLockUnlock(s->lock);
             }
             if (e.flags & BufFlagLast) endDrain(s);
-            requeueCapture(s, e.index);
+            if (handedOver) dropSurface(s->capture[e.index]);
+            if (!s->direct) {
+                requeueCapture(s, e.index);
+            } else {
+                // Every slot without a surface (this one, or one an earlier Dbuf failed for) takes one and goes back.
+                for (unsigned i = 0; i < s->captureCount; ++i) {
+                    if (s->capture[i].queued) continue;
+                    if (!s->capture[i].memory && !takeSurface(s, i)) { failed(82, int32_t(i)); continue; }
+                    requeueCapture(s, i);
+                }
+            }
         } else if (e.kind == MediaEvtEvent && e.type == EventEos) {
             endDrain(s);
         } else if (e.kind == MediaEvtError) {
@@ -983,7 +1323,7 @@ bool describeToGuest(Session *s) {
         const int keys[2] = {p->string("FormatName"), p->string("SampleDescriptionExtensionAtoms")};
         const int values[2] = {p->string(hevcSession(s) ? "HEVC" : "H.264"), p->dict(atomKeys, atomValues, 1)};
         const int extensions = p->dict(keys, values, 2);
-        const uint64_t request = s->nextHostRequest++;
+        const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
         Writer w(message, 4096);
         w.header(cc("Efds"), FlagHostRequest, s->uuid, request);
         w.s32(cc(",cod"), int32_t(s->codec));
@@ -1063,7 +1403,7 @@ void emitEncoded(Session *s, const Session::Frame &f, const uint8_t *data, uint3
         else sbufSize = a.size();
     }
     // The head parameters, then the sample buffer in pieces of what fits a message.
-    const uint64_t request = s->nextHostRequest++;
+    const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
     uint32_t sent = 0;
     bool first = true;
     for (;;) {
@@ -1323,7 +1663,7 @@ void encoderPixelBufferAttributes(Session *s) {
                            p->dict(nullptr, nullptr, 0)};
     const int attributes = p->dict(keys, values, 6);
     Writer w(buffer, sizeof buffer);
-    w.header(cc("Epba"), FlagHostRequest, s->uuid, s->nextHostRequest++);
+    w.header(cc("Epba"), FlagHostRequest, s->uuid, __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED));
     w.plist(cc(",pba"), *p, attributes);
     sendToGuest(s->client, w, buffer);
     delete p;
@@ -1442,6 +1782,24 @@ Session *findSession(Client *c, const uint8_t *uuid) {
     return nullptr;
 }
 
+// The virtio-media session and everything of the device's the session holds (teardown, or its worker when the session idles).
+void closeDevice(Session *s) {
+    if (s->open) {
+        uint32_t type = TypeOutputMplane;
+        if (s->outputStreaming) ioctl(s, IocStreamoff, &type, 4, 0);
+        type = TypeCaptureMplane;
+        if (s->captureStreaming) ioctl(s, IocStreamoff, &type, 4, 0);
+        for (Mapped &m : s->output) unmapBuffer(s, m);
+        if (s->direct) giveSurfacesBack(s);
+        for (Mapped &m : s->capture) unmapBuffer(s, m);
+        unregisterSession(s);
+        droidvm_media_close(s->device, s->v4l2);
+        if (s->fast) droidvm_media_set_fast(s->device, false);
+    }
+    s->open = s->outputStreaming = s->captureStreaming = s->fast = s->direct = false;
+    s->captureCount = 0;
+}
+
 void teardown(Session *s) {
     if (s->workerRunning) {
         IOLockLock(s->lock);
@@ -1452,19 +1810,8 @@ void teardown(Session *s) {
         IOLockUnlock(s->lock);
         s->stopping = false;
     }
-    if (s->open) {
-        uint32_t type = TypeOutputMplane;
-        if (s->outputStreaming) ioctl(s, IocStreamoff, &type, 4, 0);
-        type = TypeCaptureMplane;
-        if (s->captureStreaming) ioctl(s, IocStreamoff, &type, 4, 0);
-        for (Mapped &m : s->output) unmapBuffer(s, m);
-        for (Mapped &m : s->capture) unmapBuffer(s, m);
-        unregisterSession(s);
-        droidvm_media_close(s->device, s->v4l2);
-        if (s->fast) droidvm_media_set_fast(s->device, false);
-    }
-    s->open = s->outputStreaming = s->captureStreaming = s->fast = false;
-    s->captureCount = 0;
+    closeDevice(s);
+    s->idleClosed = s->finished = false;
     while (s->inputTail != s->inputHead) {
         const Session::Input &input = s->inputs[s->inputTail++ % MaxInputs];
         IOFree(input.bytes, input.capacity);
@@ -1473,6 +1820,10 @@ void teardown(Session *s) {
     s->outstandingCount = 0;
     s->lastShownUs = INT64_MIN;
     for (Session::FrameTime &t : s->frameTimes) t = {-1, -1};
+    s->lastInputUs = INT64_MIN;
+    s->minStepUs = INT64_MAX;
+    s->steps = 0;
+    s->skipLogged = false;
     s->frameHead = s->frameTail = 0;
     s->finishWanted = s->draining = false;
     if (s->surfaces) {
@@ -1605,11 +1956,17 @@ void pixelBufferAttributes(Session *s) {
     // '420v', or 'x420' for a 10-bit stream: the player of a 10-bit (HDR) video takes nothing else and drops 420v frames
     // unseen (the lock screen's aerials stayed black), so the device's 8 bits are widened into it (copyFrame).
     const int format = p->integer(s->tenBit ? int64_t(cc("x420")) : 875704438);
-    const int keys[6] = {p->string("Width"), p->string("Height"), p->string("PixelFormatType"), p->string("BytesPerRowAlignment"),
-                         p->string("PlaneAlignment"), p->string("IOSurfaceProperties")};
-    const int values[6] = {p->integer(s->width), p->integer(s->height), p->array(&format, 1), p->integer(64), p->integer(256),
-                           p->dict(nullptr, nullptr, 0)};
-    const int attributes = p->dict(keys, values, 6);
+    // A 10-bit stream's surfaces as tall as the device's padded rows (P3): msm_vidc's P010 puts the chroma right after a luma
+    // plane of the height aligned to 32 (2176 for 2160). The device's own number once its CAPTURE format is known
+    // (setUpCapture sends Dpba again if it differs), this guess till then.
+    const int keys[7] = {p->string("Width"), p->string("Height"), p->string("PixelFormatType"), p->string("BytesPerRowAlignment"),
+                         p->string("PlaneAlignment"), p->string("IOSurfaceProperties"), p->string("ExtendedPixelsBottom")};
+    // Planes aligned to the host's pages for P3: CoreVideo puts the luma 512 bytes into the surface at 256, and the device takes
+    // only page-aligned guest memory (udmabuf); at 4096 the luma starts at 4096 and the chroma right after its padded rows.
+    const int values[7] = {p->integer(s->width), p->integer(s->height), p->array(&format, 1), p->integer(64),
+                           p->integer(s->tenBit && directLayout() ? 4096 : 256),
+                           p->dict(nullptr, nullptr, 0), p->integer(s->extendBottom)};
+    const int attributes = p->dict(keys, values, s->tenBit && s->extendBottom ? 7 : 6);
     Writer w(buffer, sizeof buffer);
     w.header(cc("Dpba"), 0, s->uuid, 0);
     w.plist(cc(",pba"), *p, attributes);
@@ -1646,6 +2003,30 @@ bool decodableSize(Session *s, uint32_t pixelformat) {
     return fits;
 }
 
+void forgetStartMessage(Session *s) {
+    if (s->startMessage) IOFree(s->startMessage, s->startSize);
+    s->startMessage = nullptr;
+    s->startSize = 0;
+}
+
+void keepStartMessage(Session *s, const uint8_t *m, uint32_t n) {
+    if (s->startMessage == m) return;
+    forgetStartMessage(s);
+    if (!(s->startMessage = static_cast<uint8_t *>(IOMalloc(n)))) return;
+    memcpy(s->startMessage, m, n);
+    s->startSize = n;
+}
+
+int startSession(Session *s, const uint8_t *m, uint32_t n);
+
+// A frame for a session whose device session went idle (workerMain): a new one, started as the last dsta did. A stream goes on
+// from a sync sample after a dfin (a seek, a loop); a frame before one decodes wrong until the next.
+void resumeSession(Session *s) {
+    if (!s->startMessage) return;
+    const int error = startSession(s, s->startMessage, s->startSize);
+    if (error) failed(90, error);
+}
+
 int startSession(Session *s, const uint8_t *m, uint32_t n) {
     Param fds;
     ImageDescription d;
@@ -1654,6 +2035,7 @@ int startSession(Session *s, const uint8_t *m, uint32_t n) {
     if (!decodableFormat(d)) return -12910;   // kVTVideoDecoderUnsupportedDataFormatErr
     if (!parameterSets(s, d)) return -12909;
     teardown(s);
+    s->lastInputAt = mach_absolute_time();
     s->width = d.width;
     s->height = d.height;
     s->parametersSent = false;
@@ -1694,6 +2076,7 @@ int startSession(Session *s, const uint8_t *m, uint32_t n) {
     s->workerRunning = true;
     if (kernel_thread_start(workerMain, s, &s->worker) != KERN_SUCCESS) { s->workerRunning = false; return -12904; }
     thread_deallocate(s->worker);
+    s->extendBottom = s->tenBit && directLayout() ? ((s->height + 31) & ~31u) - s->height : 0;
     pixelBufferAttributes(s);
     IOLog("DroidVMVTHost: session %u %ux%u %c%c%c%c\n", s->v4l2, s->width, s->height, d.codec >> 24, d.codec >> 16, d.codec >> 8, d.codec);
     return 0;
@@ -1716,6 +2099,8 @@ int64_t presentationUs(const Atom &sbuf) {
 
 // dfrm: the frame's NAL units as Annex B, kept for the worker (selector 3 never waits for an OUTPUT buffer).
 int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
+    s->lastInputAt = mach_absolute_time();
+    s->finished = false;
     int64_t frame = 0;
     paramS64(m, n, cc(",frm"), frame);
     Param sbf;
@@ -1733,24 +2118,53 @@ int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
         s->parametersSent = true;
     }
     const uint8_t *p = sdat.body, *end = sdat.body + sdat.size;
+    // The temporal layer of the frame's first VCL NAL unit (HEVC types 0-31; nuh_temporal_id_plus1 the low 3 bits of byte 2).
+    uint8_t tid = 0;
+    bool vcl = !hevcSession(s);
     while (uint32_t(end - p) > s->nalLength) {
         uint32_t length = 0;
         for (uint32_t i = 0; i < s->nalLength; ++i) length = length << 8 | p[i];
         p += s->nalLength;
         if (length > uint32_t(end - p) || at + 4 + length > capacity) { failed(7, int32_t(length)); break; }
+        if (!vcl && length >= 2 && ((p[0] >> 1) & 0x3f) < 32) { vcl = true; tid = (p[1] & 7) ? uint8_t((p[1] & 7) - 1) : 0; }
         memcpy(bytes + at, start, 4);
         memcpy(bytes + at + 4, p, length);
         at += 4 + length;
         p += length;
     }
     IOLockLock(s->lock);
+    const int64_t ptsUs = presentationUs(sbuf);
+    if (ptsUs >= 0 && s->lastInputUs != INT64_MIN) {
+        const int64_t step = ptsUs > s->lastInputUs ? ptsUs - s->lastInputUs : s->lastInputUs - ptsUs;
+        if (step > 0 && step < 1000000) { if (step < s->minStepUs) s->minStepUs = step; ++s->steps; }
+    }
+    if (ptsUs >= 0) s->lastInputUs = ptsUs;
+    if (tid > keptLayer(s)) {
+        // Z0 here and now: handed over as dropped on the player's own thread, which is held back by it -- queued, the 7 in 8
+        // the device never sees outran the worker and filled MaxInputs (-12911) at the player's 4000-5000 frames a second.
+        // VideoToolbox takes frames back in any order (decode order is not output order).
+        IOLockUnlock(s->lock);
+        IOFree(bytes, capacity);
+        uint8_t message[160];
+        Writer e(message, sizeof message);
+        e.header(cc("Demt"), FlagHostRequest, s->uuid, __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED));
+        e.s64(cc(",frm"), frame);
+        e.s32(cc(",err"), 0);
+        e.u32(cc(",inf"), 1 | 2);   // kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped
+        if (sendToGuest(s->client, e, message)) {
+            droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
+            droidvm_vthost_frames_skipped = droidvm_vthost_frames_skipped + 1;
+        }
+        droidvm_vthost_frames_in = droidvm_vthost_frames_in + 1;
+        return 0;
+    }
     if (s->inputHead - s->inputTail >= MaxInputs) {
         IOLockUnlock(s->lock);
         IOFree(bytes, capacity);
         failed(6, 0);
         return -12911;
     }
-    s->inputs[s->inputHead++ % MaxInputs] = {frame, bytes, at, capacity, presentationUs(sbuf)};
+    s->inputs[s->inputHead++ % MaxInputs] = {frame, bytes, at, capacity, ptsUs, tid};
     ++s->pendingFrames;
     if (s->outstandingCount < MaxInputs) s->outstanding[s->outstandingCount++] = frame;
     IOLockUnlock(s->lock);
@@ -1771,6 +2185,10 @@ void *droidvm_vthost_client_open(void *transport, bool (*send)(void *, const uin
         IOLock *lock = IOLockAlloc();
         if (!OSCompareAndSwapPtr(nullptr, lock, &gTableLock)) IOLockFree(lock);
     }
+    if (!gSgLock) {
+        IOLock *lock = IOLockAlloc();
+        if (!OSCompareAndSwapPtr(nullptr, lock, &gSgLock)) IOLockFree(lock);
+    }
     Client *c = new Client();
     if (!c) return nullptr;
     c->transport = transport;
@@ -1790,6 +2208,7 @@ void droidvm_vthost_client_close(void *host) {
         teardown(s);
         IOLockFree(s->lock);
         IOLockFree(s->surfaceLock);
+        forgetStartMessage(s);
         delete s;
     }
     if (c->lock) IOLockFree(c->lock);
@@ -1876,13 +2295,19 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
                 if (*at == s) { *at = s->next; break; }
             IOLockFree(s->lock);
             IOLockFree(s->surfaceLock);
+            forgetStartMessage(s);
             delete s;
         }
         break;
     case cc("+dec"): createDecoder(c, h, m, n); break;
     case cc("dset"): replyStatus(c, h, 0); break;
     case cc("dmul"): replyStatus(c, h, 0); break;
-    case cc("dsta"): replyStatus(c, h, s ? startSession(s, m, n) : -12903); break;
+    case cc("dsta"): {
+        const int error = s ? startSession(s, m, n) : -12903;
+        if (!error) keepStartMessage(s, m, n);
+        replyStatus(c, h, error);
+        break;
+    }
     case cc("dsup"): case cc("esup"):
         supportedProperties(c, h);
         break;
@@ -1911,6 +2336,7 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
         break;
     }
     case cc("dfrm"): {
+        if (s && s->idleClosed) resumeSession(s);
         const int error = s ? queueFrame(s, m, n) : -12903;
         uint8_t buffer[128];
         Writer w(buffer, sizeof buffer);
@@ -1943,6 +2369,7 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
                 if (*at == s) { *at = s->next; break; }
             IOLockFree(s->lock);
             IOLockFree(s->surfaceLock);
+            forgetStartMessage(s);
             delete s;
         }
         break;
