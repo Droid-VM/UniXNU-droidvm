@@ -1,0 +1,7 @@
+# The board's XNU patches for iPadOS 27 only, after series: the iPadOS GPU clients' sandbox and kobject grants, the
+# IOSurface GPU wait of iPadOS's surface client and the text fixups of its fileset pairing.
+zzw-native-sandbox-grant-patterns.patch
+droidvm-text-fixup-bitmap.patch
+droidvm-gpu-grant-apps.patch
+droidvm-gpu-sandbox-first.patch
+droidvm-surface-gpu-wait.patch

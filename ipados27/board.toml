@@ -24,7 +24,7 @@ include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "VirtioMmioBlock", "RamBlock
 [kernel]
 defconfig = "droidvm_ipados27_defconfig"
 config_fragments = ["arch:configs/common.config", "os:configs/ipados.config"]
-patch_series = ["arch:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu-12377/series"]
+patch_series = ["arch:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu-12377/series", "device:patches/xnu-12377/ipados.series"]
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",

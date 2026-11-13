@@ -1,11 +1,12 @@
-# Board patch paths for xnu-12377, one per line in application order (after the arm64e and iPadOS 27 series).
+# The board's XNU patches for xnu-12377 that every OS profile of this board takes, one per line in application order (after
+# the arm64e series and the OS profile's series). Then the selected OS's own: ipados.series (iPadOS 27) or macos.series
+# (macOS 27, board.toml [os_overrides]).
 ipados27-bringup.patch
 native-board-launch-policy.patch
 non-apple-vcpu-park.patch
 non-apple-vcpu-start-flush.patch
 non-apple-idle-wfi.patch
 zzx-pmap-sync-flush.patch
-zzw-native-sandbox-grant-patterns.patch
 source-storage-start.patch
 droidvm-early-panic.patch
 non-apple-sigp-recover.patch
@@ -17,10 +18,6 @@ droidvm-free-target-bytes.patch
 droidvm-dyld-16k-peek-first.patch
 droidvm-native-pac-user-jop.patch
 droidvm-timebase-24mhz.patch
-droidvm-text-fixup-bitmap.patch
-droidvm-gpu-grant-apps.patch
 droidvm-native-pac-user-ib.patch
 droidvm-osmetaclass-adopt-superclass.patch
-droidvm-gpu-sandbox-first.patch
-droidvm-surface-gpu-wait.patch
 droidvm-serial-uarts.patch
