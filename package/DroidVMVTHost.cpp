@@ -72,6 +72,7 @@ kern_return_t mach_port_deallocate(ipc_space_t space, mach_port_name_t name);
 
 // For the host rig (peek.py): sessions made, frames given, frames emitted, errors; the last error's stage and value.
 volatile uint32_t droidvm_vthost_sessions, droidvm_vthost_frames_in, droidvm_vthost_frames_out, droidvm_vthost_errors;
+volatile uint32_t droidvm_vthost_frames_dropped;   // handed over as dropped (frame thinning), no pixels
 volatile uint32_t droidvm_vthost_error_stage;
 volatile int32_t droidvm_vthost_error_value;
 volatile uint32_t droidvm_vthost_replies, droidvm_vthost_unknown, droidvm_vthost_last_unknown;
@@ -128,7 +129,15 @@ struct V4l2Format {   // struct v4l2_format with v4l2_pix_format_mplane
 };
 static_assert(sizeof(V4l2Format) == 208, "v4l2_format");
 
-constexpr unsigned OutputBuffers = 4, MaxCaptureBuffers = 32, MaxInputs = 4096;   // Qualcomm's AVC decoder asks 21 output slots at 720p
+constexpr unsigned OutputBuffers = 4, MaxCaptureBuffers = 32, MaxInputs = 4096;
+// Frame thinning. The lock screen's aerials are 4K HEVC at 240 frames a second (idleassetsd's 4KSDR240FPS); its player decodes
+// every frame and shows about 30 of them a second, and nothing in AVFoundation asks for fewer (ReducedFrameDelivery is set by no
+// one but VideoToolbox's own callers). A pixel buffer and a 4K copy for each of the 240 is ten times what this path does, so the
+// player falls behind, fills MaxInputs and starts over. A frame whose presentation time is less than ThinUs after the last one
+// handed over with pixels goes back as dropped (kVTDecodeInfo_FrameDropped, no pixel buffer): the references it is to the
+// stream stay in the device's decoder, which is the only place they are needed.
+constexpr int64_t ThinUs = 31000;   // a 30 Hz picture, less a little: every 8th frame of 240
+constexpr unsigned FrameTimes = 256;   // frames given to the device and not yet out: OUTPUT + the codec's delay + CAPTURE   // Qualcomm's AVC decoder asks 21 output slots at 720p
 constexpr uint32_t OutputBytes = 2u << 20;
 
 // --- IOSurface, through the guest process's own IOSurfaceRootUserClient ----------------------------------------------------
@@ -297,7 +306,11 @@ struct Session {
     // The frames sent and not yet given to the device. MaxInputs, not 128: the lock screen's video player sends 100-200 frames at
     // once when a session starts; refused at 128 (-12911), VideoToolbox opened another session without invalidating the first, every
     // few seconds, and each kept a 4K hardware decoder and its buffers on the host (500 MB apiece) until the host ran out of memory.
-    struct Input { int64_t frame; uint8_t *bytes; uint32_t size, capacity; } inputs[MaxInputs];
+    struct Input { int64_t frame; uint8_t *bytes; uint32_t size, capacity; int64_t ptsUs; } inputs[MaxInputs];
+    // The presentation times (microseconds, -1 unknown) of the frames given to the device, by frame % FrameTimes; and that of the
+    // last frame handed over with pixels (INT64_MIN: none yet).
+    struct FrameTime { int64_t frame = -1, ptsUs = -1; } frameTimes[FrameTimes];
+    int64_t lastShownUs = INT64_MIN;
     unsigned inputHead = 0, inputTail = 0;
     // An outstanding dfin: its request, answered when pendingFrames is 0 or at finishDeadline.
     bool finishWanted = false, draining = false;
@@ -642,6 +655,22 @@ void copyFrame(Session *s, const Mapped &from, const SurfaceView &to) {
 void emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
     Mapped &buffer = s->capture[index];
     uint8_t message[256];
+    const Session::FrameTime &time = s->frameTimes[uint64_t(frame) % FrameTimes];
+    const int64_t pts = time.frame == frame ? time.ptsUs : -1;
+    if (bytesused && pts >= 0) {
+        // Shown when ThinUs have passed since the last shown, or when time went back (a loop, a seek, a new segment).
+        if (s->lastShownUs != INT64_MIN && pts >= s->lastShownUs && pts - s->lastShownUs < ThinUs) {
+            const uint64_t emit = s->nextHostRequest++;
+            Writer e(message, sizeof message);
+            e.header(cc("Demt"), FlagHostRequest, s->uuid, emit);
+            e.s64(cc(",frm"), frame);
+            e.s32(cc(",err"), 0);
+            e.u32(cc(",inf"), 1 | 2);   // kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped
+            if (hostRequest(s, e, message, emit)) droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
+            return;
+        }
+        s->lastShownUs = pts;
+    }
     // Dbuf: a pixel buffer for the frame.
     const uint64_t request = s->nextHostRequest++;
     Writer w(message, sizeof message);
@@ -705,6 +734,7 @@ bool feedInput(Session *s) {
     for (unsigned i = 0; i < OutputBuffers; ++i) if (!s->output[i].queued) { index = i; break; }
     if (index == OutputBuffers || s->inputHead == s->inputTail) return false;
     const Session::Input input = s->inputs[s->inputTail++ % MaxInputs];
+    s->frameTimes[uint64_t(input.frame) % FrameTimes] = {input.frame, input.ptsUs};
     s->output[index].queued = true;
     IOLockUnlock(s->lock);
     Mapped &out = s->output[index];
@@ -1438,6 +1468,8 @@ void teardown(Session *s) {
     }
     s->pendingFrames = 0;
     s->outstandingCount = 0;
+    s->lastShownUs = INT64_MIN;
+    for (Session::FrameTime &t : s->frameTimes) t = {-1, -1};
     s->frameHead = s->frameTail = 0;
     s->finishWanted = s->draining = false;
     if (s->surfaces) {
@@ -1664,6 +1696,21 @@ int startSession(Session *s, const uint8_t *m, uint32_t n) {
     return 0;
 }
 
+// The presentation time of a sample buffer's first sample, in microseconds, from its stia (CMSampleTimingInfo: duration,
+// presentation and decode CMTime, each value int64, timescale int32, flags uint32, epoch int64, little endian); -1 if none.
+int64_t presentationUs(const Atom &sbuf) {
+    Atom stia;
+    if (!find(sbuf.body, sbuf.size, cc("stia"), stia) || stia.size < 48) return -1;
+    int64_t value;
+    int32_t timescale;
+    uint32_t flags;
+    memcpy(&value, stia.body + 24, 8);
+    memcpy(&timescale, stia.body + 32, 4);
+    memcpy(&flags, stia.body + 36, 4);
+    if (!(flags & 1) || timescale <= 0 || value < 0) return -1;   // kCMTimeFlags_Valid
+    return value / timescale * 1000000 + value % timescale * 1000000 / timescale;
+}
+
 // dfrm: the frame's NAL units as Annex B, kept for the worker (selector 3 never waits for an OUTPUT buffer).
 int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
     int64_t frame = 0;
@@ -1700,7 +1747,7 @@ int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
         failed(6, 0);
         return -12911;
     }
-    s->inputs[s->inputHead++ % MaxInputs] = {frame, bytes, at, capacity};
+    s->inputs[s->inputHead++ % MaxInputs] = {frame, bytes, at, capacity, presentationUs(sbuf)};
     ++s->pendingFrames;
     if (s->outstandingCount < MaxInputs) s->outstanding[s->outstandingCount++] = frame;
     IOLockUnlock(s->lock);
