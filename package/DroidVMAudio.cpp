@@ -43,7 +43,9 @@
 #include <mach/kmod.h>
 #include <libkern/OSKextLib.h>
 
+#if !DROIDVM_NATIVE_KEXT
 extern kmod_info_t g_kernel_kmod_info;
+#endif
 
 extern "C" {
 // The PCM transport (DroidVMVirtioSnd.c). Without a virtio-snd device it takes every output period and gives no input, so the
@@ -414,8 +416,10 @@ IOReturn DroidVMAudioUserClient::registerNotificationPort(mach_port_t, UInt32, i
     return kIOReturnSuccess;
 }
 
+#if !DROIDVM_NATIVE_KEXT
 #define DROIDVM_LATE_INIT(file) extern "C" void droidvm_late_init_##file(void) __asm__("__GLOBAL__sub_I_" #file ".cpp");
 DROIDVM_LATE_INIT(DroidVMAudio)
+#endif
 
 // OSMetaClass keeps its superclass after the vtable pointer and the reserved expansion pointer (libkern/c++/OSMetaClass.h:
 // reserved, superClassLink, className). Checked against the superclass the class was defined with before it is changed, and
@@ -454,11 +458,13 @@ int droidvm_audio_attach(void) {
     gTransportLock = IOLockAlloc();
     if (!gTransportLock) return -1;
     droidvm_audio_stage = 1;
+#if !DROIDVM_NATIVE_KEXT
     void *module = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!module) return -1;
     droidvm_late_init_DroidVMAudio();
     droidvm_audio_family_status = OSMetaClass::postModLoad(module);
     if (droidvm_audio_family_status) return -1;
+#endif   // a native kext's classes are registered as it loads
     droidvm_audio_stage = 2;
     // Normally loaded already, for IOAVFamily; a no-op then.
     droidvm_audio_family_status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOAudio2Family");
