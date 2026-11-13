@@ -165,12 +165,17 @@ static void reap_events(struct media_device *d) {
 // One command, synchronously: `command` (with `out` bytes of payload behind it) goes to the device, which writes a response
 // of `response` bytes (its header first) and up to `in` bytes of payload back into media_io[].in. Returns the response's
 // status (0 or a Linux errno), or -1 when the device did not answer.
-static int command(struct media_device *d, uint32_t command_size, uint32_t out, uint32_t response, uint32_t in) {
+// `extra`: a second device-readable buffer after the payload, at guest-physical `extra_pa` (a USERPTR buffer's scatter list, which
+// the device reads on from the payload: it walks the chain's readable descriptors as one stream).
+static int command(struct media_device *d, uint32_t command_size, uint32_t out, uint64_t extra_pa, uint32_t extra, uint32_t response,
+                   uint32_t in) {
     struct media_desc *desc = descriptors(d, MEDIA_COMMANDQ);
     uint16_t n = 0;
     desc[n] = (struct media_desc){pa(media_io[index_of(d)].command), command_size, 0, 0};
     if (out) { desc[n].flags = VIRTQ_DESC_F_NEXT; desc[n].next = (uint16_t)(n + 1); ++n;
                desc[n] = (struct media_desc){pa(media_io[index_of(d)].out), out, 0, 0}; }
+    if (extra) { desc[n].flags = VIRTQ_DESC_F_NEXT; desc[n].next = (uint16_t)(n + 1); ++n;
+                 desc[n] = (struct media_desc){extra_pa, extra, 0, 0}; }
     if (response) { desc[n].flags |= VIRTQ_DESC_F_NEXT; desc[n].next = (uint16_t)(n + 1); ++n;
                     desc[n] = (struct media_desc){pa(media_io[index_of(d)].response), response, VIRTQ_DESC_F_WRITE, 0}; }
     if (in) { desc[n].flags |= VIRTQ_DESC_F_NEXT; desc[n].next = (uint16_t)(n + 1); ++n;
@@ -198,7 +203,7 @@ int droidvm_media_open(unsigned device, uint32_t *session) {
     lck_mtx_lock(d->lock);
     const uint32_t cmd[2] = {CMD_OPEN, 0};
     memcpy(media_io[device].command, cmd, sizeof(cmd));
-    int status = command(d, sizeof(cmd), 0, 16, 0);
+    int status = command(d, sizeof(cmd), 0, 0, 0, 16, 0);
     if (!status) memcpy(session, media_io[device].response + 8, 4);
     lck_mtx_unlock(d->lock);
     return status;
@@ -210,21 +215,30 @@ int droidvm_media_close(unsigned device, uint32_t session) {
     lck_mtx_lock(d->lock);
     const uint32_t cmd[4] = {CMD_CLOSE, 0, session, 0};
     memcpy(media_io[device].command, cmd, sizeof(cmd));
-    int status = command(d, sizeof(cmd), 0, 0, 0);
+    int status = command(d, sizeof(cmd), 0, 0, 0, 0, 0);
     lck_mtx_unlock(d->lock);
     return status;
 }
 
 // An ioctl: `out` bytes of `payload` go to the device (an _IOW or _IOWR ioctl), and `in` bytes come back into it (_IOR or
 // _IOWR; the device writes the whole structure back, so `in` is the structure's size).
+int droidvm_media_ioctl_sg(unsigned device, uint32_t session, uint32_t code, void *payload, uint32_t out, uint32_t in, uint64_t sg,
+                           uint32_t sg_bytes);
 int droidvm_media_ioctl(unsigned device, uint32_t session, uint32_t code, void *payload, uint32_t out, uint32_t in) {
-    if (device >= media_count || !media[device].up || out > MEDIA_PAYLOAD || in > MEDIA_PAYLOAD) return -1;
+    return droidvm_media_ioctl_sg(device, session, code, payload, out, in, 0, 0);
+}
+
+// The same with a scatter list after the payload (`sg_bytes` of it at guest-physical `sg`): VIDIOC_QBUF of a USERPTR buffer, whose
+// v4l2_buffer is followed by the {start, length} entries of each plane's guest pages.
+int droidvm_media_ioctl_sg(unsigned device, uint32_t session, uint32_t code, void *payload, uint32_t out, uint32_t in, uint64_t sg,
+                           uint32_t sg_bytes) {
+    if (device >= media_count || !media[device].up || out > MEDIA_PAYLOAD || in > MEDIA_PAYLOAD || (sg_bytes && !out)) return -1;
     struct media_device *d = &media[device];
     lck_mtx_lock(d->lock);
     const uint32_t cmd[4] = {CMD_IOCTL, 0, session, code};
     memcpy(media_io[device].command, cmd, sizeof(cmd));
     if (out) memcpy(media_io[device].out, payload, out);
-    int status = command(d, sizeof(cmd), out, 8, in);
+    int status = command(d, sizeof(cmd), out, sg, sg_bytes, 8, in);
     if (!status && in) memcpy(payload, media_io[device].in, in);
     lck_mtx_unlock(d->lock);
     return status;
@@ -237,7 +251,7 @@ int droidvm_media_mmap(unsigned device, uint32_t session, uint32_t offset, bool 
     lck_mtx_lock(d->lock);
     const uint32_t cmd[5] = {CMD_MMAP, 0, session, writable ? 1u : 0u, offset};
     memcpy(media_io[device].command, cmd, sizeof(cmd));
-    int status = command(d, sizeof(cmd), 0, 24, 0);
+    int status = command(d, sizeof(cmd), 0, 0, 0, 24, 0);
     if (!status) {
         uint64_t at, size;
         memcpy(&at, media_io[device].response + 8, 8);
@@ -256,7 +270,7 @@ int droidvm_media_munmap(unsigned device, uint64_t gpa) {
     const uint64_t at = gpa - d->pool_base;
     uint32_t cmd[4] = {CMD_MUNMAP, 0, (uint32_t)at, (uint32_t)(at >> 32)};
     memcpy(media_io[device].command, cmd, sizeof(cmd));
-    int status = command(d, sizeof(cmd), 0, 8, 0);
+    int status = command(d, sizeof(cmd), 0, 0, 0, 8, 0);
     lck_mtx_unlock(d->lock);
     return status;
 }

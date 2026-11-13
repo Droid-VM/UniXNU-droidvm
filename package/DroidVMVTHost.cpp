@@ -44,6 +44,7 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/c++/OSString.h>
 #include <kern/thread.h>
 #include <stdarg.h>
@@ -57,6 +58,8 @@ int droidvm_media_close(unsigned device, uint32_t session);
 int droidvm_media_ioctl(unsigned device, uint32_t session, uint32_t code, void *payload, uint32_t out, uint32_t in);
 int droidvm_media_mmap(unsigned device, uint32_t session, uint32_t offset, bool writable, uint64_t *gpa, uint64_t *length);
 int droidvm_media_munmap(unsigned device, uint64_t gpa);
+int droidvm_media_ioctl_sg(unsigned device, uint32_t session, uint32_t code, void *payload, uint32_t out, uint32_t in, uint64_t sg,
+                           uint32_t sgBytes);
 unsigned droidvm_media_devices(void);
 uint32_t droidvm_media_caps(unsigned device);
 const char *droidvm_media_card(unsigned device);
@@ -99,7 +102,7 @@ void failed(uint32_t stage, int32_t value) {
 enum : uint32_t {
     IocGFmt = 4, IocSFmt = 5, IocReqbufs = 8, IocQuerybuf = 9, IocQbuf = 15, IocStreamon = 18, IocStreamoff = 19, IocGCtrl = 27,
     IocSubscribeEvent = 90, IocDecoderCmd = 96, IocEnumFramesizes = 74,
-    TypeCaptureMplane = 9, TypeOutputMplane = 10, MemoryMmap = 1,
+    TypeCaptureMplane = 9, TypeOutputMplane = 10, MemoryMmap = 1, MemoryUserPtr = 2,
     EventEos = 2, EventSourceChange = 5,
     BufFlagLast = 0x00100000, BufFlagError = 0x40,
     CidMinBuffersForCapture = 0x00980927,
@@ -252,10 +255,14 @@ bool lookupSurface(IOUserClient *client, uint32_t id, SurfaceView &view, IOUserC
 // --- Sessions ---------------------------------------------------------------------------------------------------------------
 struct Client;
 
+// A buffer of a queue: guest memory of ours the device reads or writes in place (USERPTR), given to it by the scatter list of its
+// pages at every QBUF. Not MMAP: a host buffer comes out of the media_host pool, which crosvm shares once at boot and two 4K
+// decoders (a lock screen's video and its still) outgrew; ours come from the guest's memory, as many as the codec asks.
 struct Mapped {
-    uint64_t gpa = 0, length = 0;
-    IOMemoryDescriptor *memory = nullptr;
-    IOMemoryMap *map = nullptr;
+    uint64_t length = 0;
+    IOBufferMemoryDescriptor *buffer = nullptr, *sg = nullptr;   // the bytes; their {start, length} list (physically contiguous)
+    uint64_t sgAddress = 0;
+    uint32_t sgBytes = 0;
     uint8_t *bytes = nullptr;
     bool queued = false;
 };
@@ -413,28 +420,63 @@ int ioctl(Session *s, uint32_t code, void *payload, uint32_t out, uint32_t in) {
     return droidvm_media_ioctl(s->device, s->v4l2, code, payload, out, in);
 }
 
+struct SgEntry { uint64_t start; uint32_t length, padding; };   // virtio-media's struct virtio_media_sg_entry
+constexpr uint32_t MaxSgEntries = 4096;                         // the device's MAX_SG_ENTRIES
+
+void unmapBuffer(Session *s, Mapped &m) {
+    if (m.buffer) { m.buffer->complete(); m.buffer->release(); }
+    OSSafeReleaseNULL(m.sg);
+    m = Mapped();
+}
+
+// Buffer `index` of the queue (after REQBUFS with USERPTR): as long as the device says (QUERYBUF's plane length, the queue's
+// sizeimage, which a USERPTR buffer must give exactly), wired, and the list of its pages, adjacent ones merged.
 bool mapBuffer(Session *s, uint32_t type, uint32_t index, Mapped &m) {
     V4l2Buffer b = {};
-    b.index = index; b.type = type; b.memory = MemoryMmap; b.length = 1;
+    b.index = index; b.type = type; b.memory = MemoryUserPtr; b.length = 1;
     int r = ioctl(s, IocQuerybuf, &b, sizeof b, sizeof b);
-    if (r) { failed(10, r); return false; }
-    uint64_t gpa = 0, length = 0;
-    r = droidvm_media_mmap(s->device, s->v4l2, uint32_t(b.plane.m), true, &gpa, &length);
-    if (r) { failed(11, r); return false; }
-    m.gpa = gpa;
-    m.length = length;
-    m.memory = IOMemoryDescriptor::withPhysicalAddress(gpa, length, kIODirectionInOut);
-    m.map = m.memory ? m.memory->map(kIOMapCopybackCache) : nullptr;
-    m.bytes = m.map ? reinterpret_cast<uint8_t *>(m.map->getVirtualAddress()) : nullptr;
-    if (!m.bytes) { failed(12, 0); return false; }
+    if (r || !b.plane.length) { failed(10, r ? r : -1); return false; }
+    m.length = b.plane.length;
+    m.buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, m.length, 16384);
+    if (!m.buffer || m.buffer->prepare() != kIOReturnSuccess) { OSSafeReleaseNULL(m.buffer); failed(11, int32_t(m.length)); return false; }
+    m.bytes = static_cast<uint8_t *>(m.buffer->getBytesNoCopy());
+    SgEntry *entries = static_cast<SgEntry *>(IOMalloc(MaxSgEntries * sizeof(SgEntry)));
+    if (!entries) { unmapBuffer(s, m); failed(12, 0); return false; }
+    uint32_t count = 0;
+    for (uint64_t at = 0; at < m.length;) {
+        IOByteCount segment = 0;
+        const uint64_t pa = m.buffer->getPhysicalSegment(at, &segment, kIOMemoryMapperNone);
+        if (!pa || !segment) { count = 0; break; }
+        if (segment > m.length - at) segment = IOByteCount(m.length - at);
+        if (count && entries[count - 1].start + entries[count - 1].length == pa && entries[count - 1].length + segment < (1ull << 31))
+            entries[count - 1].length += uint32_t(segment);
+        else if (count < MaxSgEntries)
+            entries[count++] = {pa, uint32_t(segment), 0};
+        else { count = 0; break; }
+        at += segment;
+    }
+    if (count) {
+        m.sgBytes = count * uint32_t(sizeof(SgEntry));
+        m.sg = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionOut) |
+                                                                IOOptionBits(kIOMemoryPhysicallyContiguous), m.sgBytes,
+                                                                0x0000fffffffff000ULL);
+        if (m.sg) {
+            memcpy(m.sg->getBytesNoCopy(), entries, m.sgBytes);
+            m.sgAddress = m.sg->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+        }
+    }
+    IOFree(entries, MaxSgEntries * sizeof(SgEntry));
+    if (!m.sgAddress) { unmapBuffer(s, m); failed(12, int32_t(count)); return false; }
     return true;
 }
 
-void unmapBuffer(Session *s, Mapped &m) {
-    OSSafeReleaseNULL(m.map);
-    OSSafeReleaseNULL(m.memory);
-    if (m.gpa) droidvm_media_munmap(s->device, m.gpa);
-    m = Mapped();
+// QBUF of a buffer of ours: the v4l2_buffer names it by its kernel address (the device only echoes it) and its pages follow.
+int queueBuffer(Session *s, V4l2Buffer &b, const Mapped &m) {
+    b.memory = MemoryUserPtr;
+    b.length = 1;
+    b.plane.m = uint64_t(uintptr_t(m.bytes));
+    b.plane.length = uint32_t(m.length);
+    return droidvm_media_ioctl_sg(s->device, s->v4l2, IocQbuf, &b, sizeof b, sizeof b, m.sgAddress, m.sgBytes);
 }
 
 // The parameter sets of an avcC or hvcC, as Annex B, and the NAL length size.
@@ -535,16 +577,15 @@ bool setUpCapture(Session *s) {
     uint32_t control[2] = {CidMinBuffersForCapture, 0};
     unsigned count = ioctl(s, IocGCtrl, control, sizeof control, sizeof control) ? 8 : control[1] + 2;
     if (count > MaxCaptureBuffers) count = MaxCaptureBuffers;
-    uint32_t request[5] = {count, TypeCaptureMplane, MemoryMmap, 0, 0};
+    uint32_t request[5] = {count, TypeCaptureMplane, MemoryUserPtr, 0, 0};
     r = ioctl(s, IocReqbufs, request, sizeof request, sizeof request);
     if (r || !request[0]) { failed(51, r); return false; }
     s->captureCount = request[0] < MaxCaptureBuffers ? request[0] : MaxCaptureBuffers;
     for (unsigned i = 0; i < s->captureCount; ++i) {
         if (!mapBuffer(s, TypeCaptureMplane, i, s->capture[i])) return false;
         V4l2Buffer b = {};
-        b.index = i; b.type = TypeCaptureMplane; b.memory = MemoryMmap; b.length = 1;
-        b.plane.length = uint32_t(s->capture[i].length);
-        r = ioctl(s, IocQbuf, &b, sizeof b, sizeof b);
+        b.index = i; b.type = TypeCaptureMplane;
+        r = queueBuffer(s, b, s->capture[i]);
         if (r) { failed(52, r); return false; }
         s->capture[i].queued = true;
     }
@@ -632,9 +673,8 @@ void dropOutstanding(Session *s) {
 
 void requeueCapture(Session *s, unsigned index) {
     V4l2Buffer b = {};
-    b.index = index; b.type = TypeCaptureMplane; b.memory = MemoryMmap; b.length = 1;
-    b.plane.length = uint32_t(s->capture[index].length);
-    const int r = ioctl(s, IocQbuf, &b, sizeof b, sizeof b);
+    b.index = index; b.type = TypeCaptureMplane;
+    const int r = queueBuffer(s, b, s->capture[index]);
     if (r) failed(54, r);
     else s->capture[index].queued = true;
 }
@@ -652,11 +692,10 @@ bool feedInput(Session *s) {
     memcpy(out.bytes, input.bytes, size);
     IOFree(input.bytes, input.capacity);
     V4l2Buffer b = {};
-    b.index = index; b.type = TypeOutputMplane; b.memory = MemoryMmap; b.length = 1;
+    b.index = index; b.type = TypeOutputMplane;
     b.sec = input.frame;
     b.plane.bytesused = size;
-    b.plane.length = uint32_t(out.length);
-    const int r = ioctl(s, IocQbuf, &b, sizeof b, sizeof b);
+    const int r = queueBuffer(s, b, out);
     IOLockLock(s->lock);
     if (r) {
         failed(8, r);
@@ -1057,11 +1096,10 @@ bool feedFrame(Session *s) {
     OSSafeReleaseNULL(map);
     if (memory) { memory->complete(); memory->release(); }
     V4l2Buffer b = {};
-    b.index = index; b.type = TypeOutputMplane; b.memory = MemoryMmap; b.length = 1;
+    b.index = index; b.type = TypeOutputMplane;
     b.sec = frame;
     b.plane.bytesused = need;
-    b.plane.length = uint32_t(out.length);
-    const int r = ioctl(s, IocQbuf, &b, sizeof b, sizeof b);
+    const int r = queueBuffer(s, b, out);
     IOLockLock(s->lock);
     if (r) { failed(85, r); out.queued = false; }
     return true;
@@ -1279,12 +1317,12 @@ int startEncoder(Session *s, const uint8_t *m, uint32_t n) {
     f.planes[0].sizeimage = width * height * 3 / 2;
     r = ioctl(s, IocSFmt, &f, sizeof f, sizeof f);
     if (r) { failed(92, r); return -12911; }
-    uint32_t request[5] = {OutputBuffers, TypeOutputMplane, MemoryMmap, 0, 0};
+    uint32_t request[5] = {OutputBuffers, TypeOutputMplane, MemoryUserPtr, 0, 0};
     r = ioctl(s, IocReqbufs, request, sizeof request, sizeof request);
     if (r || request[0] < OutputBuffers) { failed(93, r ? r : int32_t(request[0])); return -12904; }
     for (unsigned i = 0; i < OutputBuffers; ++i)
         if (!mapBuffer(s, TypeOutputMplane, i, s->output[i])) return -12904;
-    uint32_t captures[5] = {6, TypeCaptureMplane, MemoryMmap, 0, 0};
+    uint32_t captures[5] = {6, TypeCaptureMplane, MemoryUserPtr, 0, 0};
     r = ioctl(s, IocReqbufs, captures, sizeof captures, sizeof captures);
     if (r || !captures[0]) { failed(94, r); return -12904; }
     s->captureCount = captures[0] < MaxCaptureBuffers ? captures[0] : MaxCaptureBuffers;
@@ -1586,7 +1624,7 @@ int startSession(Session *s, const uint8_t *m, uint32_t n) {
     f.planes[0].sizeimage = OutputBytes;
     r = ioctl(s, IocSFmt, &f, sizeof f, sizeof f);
     if (r) { failed(3, r); return -12911; }
-    uint32_t request[5] = {OutputBuffers, TypeOutputMplane, MemoryMmap, 0, 0};
+    uint32_t request[5] = {OutputBuffers, TypeOutputMplane, MemoryUserPtr, 0, 0};
     r = ioctl(s, IocReqbufs, request, sizeof request, sizeof request);
     if (r || request[0] < OutputBuffers) { failed(4, r ? r : int32_t(request[0])); return -12904; }
     for (unsigned i = 0; i < OutputBuffers; ++i)
