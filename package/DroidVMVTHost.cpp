@@ -104,11 +104,13 @@ void failed(uint32_t stage, int32_t value) {
 // --- V4L2 over virtio-media (64-bit Linux layouts) ----------------------------------------------------------------------------
 enum : uint32_t {
     IocGFmt = 4, IocSFmt = 5, IocReqbufs = 8, IocQuerybuf = 9, IocQbuf = 15, IocStreamon = 18, IocStreamoff = 19, IocGCtrl = 27,
+    IocSCtrl = 28,
     IocSubscribeEvent = 90, IocDecoderCmd = 96, IocEnumFramesizes = 74,
     TypeCaptureMplane = 9, TypeOutputMplane = 10, MemoryMmap = 1, MemoryUserPtr = 2,
     EventEos = 2, EventSourceChange = 5,
     BufFlagLast = 0x00100000, BufFlagError = 0x40,
     CidMinBuffersForCapture = 0x00980927,
+    CidDecDisplayDelay = 0x00990b8d, CidDecDisplayDelayEnable = 0x00990b8e,   // V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY(_ENABLE)
     DecCmdStart = 0, DecCmdStop = 1,
     MediaEvtError = 0, MediaEvtDqbuf = 1, MediaEvtEvent = 2,
 };
@@ -132,12 +134,50 @@ struct V4l2Format {   // struct v4l2_format with v4l2_pix_format_mplane
 static_assert(sizeof(V4l2Format) == 208, "v4l2_format");
 
 constexpr unsigned OutputBuffers = 4, MaxCaptureBuffers = 32, MaxInputs = 4096;
+// CAPTURE buffers queued at once. msm_vidc asks for 12 (MIN_BUFFERS_FOR_CAPTURE) and is given 14, but decodes the aerials with
+// 6 queued (5 with layers 0-1; none with 4; research/vidc-probe vidc-replay --queue). Direct, each held a 4K P010 pool surface
+// (26.7 MB) of the player's: four sessions' 14 were the aerials' 1.49 GB, killed at its memory limit (11-04 on the phone).
+constexpr unsigned CaptureInFlight = 6;
+// Synchronous dfrms waiting for their frame (the guest sends the next only once one is answered: one at a time per thread).
+constexpr unsigned MaxSyncReplies = 8;
+// Asynchronous frames given and not handed over before a dfrm's reply waits (Apple's host: at most 3 in flight).
+constexpr unsigned AsyncInFlight = 3;
+constexpr uint32_t AsyncDemtMs = 2000;
 constexpr uint32_t IdleCloseMs = 1000;   // workerMain: the lock screen's player opens a new session every 3 s or so
-uint64_t idleCloseTicks() {
-    static uint64_t ticks;
-    if (!ticks) nanoseconds_to_absolutetime(uint64_t(IdleCloseMs) * 1000000, &ticks);
-    return ticks;
-}
+constexpr uint32_t FinishMs = 2000;   // a dfin with no frame coming out for this long drops what is left (answerFinish)
+// Device sessions held at once (makeRoom). The lock screen's player starts a session for every clip and lets the old ones go
+// only much later; each held a 4K decoder on the host (one of msm_vidc's eight) and, copying, 14 CAPTURE buffers of 26.7 MB in
+// the guest -- five of them left VideoToolbox no memory for pixel buffers, its Dbuf answers stopped, no session's frames came
+// out and none went quiet enough to be closed (research/vthost-harness). A new session closes the least recently fed other
+// one with every frame handed over once SoftDeviceSessions are open and that one has had no frame for EvictIdleMs, or whatever
+// its age once HardDeviceSessions are (makeRoom); a session closed so starts again at its next sync sample, or from the frames
+// since its last (MaxReplay).
+constexpr unsigned SoftDeviceSessions = 2, HardDeviceSessions = 3;
+constexpr uint32_t EvictIdleMs = 500;
+// A session let go is drained first (its last frames, which the codec keeps for reordering till the stream ends, handed over with
+// pixels): for at most EvictDrainMs, and only one with at most EvictFrames still to hand over. The player gives no dfin till much
+// later, and these frames kept every session from counting as done: eight open, the aerials' pool surfaces 1.22 GB (11-04).
+constexpr uint32_t EvictDrainMs = 500;
+// A session given nothing for IdleDrainMs with frames still inside the codec is drained (workerMain): the codec keeps the last
+// few back for reordering till more come, and the lock screen's player reads a clip in at once and lets the session go once it
+// has what it waited for -- a frame handed over after that ended the session inside the Demt, under the decoder's lock, and its
+// VTDecompressionSessionInvalidate took that lock again: os_unfair_lock_recursive_abort (11-04 on the phone, v6). After the
+// drain the device goes on (DEC_CMD_START) from the next frame, a few frames flagged ERROR (handed over dropped).
+// IdleDrainMs, EvictDrainMs and MaxBacklog are for display order only (a device without the display delay control: MediaCodec,
+// an older crosvm): in decode order every frame comes out as soon as decoded and a synchronous player waits for each (dfrm).
+constexpr uint32_t IdleDrainMs = 200;
+constexpr unsigned EvictFrames = 16;
+// Frames waiting for an OUTPUT buffer (queueFrame): past MaxBacklog the session is behind (its worker waiting on the guest, the
+// device slower than the stream) and sheds one more temporal layer (keptLayer), at most every ShedMs -- never a frame another
+// refers to: the aerials' clips have one sync sample, their first frame, and a stretch dropped up to the next one was the rest
+// of the clip black (11-04 on the phone).
+constexpr unsigned MaxBacklog = 32;
+// The frames since the last sync sample kept to start a session let go again from (queueFrame): the next clip's session, opened
+// ahead with its first frame, then let go for a third -- the clip's one sync sample gone with it, the clip was black (11-04).
+constexpr unsigned MaxReplay = 16;
+constexpr uint32_t MaxReplayBytes = 16 << 20;
+constexpr uint32_t ShedMs = 500;
+constexpr uint32_t DbufPauseMs = 500;
 // Frame thinning. The lock screen's aerials are 4K HEVC at 240 frames a second (idleassetsd's 4KSDR240FPS); its player decodes
 // every frame and shows about 30 of them a second, and nothing in AVFoundation asks for fewer (ReducedFrameDelivery is set by no
 // one but VideoToolbox's own callers). A pixel buffer and a 4K copy for each of the 240 is ten times what this path does, so the
@@ -344,13 +384,46 @@ struct Session {
     bool finishWanted = false, draining = false;
     uint64_t finishRequest = 0;
     uint64_t finishDeadline = 0;
+    uint32_t pendingAtDeadline = 0;   // pendingFrames when finishDeadline was last set: fewer since, the deadline moves on
     Event events[64];
     unsigned eventHead = 0, eventTail = 0;
     bool stopping = false, workerRunning = false;
     // The device session let go while VideoToolbox's lives on (workerMain): the dsta that started it, to start it again with.
     bool idleClosed = false, finished = false;
+    // evict: makeRoom (or a device error) asks the worker to let the device session go as when idle; resync: frames are
+    // dropped until a sync sample, which (re)starts the device session if it was let go.
+    bool evict = false, resync = false;
+    uint64_t evictDrainUntil = 0;   // evicted with frames inside the codec: drained first, till then (evictNow)
+    bool idleDrained = false;   // drained for having been given nothing for IdleDrainMs, since the last frame given
+    // Decode order (the device's display delay 0, set at startSession): a frame out for every one given, as soon as it is
+    // decoded -- what Apple's host does. Only then is a synchronous dfrm answered after its frame's Demt (syncReplies); in
+    // display order the device keeps frames back till later ones come, and a player waiting on each would wait for ever.
+    bool decodeOrder = false;
+    // demt: its Demt's request, sent from the guest's message thread (not waited for there): the dfrm answered when the Demt is.
+    // async: an asynchronous dfrm's, held while AsyncInFlight frames are out (releaseAsync), not tied to its frame.
+    struct SyncReply { int64_t frame; uint64_t request, demt; bool async; } syncReplies[MaxSyncReplies];
+    unsigned syncReplyCount = 0;
+    // Demts of asynchronous frames sent and not yet answered by the guest (request, when sent): out still, as VideoToolbox sees
+    // it (its queue behind). One unanswered for AsyncDemtMs no longer counts (an answer lost must not hold the player for ever).
+    struct SentDemt { uint64_t request, at; } sentDemts[32];
+    unsigned sentDemtCount = 0;
+    bool dflLogged = false;
+    // For the life log at its end (logEnd): frames given to the device, handed over with pixels, handed over dropped; when the
+    // last went out with pixels.
+    uint32_t statIn = 0, statOut = 0, statDropped = 0;
+    uint64_t lastOutAt = 0;
+    uint8_t shed = 0;          // temporal layers given up below keptLayer's own choice because the session fell behind
+    uint64_t shedAfter = 0;    // the next shedding not before this (mach_absolute_time)
+    uint64_t resumeAfter = 0;   // a start again the device refused: the next try not before this (mach_absolute_time)
+    uint64_t dbufPauseUntil = 0;   // emitFrame: no Dbuf before this, after one went unanswered
     uint8_t *startMessage = nullptr;
     uint32_t startSize = 0;
+    // The frames given to the device since the last sync sample (Annex B, no parameter sets), while MaxReplay and MaxReplayBytes
+    // hold them all (replayable): a session let go with these behind it starts again from them, at any frame (queueFrame).
+    struct Saved { int64_t frame; uint8_t *bytes; uint32_t size; int64_t ptsUs; uint8_t tid; } replay[MaxReplay];
+    unsigned replayCount = 0;
+    uint32_t replaySize = 0;
+    bool replayable = false;
     uint64_t lastInputAt = 0;   // mach_absolute_time of the last dfrm queued
     thread_t worker = nullptr;
     uint32_t pendingFrames = 0;
@@ -397,6 +470,9 @@ struct Client {
     task_t task;
     int pid;
     IOLock *lock;
+    // The sessions list, against the guest's replies (droidvm_vthost_message), which come on another guest thread than its
+    // requests and take no `lock` (a dinv holds that while its worker waits): a -dec freed the session a reply had found.
+    IOLock *listLock;
     Session *sessions;
 };
 
@@ -661,7 +737,7 @@ bool hostRequest(Session *s, Writer &w, const uint8_t *buffer, uint64_t request)
     IOLockLock(s->lock);
     AbsoluteTime deadline;
     clock_interval_to_deadline(2000, kMillisecondScale, &deadline);
-    while (!s->replied && !s->stopping)
+    while (!s->replied && !s->stopping && !s->evict)
         if (IOLockSleepDeadline(s->lock, &s->replied, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) break;
     const bool replied = s->replied;
     s->awaitedRequest = 0;
@@ -822,7 +898,8 @@ bool setUpCapture(Session *s) {
     uint32_t request[5] = {count, TypeCaptureMplane, MemoryUserPtr, 0, 0};
     r = ioctl(s, IocReqbufs, request, sizeof request, sizeof request);
     if (r || !request[0]) { failed(51, r); return false; }
-    s->captureCount = request[0] < MaxCaptureBuffers ? request[0] : MaxCaptureBuffers;
+    // Only CaptureInFlight of them used: the rest never queued, never given memory.
+    s->captureCount = request[0] < CaptureInFlight ? request[0] : CaptureInFlight;
     const bool direct = setUpDirect(s);
     for (unsigned i = 0; i < s->captureCount; ++i) {
         if (!direct && !mapBuffer(s, TypeCaptureMplane, i, s->capture[i])) return false;
@@ -890,6 +967,10 @@ void copyFrame(Session *s, const Mapped &from, const SurfaceView &to) {
     memory->release();
 }
 
+void handOverDropped(Session *s, int64_t frame, bool wait = true);
+bool syncFrame(Session *s, int64_t frame);
+bool sendDemt(Session *s, Writer &e, const uint8_t *message, uint64_t request, int64_t frame, bool sync, bool wait = true);
+
 // Returns whether the slot's pool surface went with the frame (direct): the slot then needs another.
 bool emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
     Mapped &buffer = s->capture[index];
@@ -899,13 +980,7 @@ bool emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
     if (bytesused && pts >= 0) {
         // Shown when ThinUs have passed since the last shown, or when time went back (a loop, a seek, a new segment).
         if (s->lastShownUs != INT64_MIN && pts >= s->lastShownUs && pts - s->lastShownUs < ThinUs) {
-            const uint64_t emit = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
-            Writer e(message, sizeof message);
-            e.header(cc("Demt"), FlagHostRequest, s->uuid, emit);
-            e.s64(cc(",frm"), frame);
-            e.s32(cc(",err"), 0);
-            e.u32(cc(",inf"), 1 | 2);   // kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped
-            if (sendToGuest(s->client, e, message)) droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
+            handOverDropped(s, frame);
             return false;
         }
         s->lastShownUs = pts;
@@ -914,22 +989,38 @@ bool emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
         // Decoded in place: the surface goes as it is, once no line the guest's caches hold of it (prefetched while the device
         // wrote) can stand in for what the device put there.
         if (buffer.memory) buffer.memory->performOperation(kIOMemoryIncoherentIOFlush, 0, buffer.length);
+        const bool sync = syncFrame(s, frame);
+        const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
         Writer e(message, sizeof message);
-        e.header(cc("Demt"), FlagHostRequest, s->uuid, __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED));
+        e.header(cc("Demt"), FlagHostRequest, s->uuid, request);
         e.s64(cc(",frm"), frame);
         e.s32(cc(",err"), 0);
-        e.u32(cc(",inf"), 1);
+        e.u32(cc(",inf"), sync ? 0 : 1);
         e.uuid(cc(",uui"), buffer.uuid);
-        if (sendToGuest(s->client, e, message)) droidvm_vthost_frames_out = droidvm_vthost_frames_out + 1;
+        if (sendDemt(s, e, message, request, frame, sync)) droidvm_vthost_frames_out = droidvm_vthost_frames_out + 1;
+        ++s->statOut;
+        s->lastOutAt = mach_absolute_time();
         return true;
     }
-    // Dbuf: a pixel buffer for the frame.
+    // Dbuf: a pixel buffer for the frame -- not while the guest is not answering (DbufPauseMs after one went unanswered: each
+    // more would wait its two seconds behind the last in the guest's queue), the frame handed over dropped then.
+    if (mach_absolute_time() < s->dbufPauseUntil) {
+        handOverDropped(s, frame);
+        return false;
+    }
     const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
     Writer w(message, sizeof message);
     w.header(cc("Dbuf"), FlagHostRequest, s->uuid, request);
     w.s64(cc(",frm"), frame);
-    if (!hostRequest(s, w, message, request) || s->replyError || !s->replyHasSurface) {
+    const bool replied = hostRequest(s, w, message, request);
+    if (!replied || s->replyError || !s->replyHasSurface) {
         failed(31, s->replyError);
+        if (!replied) {
+            uint64_t pause;
+            nanoseconds_to_absolutetime(uint64_t(DbufPauseMs) * 1000000, &pause);
+            s->dbufPauseUntil = mach_absolute_time() + pause;
+        }
+        handOverDropped(s, frame);   // VideoToolbox waits for every frame given: one never handed over, it waited for forever
         return false;
     }
     uint8_t pixelBuffer[16];
@@ -937,17 +1028,20 @@ bool emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
     const SurfaceView surface = s->replySurface;
     if (bytesused) copyFrame(s, buffer, surface);
     // Demt: the frame, decoded into that pixel buffer.
+    const bool sync = syncFrame(s, frame);
     const uint64_t emit = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
     Writer e(message, sizeof message);
     e.header(cc("Demt"), FlagHostRequest, s->uuid, emit);
     e.s64(cc(",frm"), frame);
     e.s32(cc(",err"), bytesused ? 0 : -12911);
-    e.u32(cc(",inf"), 1);
+    e.u32(cc(",inf"), sync ? 0 : 1);
     e.uuid(cc(",uui"), pixelBuffer);
-    // Not waited for: the guest's answer to a Demt carries nothing this side uses (an answer no one awaits is let go, see
-    // droidvm_vthost_message), and waiting for it was a round trip to the player's process for every frame -- 40 ms a frame
-    // for the lock screen's (a background process), the ceiling of the whole path (21 frames a second of 240).
-    if (sendToGuest(s->client, e, message)) droidvm_vthost_frames_out = droidvm_vthost_frames_out + 1;
+    // An asynchronous frame's not waited for: the guest's answer to a Demt carries nothing this side uses (an answer no one
+    // awaits is let go, see droidvm_vthost_message), and waiting for it was a round trip to the player's process for every
+    // frame -- 40 ms a frame for the lock screen's (a background process), when it gave thousands of frames a second.
+    if (sendDemt(s, e, message, emit, frame, sync)) droidvm_vthost_frames_out = droidvm_vthost_frames_out + 1;
+    ++s->statOut;
+    s->lastOutAt = mach_absolute_time();
     return false;
 }
 
@@ -958,22 +1052,186 @@ void forgetFrame(Session *s, int64_t frame) {
     IOLockUnlock(s->lock);
 }
 
-// The frames that never came out (a codec that dropped them, a decoder too small for the stream): each handed over failed.
+// Whether VideoToolbox still waits for `frame`: a frame handed over already (failed at a dfin's deadline, dropped when the
+// session fell behind or let its device session go) may still come out of the device, and must not be handed over twice.
+bool isOutstanding(Session *s, int64_t frame) {
+    IOLockLock(s->lock);
+    bool found = false;
+    for (unsigned i = 0; i < s->outstandingCount && !found; ++i) found = s->outstanding[i] == frame;
+    IOLockUnlock(s->lock);
+    return found;
+}
+
+// --- Synchronous dfrm (reims-vgpu docs/video/devices.md, docs/reims-vgpu-vtpv-contract.md) ---------------------------------
+// Apple's host answers a dfrm without ,dfl's asynchronous bit only once the frame is handed over: Dbuf, its answer, Demt, its
+// answer, then the dfrm's reply (,err 0, ,inf 0). The guest's VTDecompressionSessionDecodeFrame waits for that reply before it
+// gives the next frame: the player's pace. Answered at once instead, the lock screen's player gave 4000-5000 frames a second,
+// and every session-lifecycle problem of 11-03/04 followed from it.
+
+// Frames out as an asynchronous player sees them (the lock held): not handed over, and handed over in a Demt not yet answered.
+unsigned asyncOut(Session *s) {
+    uint64_t limit;
+    nanoseconds_to_absolutetime(uint64_t(AsyncDemtMs) * 1000000, &limit);
+    const uint64_t now = mach_absolute_time();
+    unsigned n = s->outstandingCount;
+    for (unsigned i = 0; i < s->sentDemtCount;)
+        if (now - s->sentDemts[i].at >= limit) s->sentDemts[i] = s->sentDemts[--s->sentDemtCount];
+        else { ++n; ++i; }
+    return n;
+}
+
+// A dfrm's reply: ,inf 0 synchronous, 1 asynchronous, as Apple's.
+void answerRequest(Session *s, uint64_t request, int32_t error, bool async) {
+    uint8_t buffer[128];
+    Writer w(buffer, sizeof buffer);
+    w.header(cc("dfrm"), FlagReply, s->uuid, request);
+    w.s32(cc(",err"), error);
+    w.u32(cc(",inf"), async ? 1 : 0);
+    sendToGuest(s->client, w, buffer);
+}
+
+void releaseAsync(Session *s, int32_t error = 0, bool all = false);
+
+// Whether `frame` is a synchronous dfrm's, still unanswered.
+bool syncFrame(Session *s, int64_t frame) {
+    IOLockLock(s->lock);
+    bool found = false;
+    for (unsigned i = 0; i < s->syncReplyCount && !found; ++i) found = !s->syncReplies[i].async && s->syncReplies[i].frame == frame;
+    IOLockUnlock(s->lock);
+    return found;
+}
+
+// The dfrm's reply for `frame`, if it is a synchronous one still unanswered (,inf 0, as Apple's); with `demt`, the one whose
+// Demt that is (its answer come).
+void answerFrame(Session *s, int64_t frame, int32_t error, uint64_t demt = 0) {
+    uint64_t request = 0;
+    bool found = false;
+    IOLockLock(s->lock);
+    for (unsigned i = 0; i < s->syncReplyCount && !found; ++i)
+        if (!s->syncReplies[i].async && (demt ? s->syncReplies[i].demt == demt : s->syncReplies[i].frame == frame)) {
+            request = s->syncReplies[i].request;
+            s->syncReplies[i] = s->syncReplies[--s->syncReplyCount];
+            found = true;
+        }
+    IOLockUnlock(s->lock);
+    if (found) answerRequest(s, request, error, false);
+}
+
+// The asynchronous dfrms held (the oldest first) answered while fewer than AsyncInFlight frames are out; `all`: every one.
+void releaseAsync(Session *s, int32_t error, bool all) {
+    for (;;) {
+        uint64_t request = 0;
+        bool found = false;
+        IOLockLock(s->lock);
+        if (all || asyncOut(s) <= AsyncInFlight) {
+            unsigned oldest = s->syncReplyCount;
+            for (unsigned i = 0; i < s->syncReplyCount; ++i)
+                if (s->syncReplies[i].async && (oldest == s->syncReplyCount || s->syncReplies[i].request < s->syncReplies[oldest].request))
+                    oldest = i;
+            if (oldest < s->syncReplyCount) {
+                request = s->syncReplies[oldest].request;
+                s->syncReplies[oldest] = s->syncReplies[--s->syncReplyCount];
+                found = true;
+            }
+        }
+        IOLockUnlock(s->lock);
+        if (!found) return;
+        answerRequest(s, request, error, true);
+    }
+}
+
+// Every synchronous dfrm still unanswered, answered (the session's device session ends: nothing more will come of them).
+void answerAllFrames(Session *s, int32_t error) {
+    releaseAsync(s, error, true);
+    for (;;) {
+        IOLockLock(s->lock);
+        const bool any = s->syncReplyCount;
+        const int64_t frame = any ? s->syncReplies[0].frame : 0;
+        IOLockUnlock(s->lock);
+        if (!any) return;
+        answerFrame(s, frame, error);
+    }
+}
+
+// An asynchronous frame's Demt answered (or never sent): out no more.
+void forgetDemt(Session *s, uint64_t request) {
+    IOLockLock(s->lock);
+    for (unsigned i = 0; i < s->sentDemtCount; ++i)
+        if (s->sentDemts[i].request == request) { s->sentDemts[i] = s->sentDemts[--s->sentDemtCount]; break; }
+    IOLockUnlock(s->lock);
+}
+
+// A Demt: for a synchronous frame waited for (as Apple's host does: the dfrm's reply after the Demt's), then the dfrm answered;
+// otherwise sent and not waited for (see emitFrame). Whether it went. `wait` false on the thread that takes the guest's
+// messages (the dfrm's own): the Demt's answer comes on it, waiting there only ever times out -- sent, then the dfrm answered.
+bool sendDemt(Session *s, Writer &e, const uint8_t *message, uint64_t request, int64_t frame, bool sync, bool wait) {
+    if (!sync) {
+        IOLockLock(s->lock);
+        if (s->decodeOrder && s->sentDemtCount < 32) s->sentDemts[s->sentDemtCount++] = {request, mach_absolute_time()};
+        IOLockUnlock(s->lock);
+        const bool sent = sendToGuest(s->client, e, message);
+        if (!sent) forgetDemt(s, request);
+        releaseAsync(s);   // one frame fewer out (or none, till its Demt is answered)
+        return sent;
+    }
+    // Answered when the Demt's answer comes (droidvm_vthost_message) if not here: a wait cut short (evict, stopping) too.
+    IOLockLock(s->lock);
+    for (unsigned i = 0; i < s->syncReplyCount; ++i)
+        if (s->syncReplies[i].frame == frame) s->syncReplies[i].demt = request;
+    IOLockUnlock(s->lock);
+    const bool sent = wait ? hostRequest(s, e, message, request) : sendToGuest(s->client, e, message);
+    if (sent == wait) answerFrame(s, frame, 0);   // waited and answered; or never went (sent without waiting: its answer will)
+    return sent;
+}
+
+// A frame handed over as dropped, no pixels (a frame the session skipped: a temporal layer above the kept ones, a frame of a
+// stretch the session fell behind on).
+void handOverDropped(Session *s, int64_t frame, bool wait) {
+    ++s->statDropped;
+    const bool sync = syncFrame(s, frame);
+    uint8_t message[160];
+    const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
+    Writer e(message, sizeof message);
+    e.header(cc("Demt"), FlagHostRequest, s->uuid, request);
+    e.s64(cc(",frm"), frame);
+    e.s32(cc(",err"), 0);
+    e.u32(cc(",inf"), (sync ? 0 : 1) | 2);   // kVTDecodeInfo_Asynchronous (an asynchronous frame's) | kVTDecodeInfo_FrameDropped
+    if (sendDemt(s, e, message, request, frame, sync, wait)) droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
+}
+
+// The frames that never came out (a codec that dropped them, a decoder too small for the stream, a device session let go): each
+// handed over as dropped -- not failed: a failed frame kills the lock screen's player (11-04, an evicted session's). Not waited for, as emitFrame's Demt is not: each was a round trip to the player's process (40 ms for the lock screen's), and
+// the guest's answers cannot come while its thread is in a send to this side (selector 3) waiting for the worker.
 void dropOutstanding(Session *s) {
     for (;;) {
         IOLockLock(s->lock);
         if (!s->outstandingCount) { IOLockUnlock(s->lock); return; }
         const int64_t frame = s->outstanding[--s->outstandingCount];
         IOLockUnlock(s->lock);
+        const bool sync = syncFrame(s, frame);
         uint8_t message[160];
         const uint64_t request = __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED);
         Writer e(message, sizeof message);
         e.header(cc("Demt"), FlagHostRequest, s->uuid, request);
         e.s64(cc(",frm"), frame);
-        e.s32(cc(",err"), -12911);
-        e.u32(cc(",inf"), 2);   // kVTDecodeInfo_FrameDropped
-        hostRequest(s, e, message, request);
+        e.s32(cc(",err"), 0);
+        e.u32(cc(",inf"), (sync ? 0 : 1) | 2);   // kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped
+        if (sendDemt(s, e, message, request, frame, sync)) droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
+        ++s->statDropped;
     }
+}
+
+// The frames waiting for an OUTPUT buffer, freed (the lock held); their IDs stay outstanding, for dropOutstanding or the caller.
+unsigned discardInputs(Session *s, int64_t *frames, unsigned room) {
+    unsigned n = 0;
+    while (s->inputTail != s->inputHead) {
+        const Session::Input &input = s->inputs[s->inputTail++ % MaxInputs];
+        if (frames && n < room) frames[n] = input.frame;
+        ++n;
+        IOFree(input.bytes, input.capacity);
+        if (s->pendingFrames) --s->pendingFrames;
+    }
+    return n;
 }
 
 void requeueCapture(Session *s, unsigned index) {
@@ -988,22 +1246,34 @@ void requeueCapture(Session *s, unsigned index) {
 // the rate (the aerials' do), once 16 steps between inputs' times have shown the frame period; every layer till then.
 bool hevcSession(const Session *s);
 unsigned keptLayer(const Session *s) {
-    if (!hevcSession(s) || s->temporalLayers < 2 || s->steps < 16 || s->minStepUs <= 0 || s->minStepUs == INT64_MAX) return 7;
-    const int64_t rate = 1000000 / s->minStepUs;
-    unsigned drop = 0;
-    while (drop + 1 < s->temporalLayers && (rate >> (drop + 1)) >= 30) ++drop;
-    return s->temporalLayers - 1 - drop;
+    if (!hevcSession(s) || s->temporalLayers < 2) return 7;
+    unsigned kept = s->temporalLayers - 1;
+    if (s->steps >= 16 && s->minStepUs > 0 && s->minStepUs != INT64_MAX) {
+        const int64_t rate = 1000000 / s->minStepUs;
+        unsigned drop = 0;
+        while (drop + 1 < s->temporalLayers && (rate >> (drop + 1)) >= 30) ++drop;
+        kept = s->temporalLayers - 1 - drop;
+    }
+    return kept > s->shed ? kept - s->shed : 0;
 }
 
 // The oldest kept frame into a free OUTPUT buffer, if both exist (the lock held, and released while the buffer is filled).
 bool feedInput(Session *s) {
-    if (s->inputHead == s->inputTail) return false;
+    if (s->inputHead == s->inputTail || s->draining) return false;   // after a drain's LAST (endDrain)
     // A frame to skip needs no OUTPUT buffer: one waiting for one would hold the 7 in 8 behind it that never go to the device.
     if (s->inputs[s->inputTail % MaxInputs].tid > keptLayer(s)) {
         const Session::Input input = s->inputs[s->inputTail++ % MaxInputs];
-        // Z0: a frame of a temporal layer no kept frame refers to, handed over as dropped without the device seeing it.
+        // Z0: a frame of a temporal layer no kept frame refers to, handed over as dropped without the device seeing it -- if
+        // VideoToolbox waits for it (not one replayed to start the session again, handed over long ago).
+        bool given = false;
         for (unsigned i = 0; i < s->outstandingCount; ++i)
-            if (s->outstanding[i] == input.frame) { s->outstanding[i] = s->outstanding[--s->outstandingCount]; break; }
+            if (s->outstanding[i] == input.frame) { s->outstanding[i] = s->outstanding[--s->outstandingCount]; given = true; break; }
+        if (!given) {
+            IOLockUnlock(s->lock);
+            IOFree(input.bytes, input.capacity);
+            IOLockLock(s->lock);
+            return true;
+        }
         if (s->pendingFrames) --s->pendingFrames;
         const bool first = !s->skipLogged;
         s->skipLogged = true;
@@ -1069,7 +1339,17 @@ void answerFinish(Session *s) {
         return;
     }
     if (s->pendingFrames && mach_absolute_time() < s->finishDeadline) return;
+    // The deadline is for a stuck device or guest, not a slow one: frames still coming out, another FinishMs. The player reads a
+    // clip in at once and its dfin waits for the whole clip; the rest of it dropped at two seconds was the clip on screen cut.
+    if (s->pendingFrames && s->pendingFrames < s->pendingAtDeadline) {
+        s->pendingAtDeadline = s->pendingFrames;
+        clock_interval_to_deadline(FinishMs, kMillisecondScale, &s->finishDeadline);
+        return;
+    }
     if (s->outstandingCount) {
+        // Handed over failed, these frames are VideoToolbox's no more: those still waiting go too (isOutstanding keeps the
+        // device's late ones from being handed over again).
+        discardInputs(s, nullptr, 0);
         IOLockUnlock(s->lock);
         dropOutstanding(s);
         IOLockLock(s->lock);
@@ -1091,8 +1371,23 @@ void endDrain(Session *s) {
     IOLockLock(s->lock);
     const bool draining = s->draining;
     s->draining = false;
-    if (draining && s->pendingFrames) s->pendingFrames = 0;   // what the drain did not bring out never will
+    // What the drain did not bring out never will: handed over dropped now (not left for VideoToolbox to wait on); the frames
+    // given since, still waiting to be fed, are what is pending.
+    int64_t gone[64];
+    unsigned goneCount = 0;
+    if (draining) {
+        for (unsigned i = 0; i < s->outstandingCount;) {
+            bool waiting = false;
+            for (unsigned at = s->inputTail; at != s->inputHead && !waiting; ++at)
+                waiting = s->inputs[at % MaxInputs].frame == s->outstanding[i];
+            if (waiting || goneCount == 64) { ++i; continue; }
+            gone[goneCount++] = s->outstanding[i];
+            s->outstanding[i] = s->outstanding[--s->outstandingCount];
+        }
+        s->pendingFrames = s->inputHead - s->inputTail;
+    }
     IOLockUnlock(s->lock);
+    for (unsigned i = 0; i < goneCount; ++i) handOverDropped(s, gone[i]);
     if (draining) {
         const int r = decoderCommand(s, DecCmdStart);
         if (r) failed(56, r);
@@ -1108,32 +1403,86 @@ bool sessionQuiet(const Session *s) {
 void closeDevice(Session *s);
 void forgetStartMessage(Session *s);
 
+// The life log's line for a session's end (dinv, -dec, let go): what was still VideoToolbox's then.
+void logEnd(Session *s, const char *why) {
+    const uint64_t now = mach_absolute_time();
+    uint64_t ms;
+    nanoseconds_to_absolutetime(1000000, &ms);
+    IOLockLock(s->lock);
+    const unsigned outstanding = s->outstandingCount, pending = s->pendingFrames, waiting = s->inputHead - s->inputTail;
+    const uint64_t sinceIn = s->lastInputAt ? (now - s->lastInputAt) / ms : 0, sinceOut = s->lastOutAt ? (now - s->lastOutAt) / ms : 0;
+    IOLockUnlock(s->lock);
+    IOLog("DroidVMVTHost: life v4l2 %u %s: in %u out %u dropped %u, %u outstanding (%u pending, %u waiting), last in %llu ms, "
+          "last out %llu ms ago\n", s->v4l2, why, s->statIn, s->statOut, s->statDropped, outstanding, pending, waiting, sinceIn, sinceOut);
+}
+
+// Whether an evicted session lets its device session go now (the lock held): not while a drain started for it brings its last
+// frames out, for EvictDrainMs at most. In decode order (decodeOrder) nothing is kept back: at once.
+bool evictNow(Session *s) {
+    if (!s->evict) return false;
+    if (s->decodeOrder) return true;
+    if (!s->pendingFrames || s->inputHead != s->inputTail || !s->captureStreaming) return true;
+    if (!s->evictDrainUntil) {
+        uint64_t wait;
+        nanoseconds_to_absolutetime(uint64_t(EvictDrainMs) * 1000000, &wait);
+        s->evictDrainUntil = mach_absolute_time() + wait;
+        if (!s->draining) {
+            s->draining = true;
+            IOLockUnlock(s->lock);
+            const int r = decoderCommand(s, DecCmdStop);
+            IOLockLock(s->lock);
+            if (r) { failed(57, r); s->draining = false; return true; }
+        }
+    }
+    return mach_absolute_time() >= s->evictDrainUntil;
+}
+
 void workerMain(void *argument, wait_result_t) {
     Session *s = static_cast<Session *>(argument);
     bool idle = false;
     for (;;) {
         IOLockLock(s->lock);
         for (;;) {
-            if (s->stopping || s->eventHead != s->eventTail) break;
+            if (s->stopping || evictNow(s) || s->eventHead != s->eventTail) break;
             if (feedInput(s)) continue;
             answerFinish(s);
-            if (s->stopping || s->eventHead != s->eventTail) break;
+            if (s->stopping || evictNow(s) || s->eventHead != s->eventTail) break;
             // The lock screen's player reads each clip to its end with a new session and lets the old one go only much later
             // (its -dec): each held its device session, some 300 MB of the host's memory and one of msm_vidc's eight, until
             // the host ran out (and msm_vidc refused the ninth). A session with every frame handed over after a dfin, or given
-            // none for IdleCloseMs (the frames still inside the codec then dropped), lets its device session go.
-            if (sessionQuiet(s) && ((s->finished && !s->pendingFrames) || mach_absolute_time() - s->lastInputAt >= idleCloseTicks())) {
+            // none for IdleCloseMs, let its device session go. Only the first now: the player opens the next clip's session ahead,
+            // gives it its first frame (the clip's one sync sample) and nothing more for seconds -- closed then, it had nothing to
+            // start again from (11-04). Sessions left open are makeRoom's.
+            if (sessionQuiet(s) && s->finished && !s->pendingFrames) {
                 idle = true;
                 break;
             }
-            if (s->finishWanted) IOLockSleepDeadline(s->lock, &s->events, s->finishDeadline, THREAD_UNINT);
-            else if (sessionQuiet(s)) {
-                AbsoluteTime deadline;
-                clock_interval_to_deadline(IdleCloseMs, kMillisecondScale, &deadline);
-                IOLockSleepDeadline(s->lock, &s->events, deadline, THREAD_UNINT);
-            } else IOLockSleep(s->lock, &s->events, THREAD_UNINT);
+            AbsoluteTime deadline;
+            clock_interval_to_deadline(IdleCloseMs, kMillisecondScale, &deadline);
+            if (!s->decodeOrder && sessionQuiet(s) && s->pendingFrames && s->captureStreaming && !s->idleDrained) {
+                uint64_t idleFor;
+                nanoseconds_to_absolutetime(uint64_t(IdleDrainMs) * 1000000, &idleFor);
+                if (mach_absolute_time() - s->lastInputAt >= idleFor) {
+                    s->idleDrained = s->draining = true;
+                    const unsigned pending = s->pendingFrames, outstanding = s->outstandingCount;
+                    IOLockUnlock(s->lock);
+                    IOLog("DroidVMVTHost: life v4l2 %u idle drain (%u pending, %u outstanding)\n", s->v4l2, pending, outstanding);
+                    const int r = decoderCommand(s, DecCmdStop);
+                    IOLockLock(s->lock);
+                    if (r) { failed(58, r); s->draining = false; }
+                    continue;
+                }
+                if (s->lastInputAt + idleFor < deadline) deadline = s->lastInputAt + idleFor;
+            }
+            if (s->finishWanted && s->finishDeadline < deadline) deadline = s->finishDeadline;
+            if (s->evictDrainUntil && s->evictDrainUntil < deadline) deadline = s->evictDrainUntil;
+            IOLockSleepDeadline(s->lock, &s->events, deadline, THREAD_UNINT);
         }
-        if (idle) {
+        if (idle || (s->evict && !s->stopping && evictNow(s))) {
+            // Let go: what still waits and what is inside the codec handed over (dropped), the device session closed. The next
+            // frame that is a sync sample starts a new one (queueFrame); those before it are dropped.
+            const bool evicted = !idle;
+            discardInputs(s, nullptr, 0);
             if (s->outstandingCount) {
                 IOLockUnlock(s->lock);
                 dropOutstanding(s);
@@ -1141,7 +1490,19 @@ void workerMain(void *argument, wait_result_t) {
             }
             s->pendingFrames = 0;
             s->idleClosed = true;
+            s->resync = true;
+            s->evict = false;
+            s->evictDrainUntil = 0;
+            // A dfin still waiting: every frame is handed over now.
+            const bool finish = s->finishWanted;
+            Header h;
+            h.type = cc("dfin");
+            memcpy(h.uuid, s->uuid, 16);
+            h.request = s->finishRequest;
+            s->finishWanted = s->draining = false;
             IOLockUnlock(s->lock);
+            if (finish) replyStatus(s->client, h, 0);
+            if (evicted) logEnd(s, "let go (another session needs the device, or it failed)");
             closeDevice(s);
             IOLockLock(s->lock);
             break;
@@ -1158,9 +1519,16 @@ void workerMain(void *argument, wait_result_t) {
         } else if (e.kind == MediaEvtDqbuf && e.type == TypeCaptureMplane && e.index < s->captureCount) {
             s->capture[e.index].queued = false;
             bool handedOver = false;
-            if (e.bytesused && !(e.flags & BufFlagError)) {
+            if (e.bytesused && !(e.flags & BufFlagError) && isOutstanding(s, e.sec)) {
                 handedOver = emitFrame(s, e.index, e.sec, e.bytesused);
                 forgetFrame(s, e.sec);
+                IOLockLock(s->lock);
+                if (s->pendingFrames) --s->pendingFrames;
+                IOLockUnlock(s->lock);
+            } else if ((e.flags & BufFlagError) && isOutstanding(s, e.sec)) {
+                // The device could not decode it (after a drain: the references it let go): dropped, now.
+                forgetFrame(s, e.sec);
+                handOverDropped(s, e.sec);
                 IOLockLock(s->lock);
                 if (s->pendingFrames) --s->pendingFrames;
                 IOLockUnlock(s->lock);
@@ -1180,7 +1548,11 @@ void workerMain(void *argument, wait_result_t) {
         } else if (e.kind == MediaEvtEvent && e.type == EventEos) {
             endDrain(s);
         } else if (e.kind == MediaEvtError) {
+            // The device session is gone (crosvm's worker returned): let it go as when evicted, a new one at the next sync.
             failed(70, 0);
+            IOLockLock(s->lock);
+            s->evict = true;
+            IOLockUnlock(s->lock);
         }
     }
     s->workerRunning = false;
@@ -1811,7 +2183,15 @@ void teardown(Session *s) {
         s->stopping = false;
     }
     closeDevice(s);
-    s->idleClosed = s->finished = false;
+    s->decodeOrder = false;
+    s->sentDemtCount = 0;
+    s->idleClosed = s->finished = s->evict = s->resync = false;
+    s->evictDrainUntil = 0;
+    s->idleDrained = false;
+    s->statIn = s->statOut = s->statDropped = 0;
+    s->lastOutAt = 0;
+    s->shed = 0;
+    s->shedAfter = 0;
     while (s->inputTail != s->inputHead) {
         const Session::Input &input = s->inputs[s->inputTail++ % MaxInputs];
         IOFree(input.bytes, input.capacity);
@@ -1926,8 +2306,10 @@ void createDecoder(Client *c, const Header &h, const uint8_t *m, uint32_t n) {
         }
         s->client = c;
         memcpy(s->uuid, h.uuid, 16);
+        IOLockLock(c->listLock);
         s->next = c->sessions;
         c->sessions = s;
+        IOLockUnlock(c->listLock);
         droidvm_vthost_sessions = droidvm_vthost_sessions + 1;
     }
     s->codec = uint32_t(codec);
@@ -2003,7 +2385,30 @@ bool decodableSize(Session *s, uint32_t pixelformat) {
     return fits;
 }
 
+void clearReplay(Session *s) {
+    for (unsigned i = 0; i < s->replayCount; ++i) IOFree(s->replay[i].bytes, s->replay[i].size);
+    s->replayCount = 0;
+    s->replaySize = 0;
+    s->replayable = false;
+}
+
+// The saved frames given to the device again ahead of the next (the lock held, the device session just started again): decoded
+// for the frames after them to refer to, none handed over (not outstanding, emitFrame and feedInput pass them by).
+void replayInputs(Session *s) {
+    for (unsigned i = 0; i < s->replayCount; ++i) {
+        const Session::Saved &saved = s->replay[i];
+        const uint32_t prefix = s->parametersSent ? 0 : s->parameterSetsSize;
+        uint8_t *bytes = static_cast<uint8_t *>(IOMalloc(prefix + saved.size));
+        if (!bytes) return;
+        memcpy(bytes, s->parameterSets, prefix);
+        memcpy(bytes + prefix, saved.bytes, saved.size);
+        s->parametersSent = true;
+        s->inputs[s->inputHead++ % MaxInputs] = {saved.frame, bytes, prefix + saved.size, prefix + saved.size, saved.ptsUs, saved.tid};
+    }
+}
+
 void forgetStartMessage(Session *s) {
+    clearReplay(s);
     if (s->startMessage) IOFree(s->startMessage, s->startSize);
     s->startMessage = nullptr;
     s->startSize = 0;
@@ -2017,17 +2422,79 @@ void keepStartMessage(Session *s, const uint8_t *m, uint32_t n) {
     s->startSize = n;
 }
 
-int startSession(Session *s, const uint8_t *m, uint32_t n);
+int startSession(Session *s, const uint8_t *m, uint32_t n, bool fresh = true);
 
 // A frame for a session whose device session went idle (workerMain): a new one, started as the last dsta did. A stream goes on
 // from a sync sample after a dfin (a seek, a loop); a frame before one decodes wrong until the next.
 void resumeSession(Session *s) {
     if (!s->startMessage) return;
-    const int error = startSession(s, s->startMessage, s->startSize);
+    // The same stream: the layers kept stay as they were (frames above them were never given, and nothing can refer to them).
+    const int64_t minStepUs = s->minStepUs, lastInputUs = s->lastInputUs;
+    const unsigned steps = s->steps;
+    const int error = startSession(s, s->startMessage, s->startSize, false);
     if (error) failed(90, error);
+    s->minStepUs = minStepUs;
+    s->lastInputUs = lastInputUs;
+    s->steps = steps;
 }
 
-int startSession(Session *s, const uint8_t *m, uint32_t n) {
+// Room for `self`'s device session (SoftDeviceSessions, HardDeviceSessions): the least recently fed other sessions told to let
+// theirs go, and waited for -- briefly, and by looking in gTable only: the session may be another process's, gone at any time
+// outside gTableLock. Its worker lets go at its next turn and waits on nothing of this thread's. `force`: the device refused
+// `self`, the least recently fed other session goes whatever the counts. Whether any went.
+bool makeRoom(Session *self, bool force = false) {
+    bool any = false;
+    uint64_t idleTicks;
+    nanoseconds_to_absolutetime(uint64_t(EvictIdleMs) * 1000000, &idleTicks);
+    for (;;) {
+        const uint64_t now = mach_absolute_time();
+        IOLockLock(gTableLock);
+        unsigned open = 0;
+        Session *oldest = nullptr, *oldestIdle = nullptr, *oldestDone = nullptr;
+        for (Session *s : gTable) {
+            if (!s || s == self || !s->open || !s->workerRunning || s->evict) continue;
+            ++open;
+            if (!oldest || s->lastInputAt < oldest->lastInputAt) oldest = s;
+            const bool drainable = s->outstandingCount <= EvictFrames && s->inputHead == s->inputTail;
+            if (drainable && (!oldestDone || s->lastInputAt < oldestDone->lastInputAt)) oldestDone = s;
+            // Of those idle for EvictIdleMs with every frame fed and at most EvictFrames to come out (drained before it goes),
+            // one whose stream finished (dfin) first, then the least recently fed. Not one with more: the player reads a clip in
+            // at once and shows it over seconds -- the clip on screen, cut (11-04: its frames failed, the player killed).
+            if (now - s->lastInputAt >= idleTicks && drainable &&
+                (!oldestIdle || (s->finished && !oldestIdle->finished) ||
+                 (s->finished == oldestIdle->finished && s->lastInputAt < oldestIdle->lastInputAt)))
+                oldestIdle = s;
+        }
+        // Never one with more than EvictFrames still to hand over, but for a device refusal: the player shows a clip seconds
+        // after reading it in, and a clip on screen whose frames all came back without pixels killed it (11-04 on the phone, v3:
+        // dropped or failed alike). Past HardDeviceSessions, the least recently fed of those, idle or not (it starts again).
+        Session *victim = force && !any ? oldest : open >= HardDeviceSessions ? oldestDone : open >= SoftDeviceSessions ? oldestIdle : nullptr;
+        if (victim) {
+            IOLockLock(victim->lock);
+            victim->evict = true;
+            IOLockUnlock(victim->lock);
+            IOLockWakeup(victim->lock, &victim->events, false);
+            IOLockWakeup(victim->lock, &victim->replied, false);
+            IOLog("DroidVMVTHost: life v4l2 %u let go for a new session (%u open, last frame %llu ms ago)\n", victim->v4l2, open,
+                  (now - victim->lastInputAt) * EvictIdleMs / idleTicks);
+        }
+        IOLockUnlock(gTableLock);
+        if (!victim) return any;
+        any = true;
+        for (unsigned waited = 0; waited < 500 + EvictDrainMs; waited += 2) {
+            bool registered = false;
+            IOLockLock(gTableLock);
+            for (Session *s : gTable) registered = registered || s == victim;
+            IOLockUnlock(gTableLock);
+            if (!registered) break;
+            IOSleep(2);
+        }
+    }
+}
+
+// `fresh`: a dsta's (a device refusal then makes room by force, once); not a session started again after it was let go, which
+// would take the device from another as often as both get a sync sample.
+int startSession(Session *s, const uint8_t *m, uint32_t n, bool fresh) {
     Param fds;
     ImageDescription d;
     if (!param(m, n, cc(",fds"), fds) || !imageDescription(fds.value, fds.size, d)) return -12902;
@@ -2042,9 +2509,13 @@ int startSession(Session *s, const uint8_t *m, uint32_t n) {
     s->pendingFrames = 0;
     s->device = decoderDevice();
     if (s->device == ~0u) return -12906;
+    makeRoom(s);
     int r = droidvm_media_open(s->device, &s->v4l2);
     if (r) { failed(1, r); return -12911; }
     s->open = true;
+    // A session that does not start lets its device session go at once (VideoToolbox decodes in software then; held, it was a
+    // device session no one would close until the dinv).
+    auto refuse = [s](int error) { closeDevice(s); return error; };
     registerSession(s);
     droidvm_media_set_fast(s->device, true);
     s->fast = true;
@@ -2062,19 +2533,31 @@ int startSession(Session *s, const uint8_t *m, uint32_t n) {
     f.num_planes = 1;
     f.planes[0].sizeimage = OutputBytes;
     r = ioctl(s, IocSFmt, &f, sizeof f, sizeof f);
-    if (r) { failed(3, r); return -12911; }
+    if (r) { failed(3, r); return refuse(-12911); }
+    // Decode order (display delay 0): every frame out as soon as decoded, as Apple's host gives them (a crosvm without it says
+    // EINVAL: display order, every dfrm answered at once as before).
+    uint32_t control[2] = {CidDecDisplayDelayEnable, 1};
+    s->decodeOrder = !ioctl(s, IocSCtrl, control, sizeof control, sizeof control);
+    control[0] = CidDecDisplayDelay;
+    control[1] = 0;
+    if (s->decodeOrder) s->decodeOrder = !ioctl(s, IocSCtrl, control, sizeof control, sizeof control);
     uint32_t request[5] = {OutputBuffers, TypeOutputMplane, MemoryUserPtr, 0, 0};
     r = ioctl(s, IocReqbufs, request, sizeof request, sizeof request);
-    if (r || request[0] < OutputBuffers) { failed(4, r ? r : int32_t(request[0])); return -12904; }
+    if (r || request[0] < OutputBuffers) { failed(4, r ? r : int32_t(request[0])); return refuse(-12904); }
     for (unsigned i = 0; i < OutputBuffers; ++i)
-        if (!mapBuffer(s, TypeOutputMplane, i, s->output[i])) return -12904;
+        if (!mapBuffer(s, TypeOutputMplane, i, s->output[i])) return refuse(-12904);
     uint32_t type = TypeOutputMplane;
     r = ioctl(s, IocStreamon, &type, 4, 0);
-    if (r) { failed(5, r); return -12911; }
+    if (r) {
+        failed(5, r);
+        refuse(0);
+        if (fresh && makeRoom(s, true)) return startSession(s, m, n, false);
+        return -12911;
+    }
     s->outputStreaming = true;
     s->stopping = false;
     s->workerRunning = true;
-    if (kernel_thread_start(workerMain, s, &s->worker) != KERN_SUCCESS) { s->workerRunning = false; return -12904; }
+    if (kernel_thread_start(workerMain, s, &s->worker) != KERN_SUCCESS) { s->workerRunning = false; return refuse(-12904); }
     thread_deallocate(s->worker);
     s->extendBottom = s->tenBit && directLayout() ? ((s->height + 31) & ~31u) - s->height : 0;
     pixelBufferAttributes(s);
@@ -2097,16 +2580,99 @@ int64_t presentationUs(const Atom &sbuf) {
     return value / timescale * 1000000 + value % timescale * 1000000 / timescale;
 }
 
+// Whether a sample is a sync sample: its first VCL NAL unit an HEVC IRAP picture (types 16-23) or an H.264 IDR one (5).
+bool syncSample(const Session *s, const uint8_t *p, const uint8_t *end) {
+    while (uint32_t(end - p) > s->nalLength) {
+        uint32_t length = 0;
+        for (uint32_t i = 0; i < s->nalLength; ++i) length = length << 8 | p[i];
+        p += s->nalLength;
+        if (!length || length > uint32_t(end - p)) return false;
+        if (hevcSession(s)) {
+            const unsigned type = (p[0] >> 1) & 0x3f;
+            if (type < 32) return type >= 16 && type <= 23;
+        } else {
+            const unsigned type = p[0] & 0x1f;
+            if (type >= 1 && type <= 5) return type == 5;
+        }
+        p += length;
+    }
+    return false;
+}
+
 // dfrm: the frame's NAL units as Annex B, kept for the worker (selector 3 never waits for an OUTPUT buffer).
+int queueFrame(Session *s, const uint8_t *m, uint32_t n);
+
+// A dfrm: a synchronous one, in decode order, answered after its frame's Demt (answerFrame: Deferred); otherwise answered by the
+// caller with what queueFrame says, at once.
+constexpr int Deferred = 1;
+int queueFrameAnswered(Session *s, const uint8_t *m, uint32_t n, uint64_t request, bool sync) {
+    int64_t frame = 0;
+    paramS64(m, n, cc(",frm"), frame);
+    IOLockLock(s->lock);
+    const bool deferred = sync && s->decodeOrder && s->syncReplyCount < MaxSyncReplies;
+    if (deferred) s->syncReplies[s->syncReplyCount++] = {frame, request, 0, false};
+    IOLockUnlock(s->lock);
+    const int error = queueFrame(s, m, n);
+    if (!deferred && !sync && !error) {
+        // Asynchronous: answered once fewer than AsyncInFlight of the session's frames are out.
+        IOLockLock(s->lock);
+        const bool held = s->decodeOrder && asyncOut(s) > AsyncInFlight && s->syncReplyCount < MaxSyncReplies;
+        if (held) s->syncReplies[s->syncReplyCount++] = {frame, request, 0, true};
+        IOLockUnlock(s->lock);
+        if (!held) return 0;
+        releaseAsync(s);   // a frame handed over meanwhile
+        return Deferred;
+    }
+    if (!deferred) return error;
+    if (error) answerFrame(s, frame, error);   // never queued: answered now (nothing if a Demt answered it already)
+    return Deferred;
+}
+
 int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
+    IOLockLock(s->lock);   // the worker's idle close reads them
     s->lastInputAt = mach_absolute_time();
     s->finished = false;
+    s->idleDrained = false;
+    IOLockUnlock(s->lock);
     int64_t frame = 0;
     paramS64(m, n, cc(",frm"), frame);
     Param sbf;
     Atom sbuf, sdat;
-    if (!s->outputStreaming || !param(m, n, cc(",sbf"), sbf) || !find(sbf.value, sbf.size, cc("sbuf"), sbuf) ||
-        !find(sbuf.body, sbuf.size, cc("sdat"), sdat)) return -12902;
+    if (!param(m, n, cc(",sbf"), sbf) || !find(sbf.value, sbf.size, cc("sbuf"), sbuf) || !find(sbuf.body, sbuf.size, cc("sdat"), sdat))
+        return -12902;
+    const bool sync = syncSample(s, sdat.body, sdat.body + sdat.size);
+    // Its device session let go, or behind: nothing till a sync sample, which (re)starts the device session as the dsta did.
+    // A session let go with every frame since its last sync sample kept starts again at any frame, from those.
+    if (s->resync) {
+        if (!sync && !(s->idleClosed && s->replayable && s->replayCount)) {
+            handOverDropped(s, frame, false);
+            droidvm_vthost_frames_in = droidvm_vthost_frames_in + 1;
+            return 0;
+        }
+        if (s->idleClosed) {
+            if (s->lastInputAt >= s->resumeAfter) resumeSession(s);
+            if (!s->outputStreaming) {   // the device would not: a sync sample a second later tries again
+                s->idleClosed = s->resync = true;
+                if (s->lastInputAt >= s->resumeAfter) {
+                    uint64_t second;
+                    nanoseconds_to_absolutetime(1000000000ULL, &second);
+                    s->resumeAfter = s->lastInputAt + second;
+                }
+                handOverDropped(s, frame, false);
+                droidvm_vthost_frames_in = droidvm_vthost_frames_in + 1;
+                return 0;
+            }
+            if (!sync) {
+                IOLockLock(s->lock);
+                replayInputs(s);
+                IOLockUnlock(s->lock);
+            }
+            IOLog("DroidVMVTHost: life v4l2 %u started again at frame %lld (%u frames replayed)\n", s->v4l2, frame,
+                  sync ? 0 : s->replayCount);
+        }
+        s->resync = false;
+    }
+    if (!s->outputStreaming) return -12902;
     const uint32_t capacity = sdat.size + (s->nalLength < 4 ? sdat.size : 0) + (s->parametersSent ? 0 : s->parameterSetsSize) + 64;
     uint8_t *bytes = static_cast<uint8_t *>(IOMalloc(capacity));
     if (!bytes) return -12904;
@@ -2117,6 +2683,7 @@ int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
         at = s->parameterSetsSize;
         s->parametersSent = true;
     }
+    const uint32_t prefix = at;
     const uint8_t *p = sdat.body, *end = sdat.body + sdat.size;
     // The temporal layer of the frame's first VCL NAL unit (HEVC types 0-31; nuh_temporal_id_plus1 the low 3 bits of byte 2).
     uint8_t tid = 0;
@@ -2145,18 +2712,22 @@ int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
         // VideoToolbox takes frames back in any order (decode order is not output order).
         IOLockUnlock(s->lock);
         IOFree(bytes, capacity);
-        uint8_t message[160];
-        Writer e(message, sizeof message);
-        e.header(cc("Demt"), FlagHostRequest, s->uuid, __atomic_fetch_add(&s->nextHostRequest, 1, __ATOMIC_RELAXED));
-        e.s64(cc(",frm"), frame);
-        e.s32(cc(",err"), 0);
-        e.u32(cc(",inf"), 1 | 2);   // kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped
-        if (sendToGuest(s->client, e, message)) {
-            droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
-            droidvm_vthost_frames_skipped = droidvm_vthost_frames_skipped + 1;
-        }
+        handOverDropped(s, frame, false);
+        droidvm_vthost_frames_skipped = droidvm_vthost_frames_skipped + 1;
         droidvm_vthost_frames_in = droidvm_vthost_frames_in + 1;
         return 0;
+    }
+    if (!s->decodeOrder && s->inputHead - s->inputTail >= MaxBacklog && hevcSession(s) && s->temporalLayers >= 2 && keptLayer(s) > 0 &&
+        s->lastInputAt >= s->shedAfter) {
+        // Behind: one temporal layer more given up; feedInput hands over the frames of it already waiting, as dropped.
+        ++s->shed;
+        uint64_t wait;
+        nanoseconds_to_absolutetime(uint64_t(ShedMs) * 1000000, &wait);
+        s->shedAfter = s->lastInputAt + wait;
+        const unsigned kept = keptLayer(s), waiting = s->inputHead - s->inputTail;
+        IOLockUnlock(s->lock);
+        IOLog("DroidVMVTHost: life v4l2 %u behind (%u frames waiting): keeps temporal layers 0-%u\n", s->v4l2, waiting, kept);
+        IOLockLock(s->lock);
     }
     if (s->inputHead - s->inputTail >= MaxInputs) {
         IOLockUnlock(s->lock);
@@ -2164,8 +2735,22 @@ int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
         failed(6, 0);
         return -12911;
     }
+    // Kept for a start again: from a sync sample on, while all fit.
+    if (sync) { clearReplay(s); s->replayable = true; }
+    if (s->replayable) {
+        uint8_t *copy = nullptr;
+        if (s->replayCount < MaxReplay && s->replaySize + (at - prefix) <= MaxReplayBytes &&
+            (copy = static_cast<uint8_t *>(IOMalloc(at - prefix)))) {
+            memcpy(copy, bytes + prefix, at - prefix);
+            s->replay[s->replayCount++] = {frame, copy, at - prefix, ptsUs, tid};
+            s->replaySize += at - prefix;
+        } else {
+            clearReplay(s);
+        }
+    }
     s->inputs[s->inputHead++ % MaxInputs] = {frame, bytes, at, capacity, ptsUs, tid};
     ++s->pendingFrames;
+    ++s->statIn;
     if (s->outstandingCount < MaxInputs) s->outstanding[s->outstandingCount++] = frame;
     IOLockUnlock(s->lock);
     IOLockWakeup(s->lock, &s->events, false);
@@ -2196,6 +2781,7 @@ void *droidvm_vthost_client_open(void *transport, bool (*send)(void *, const uin
     c->task = task;
     c->pid = pid;
     c->lock = IOLockAlloc();
+    c->listLock = IOLockAlloc();
     c->sessions = nullptr;
     return c;
 }
@@ -2203,15 +2789,21 @@ void *droidvm_vthost_client_open(void *transport, bool (*send)(void *, const uin
 void droidvm_vthost_client_close(void *host) {
     Client *c = static_cast<Client *>(host);
     if (!c) return;
-    while (Session *s = c->sessions) {
-        c->sessions = s->next;
+    for (;;) {
+        IOLockLock(c->listLock);
+        Session *s = c->sessions;
+        if (s) c->sessions = s->next;
+        IOLockUnlock(c->listLock);
+        if (!s) break;
         teardown(s);
+        answerAllFrames(s, -12903);
         IOLockFree(s->lock);
         IOLockFree(s->surfaceLock);
         forgetStartMessage(s);
         delete s;
     }
     if (c->lock) IOLockFree(c->lock);
+    if (c->listLock) IOLockFree(c->listLock);
     delete c;
 }
 
@@ -2222,8 +2814,9 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
     if (!c || !header(m, n, h)) return -1;
     // The guest's replies to the host's requests (Dbuf, Demt).
     if (h.flags & FlagGuestReply) {
+        IOLockLock(c->listLock);
         Session *s = findSession(c, h.uuid);
-        if (!s) return 0;
+        if (!s) { IOLockUnlock(c->listLock); return 0; }
         int32_t error = 0;
         paramS32(m, n, cc(",err"), error);
         Param uuid;
@@ -2250,6 +2843,12 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
         }
         IOLockUnlock(s->lock);
         IOLockWakeup(s->lock, &s->replied, false);
+        if (h.type == cc("Demt")) {
+            answerFrame(s, 0, 0, h.request);   // a dropped frame's sent from here (sendDemt)
+            forgetDemt(s, h.request);
+            releaseAsync(s);
+        }
+        IOLockUnlock(c->listLock);
         return 0;
     }
     IOLockLock(c->lock);
@@ -2291,8 +2890,10 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
     case cc("-enc"):
         if (s) {
             teardown(s);
+            IOLockLock(c->listLock);
             for (Session **at = &c->sessions; *at; at = &(*at)->next)
                 if (*at == s) { *at = s->next; break; }
+            IOLockUnlock(c->listLock);
             IOLockFree(s->lock);
             IOLockFree(s->surfaceLock);
             forgetStartMessage(s);
@@ -2336,13 +2937,22 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
         break;
     }
     case cc("dfrm"): {
-        if (s && s->idleClosed) resumeSession(s);
-        const int error = s ? queueFrame(s, m, n) : -12903;
+        // ,dfl: kVTDecodeFrame_EnableAsynchronousDecompression the low bit; absent, 0 (synchronous).
+        int32_t flags = 0;
+        paramS32(m, n, cc(",dfl"), flags);
+        const bool sync = !(flags & 1);
+        if (s && !s->dflLogged) {
+            s->dflLogged = true;
+            IOLog("DroidVMVTHost: life v4l2 %u first dfrm ,dfl %d (%s, %s order)\n", s->v4l2, flags, sync ? "sync" : "async",
+                  s->decodeOrder ? "decode" : "display");
+        }
+        const int error = s ? queueFrameAnswered(s, m, n, h.request, sync) : -12903;
+        if (error == Deferred) break;
         uint8_t buffer[128];
         Writer w(buffer, sizeof buffer);
         w.header(h.type, FlagReply, h.uuid, h.request);
         w.s32(cc(",err"), error);
-        w.u32(cc(",inf"), 1);
+        w.u32(cc(",inf"), sync ? 0 : 1);
         sendToGuest(c, w, buffer);
         break;
     }
@@ -2351,7 +2961,8 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
             IOLockLock(s->lock);
             s->finishWanted = true;
             s->finishRequest = h.request;
-            clock_interval_to_deadline(2000, kMillisecondScale, &s->finishDeadline);
+            clock_interval_to_deadline(FinishMs, kMillisecondScale, &s->finishDeadline);
+            s->pendingAtDeadline = s->pendingFrames;
             IOLockUnlock(s->lock);
             IOLockWakeup(s->lock, &s->events, false);
         } else {
@@ -2359,14 +2970,20 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
         }
         break;
     case cc("dinv"):
+        if (s) logEnd(s, "dinv");
         if (s) teardown(s);
+        if (s) answerAllFrames(s, -12903);   // kVTInvalidSessionErr: never coming (not at startSession's teardown: a resume's)
         replyStatus(c, h, 0);
         break;
     case cc("-dec"):
         if (s) {
+            logEnd(s, "-dec");
             teardown(s);
+            answerAllFrames(s, -12903);
+            IOLockLock(c->listLock);
             for (Session **at = &c->sessions; *at; at = &(*at)->next)
                 if (*at == s) { *at = s->next; break; }
+            IOLockUnlock(c->listLock);
             IOLockFree(s->lock);
             IOLockFree(s->surfaceLock);
             forgetStartMessage(s);
