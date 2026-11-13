@@ -128,7 +128,7 @@ struct V4l2Format {   // struct v4l2_format with v4l2_pix_format_mplane
 };
 static_assert(sizeof(V4l2Format) == 208, "v4l2_format");
 
-constexpr unsigned OutputBuffers = 4, MaxCaptureBuffers = 32;   // Qualcomm's AVC decoder asks 21 output slots at 720p
+constexpr unsigned OutputBuffers = 4, MaxCaptureBuffers = 32, MaxInputs = 4096;   // Qualcomm's AVC decoder asks 21 output slots at 720p
 constexpr uint32_t OutputBytes = 2u << 20;
 
 // --- IOSurface, through the guest process's own IOSurfaceRootUserClient ----------------------------------------------------
@@ -293,7 +293,10 @@ struct Session {
 
     IOLock *lock = nullptr;
     // Frames given (dfrm) and not yet in an OUTPUT buffer: Annex B, IOMalloc'd.
-    struct Input { int64_t frame; uint8_t *bytes; uint32_t size, capacity; } inputs[128];
+    // The frames sent and not yet given to the device. MaxInputs, not 128: the lock screen's video player sends 100-200 frames at
+    // once when a session starts; refused at 128 (-12911), VideoToolbox opened another session without invalidating the first, every
+    // few seconds, and each kept a 4K hardware decoder and its buffers on the host (500 MB apiece) until the host ran out of memory.
+    struct Input { int64_t frame; uint8_t *bytes; uint32_t size, capacity; } inputs[MaxInputs];
     unsigned inputHead = 0, inputTail = 0;
     // An outstanding dfin: its request, answered when pendingFrames is 0 or at finishDeadline.
     bool finishWanted = false, draining = false;
@@ -306,7 +309,7 @@ struct Session {
     uint32_t pendingFrames = 0;
     // The frames given and not yet handed over, by ID: at dfin's deadline each gets a Demt with an error, or VideoToolbox would
     // wait for it forever.
-    int64_t outstanding[64];
+    int64_t outstanding[MaxInputs];
     unsigned outstandingCount = 0;
 
     // The session's IOSurfaceRootUserClient (opened at its first pixel buffer) and the surfaces it looked up, by ID.
@@ -688,7 +691,7 @@ bool feedInput(Session *s) {
     unsigned index = OutputBuffers;
     for (unsigned i = 0; i < OutputBuffers; ++i) if (!s->output[i].queued) { index = i; break; }
     if (index == OutputBuffers || s->inputHead == s->inputTail) return false;
-    const Session::Input input = s->inputs[s->inputTail++ % 128];
+    const Session::Input input = s->inputs[s->inputTail++ % MaxInputs];
     s->output[index].queued = true;
     IOLockUnlock(s->lock);
     Mapped &out = s->output[index];
@@ -1417,7 +1420,7 @@ void teardown(Session *s) {
     s->open = s->outputStreaming = s->captureStreaming = s->fast = false;
     s->captureCount = 0;
     while (s->inputTail != s->inputHead) {
-        const Session::Input &input = s->inputs[s->inputTail++ % 128];
+        const Session::Input &input = s->inputs[s->inputTail++ % MaxInputs];
         IOFree(input.bytes, input.capacity);
     }
     s->pendingFrames = 0;
@@ -1676,15 +1679,15 @@ int queueFrame(Session *s, const uint8_t *m, uint32_t n) {
         p += length;
     }
     IOLockLock(s->lock);
-    if (s->inputHead - s->inputTail >= 128) {
+    if (s->inputHead - s->inputTail >= MaxInputs) {
         IOLockUnlock(s->lock);
         IOFree(bytes, capacity);
         failed(6, 0);
         return -12911;
     }
-    s->inputs[s->inputHead++ % 128] = {frame, bytes, at, capacity};
+    s->inputs[s->inputHead++ % MaxInputs] = {frame, bytes, at, capacity};
     ++s->pendingFrames;
-    if (s->outstandingCount < 64) s->outstanding[s->outstandingCount++] = frame;
+    if (s->outstandingCount < MaxInputs) s->outstanding[s->outstandingCount++] = frame;
     IOLockUnlock(s->lock);
     IOLockWakeup(s->lock, &s->events, false);
     droidvm_vthost_frames_in = droidvm_vthost_frames_in + 1;
