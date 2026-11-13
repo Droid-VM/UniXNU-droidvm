@@ -9,7 +9,11 @@
 //
 // This file is the transport half: it maps each window, brings the device up (VIRTIO_F_VERSION_1, and ACCESS_PLATFORM where
 // offered), keeps the event queue stocked, and runs one command at a time per device.
-// Level SPIs acknowledge queue completions and wake command waiters and the event worker. The protocol (driver/protocol.h of the virtio-media repository):
+// Level SPIs acknowledge queue completions and wake command waiters and the event worker. The window's interrupt is its GIC
+// INTID in the ADT: "droidvm,intid" (DarwinBoot's ADT built from the firmware's FDT) or "gic-spi" (macOS-DroidVM's). A window
+// without either -- a static ADT names none -- or whose SPI cannot be attached is polled instead, as every device was before:
+// a command waits a millisecond at a time, the event worker wakes every millisecond while events come and every 50 when quiet.
+// The protocol (driver/protocol.h of the virtio-media repository):
 //   commandq  OPEN -> session id; CLOSE; IOCTL(session, the _IO* number of a VIDIOC_*) with the ioctl's payload out (for _IOW
 //             and _IOWR) and back (for _IOR and _IOWR), the response header in front of it; MMAP(session, offset) -> an offset
 //             into the pool; MUNMAP. A response's status is 0 or a Linux errno. VIDIOC_QUERYCAP is the driver's to answer
@@ -72,7 +76,8 @@ struct media_device {
     // The layer above takes copied events outside the transport lock on the event worker.
     void (*sink)(void *context, const uint8_t *event, uint32_t size);
     void *sink_context;
-    uint32_t interrupt_id;
+    uint32_t interrupt_id;             // 0: the ADT names none
+    bool irq;                          // the SPI is attached; otherwise the device is polled
 };
 
 // Per device: one page per queue (descriptors at 0, the driver ring at 1024, the device ring at 2048), the event buffers,
@@ -159,14 +164,23 @@ static void media_interrupt(void *context) {
     thread_wakeup((event_t)&media_pending);
 }
 
+// When a wait for the device ends: `deadline` with its interrupt, a millisecond from now (at most `deadline`) when polled.
+static uint64_t wake_by(const struct media_device *d, uint64_t deadline) {
+    if (d->irq) return deadline;
+    uint64_t soon;
+    clock_interval_to_deadline(1, NSEC_PER_MSEC, &soon);
+    return soon < deadline ? soon : deadline;
+}
+
 // Copy and replenish under the transport lock, then deliver without it: a session may hold its lock across a command.
-static void reap_events(struct media_device *d) {
-    for (;;) {
+// Returns whether there was any.
+static bool reap_events(struct media_device *d) {
+    for (bool any = false;; any = true) {
         uint8_t copy[MEDIA_EVENT_SIZE];
         void (*sink)(void *, const uint8_t *, uint32_t);
         void *context;
         lck_mtx_lock(d->lock);
-        if (used(d, MEDIA_EVENTQ)[1] == d->used[MEDIA_EVENTQ]) { lck_mtx_unlock(d->lock); return; }
+        if (used(d, MEDIA_EVENTQ)[1] == d->used[MEDIA_EVENTQ]) { lck_mtx_unlock(d->lock); return any; }
         media_barrier();
         const uint32_t *ring = (const uint32_t *)(used(d, MEDIA_EVENTQ) + 2);
         const uint32_t id = ring[(d->used[MEDIA_EVENTQ] % MEDIA_QUEUE) * 2];
@@ -207,12 +221,12 @@ static int command(struct media_device *d, uint32_t command_size, uint32_t out, 
     clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
     for (;;) {
         // Register before checking the used index so a concurrent IRQ cannot be lost.
-        assert_wait_deadline((event_t)&d->used[MEDIA_COMMANDQ], THREAD_UNINT, deadline);
+        assert_wait_deadline((event_t)&d->used[MEDIA_COMMANDQ], THREAD_UNINT, wake_by(d, deadline));
         if (used(d, MEDIA_COMMANDQ)[1] != d->used[MEDIA_COMMANDQ]) {
             clear_wait(current_thread(), THREAD_AWAKENED);
             break;
         }
-        if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
+        if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT && mach_absolute_time() >= deadline) {
             droidvm_media_timeouts++;
             return -1;
         }
@@ -341,7 +355,7 @@ static const char *bring_up(struct media_device *d) {
         media_write64(d, 0x80, base); media_write64(d, 0x90, base + 1024); media_write64(d, 0xa0, base + 2048);
         media_write32(d, 0x44, 1);
     }
-    if (armcpu_spi_attach(d->interrupt_id, false, media_interrupt, d, NULL, NULL)) return "cannot attach level SPI";
+    d->irq = d->interrupt_id && !armcpu_spi_attach(d->interrupt_id, false, media_interrupt, d, NULL, NULL);
     media_barrier();
     media_write32(d, 0x70, 15);         // DRIVER_OK
     if ((media_read32(d, 0x70) & 0x4f) != 15) return "device not ready";
@@ -395,15 +409,24 @@ static void media_thread(void *arg, wait_result_t result) {
     (void)arg; (void)result;
     for (unsigned device = 0; device < media_count; ++device)
         if (media[device].up) check(device);
-    // Sleep until an IRQ; an interrupt arriving before assert_wait is retained in media_pending.
-    for (;;) {
-        assert_wait((event_t)&media_pending, THREAD_UNINT);
+    // Sleep until an IRQ; an interrupt arriving before assert_wait is retained in media_pending. With a polled device among
+    // them, wake on a timer as well: every millisecond while events come, every 50 once 100 polls in a row found none.
+    bool polled = false;
+    for (unsigned device = 0; device < media_count; ++device)
+        polled |= media[device].up && !media[device].irq;
+    for (unsigned quiet = 0;;) {
+        if (polled)
+            assert_wait_timeout((event_t)&media_pending, THREAD_UNINT, quiet < 100 ? 1 : 50, NSEC_PER_MSEC);
+        else
+            assert_wait((event_t)&media_pending, THREAD_UNINT);
         if (__atomic_exchange_n(&media_pending, false, __ATOMIC_ACQ_REL))
             clear_wait(current_thread(), THREAD_AWAKENED);
         else
             thread_block(THREAD_CONTINUE_NULL);
+        bool any = false;
         for (unsigned device = 0; device < media_count; ++device)
-            if (media[device].up) reap_events(&media[device]);
+            if (media[device].up) any |= reap_events(&media[device]);
+        quiet = any ? 0 : quiet + 1;
     }
 }
 
@@ -432,10 +455,9 @@ void droidvm_media_start(void) {
             memcpy(&d->pool_base, value, 8);
             memcpy(&d->pool_size, (const uint8_t *)value + 8, 8);
         }
-        if (SecureDTGetProperty(node, "gic-spi", &value, &size) != kSuccess || size != sizeof d->interrupt_id) {
-            snprintf(line, line_size, "no GIC SPI"); continue;
-        }
-        memcpy(&d->interrupt_id, value, size);
+        if ((SecureDTGetProperty(node, "droidvm,intid", &value, &size) == kSuccess ||
+             SecureDTGetProperty(node, "gic-spi", &value, &size) == kSuccess) && size == sizeof d->interrupt_id)
+            memcpy(&d->interrupt_id, value, size);
         if (SecureDTGetProperty(node, "reg", &value, &size) != kSuccess || size != sizeof(reg)) continue;
         memcpy(reg, value, sizeof(reg));
         if (reg[0] < ranges[0] || reg[1] < 0x110 || reg[1] > ranges[2] || reg[0] - ranges[0] > ranges[2] - reg[1]) continue;
@@ -457,8 +479,8 @@ void droidvm_media_start(void) {
         d->up = true;
         droidvm_media_up++;
         droidvm_media_stage[n] = 3;
-        snprintf(line, line_size, "%s: up, caps %#x type %u, pool %#llx+%#llx", d->card, d->device_caps, d->device_type,
-                 d->pool_base, d->pool_size);
+        snprintf(line, line_size, "%s: up, caps %#x type %u, pool %#llx+%#llx, %s", d->card, d->device_caps, d->device_type,
+                 d->pool_base, d->pool_size, d->irq ? "interrupt" : "polled");
     }
     if (droidvm_media_up) {
         thread_t thread;

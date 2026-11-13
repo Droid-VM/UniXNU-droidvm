@@ -5,7 +5,10 @@
 // fork's --virtio-mmio-snd, and make-droidvm-adt.py (--snd-mmio) publishes its window as /arm-io/virtio-snd, compatible
 // "droidvm,virtio-snd". This file is the transport half: it maps that window, brings the device up (VIRTIO_F_VERSION_1 only),
 // picks the first output and the first input PCM stream, sets them to 48 kHz S16 and moves PCM periods on the transmit and
-// receive queues. Level SPI completions wake the control waiter and PCM/event worker.
+// receive queues. Level SPI completions wake the control waiter and PCM/event worker. The window's interrupt is its GIC INTID
+// in the ADT, "droidvm,intid" (DarwinBoot's ADT built from the firmware's FDT) or "gic-spi" (macOS-DroidVM's); a window without
+// either (a static ADT names none) or whose SPI cannot be attached is polled: waits wake every millisecond, the worker every
+// 2 ms while a stream runs and every 50 otherwise.
 //
 // Above it the device is iOS's built-in audio device (DroidVMAudio.cpp, an IOAudio2Device). The engine there calls, from its
 // one thread, in periods of 240 frames (5 ms):
@@ -92,7 +95,8 @@ static struct {
     uint16_t tx_free;                 // transmit slots not with the device
     uint8_t tx_next;                  // the next transmit slot to fill (they return in order)
     bool up, out_running, in_running;
-    uint32_t interrupt_id;
+    uint32_t interrupt_id;            // 0: the ADT names none
+    bool irq;                         // the SPI is attached; otherwise the device is polled
     uint16_t rx_ready[SND_SLOTS], rx_head, rx_count;
     lck_mtx_t *lock;
 } snd;
@@ -139,6 +143,14 @@ static void post(unsigned q, uint16_t head) {
     snd_write32(0x50, q);
 }
 
+// When a wait for the device ends: `deadline` with its interrupt, a millisecond from now (at most `deadline`) when polled.
+static uint64_t wake_by(uint64_t deadline) {
+    if (snd.irq) return deadline;
+    uint64_t soon;
+    clock_interval_to_deadline(1, NSEC_PER_MSEC, &soon);
+    return soon < deadline ? soon : deadline;
+}
+
 // One control request and its reply, synchronously (the control queue has a single chain in flight). The request and reply
 // buffers are static; the caller fills the request and reads the reply.
 static bool control(uint32_t request_size, uint32_t reply_size) {
@@ -150,12 +162,12 @@ static bool control(uint32_t request_size, uint32_t reply_size) {
     uint64_t deadline;
     clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
     for (;;) {
-        assert_wait_deadline((event_t)&snd.used[SND_CONTROL], THREAD_UNINT, deadline);
+        assert_wait_deadline((event_t)&snd.used[SND_CONTROL], THREAD_UNINT, wake_by(deadline));
         if (used(SND_CONTROL)[1] != snd.used[SND_CONTROL]) {
             clear_wait(current_thread(), THREAD_AWAKENED);
             break;
         }
-        if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
+        if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT && mach_absolute_time() >= deadline) {
             droidvm_snd_timeouts++; droidvm_snd_errors++; return false;
         }
     }
@@ -220,7 +232,10 @@ static void snd_interrupt(void *context) {
 static void snd_worker(void *arg, wait_result_t result) {
     (void)arg; (void)result;
     for (;;) {
-        assert_wait((event_t)&snd_pending, THREAD_UNINT);
+        if (snd.irq)
+            assert_wait((event_t)&snd_pending, THREAD_UNINT);
+        else
+            assert_wait_timeout((event_t)&snd_pending, THREAD_UNINT, snd.out_running || snd.in_running ? 2 : 50, NSEC_PER_MSEC);
         if (__atomic_exchange_n(&snd_pending, false, __ATOMIC_ACQ_REL))
             clear_wait(current_thread(), THREAD_AWAKENED);
         else thread_block(THREAD_CONTINUE_NULL);
@@ -259,11 +274,11 @@ static bool drain(unsigned q) {
     uint64_t deadline;
     clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
     while (snd.used[q] != snd.avail[q]) {
-        assert_wait_deadline((event_t)&snd.used[q], THREAD_UNINT, deadline);
+        assert_wait_deadline((event_t)&snd.used[q], THREAD_UNINT, wake_by(deadline));
         lck_mtx_unlock(snd.lock);
         wait_result_t result = thread_block(THREAD_CONTINUE_NULL);
         lck_mtx_lock(snd.lock);
-        if (result == THREAD_TIMED_OUT && snd.used[q] != snd.avail[q]) {
+        if (result == THREAD_TIMED_OUT && snd.used[q] != snd.avail[q] && mach_absolute_time() >= deadline) {
             droidvm_snd_timeouts++; droidvm_snd_errors++; return false;
         }
     }
@@ -384,9 +399,9 @@ static const char *snd_bring_up(void) {
         post(SND_EVENT, i);
     }
     snd.tx_free = SND_SLOTS;
-    if (armcpu_spi_attach(snd.interrupt_id, false, snd_interrupt, NULL, NULL, NULL)) return "cannot attach level SPI";
+    snd.irq = snd.interrupt_id && !armcpu_spi_attach(snd.interrupt_id, false, snd_interrupt, NULL, NULL, NULL);
     thread_t worker;
-    if (kernel_thread_start(snd_worker, NULL, &worker) != KERN_SUCCESS) return "cannot start IRQ worker";
+    if (kernel_thread_start(snd_worker, NULL, &worker) != KERN_SUCCESS) return "cannot start the worker";
     thread_deallocate(worker);
     snd_barrier();
     snd_write32(0x70, 15);         // DRIVER_OK
@@ -461,11 +476,9 @@ void droidvm_snd_start(void) {
         lck_grp_t *group = lck_grp_alloc_init("DroidVMSnd", LCK_GRP_ATTR_NULL);
         snd.lock = lck_mtx_alloc_init(group, LCK_ATTR_NULL);
         if (!snd.lock) return;
-        if (SecureDTGetProperty(node, "gic-spi", &value, &size) != kSuccess || size != sizeof snd.interrupt_id) {
-            strlcpy(droidvm_snd_status, "no GIC SPI", sizeof droidvm_snd_status);
-            return;
-        }
-        memcpy(&snd.interrupt_id, value, size);
+        if ((SecureDTGetProperty(node, "droidvm,intid", &value, &size) == kSuccess ||
+             SecureDTGetProperty(node, "gic-spi", &value, &size) == kSuccess) && size == sizeof snd.interrupt_id)
+            memcpy(&snd.interrupt_id, value, size);
         if (SecureDTGetProperty(node, "reg", &value, &size) == kSuccess && size == sizeof(reg)) {
             memcpy(reg, value, sizeof(reg));
             if (reg[0] >= ranges[0] && reg[1] >= 0x110 && reg[1] <= ranges[2] && reg[0] - ranges[0] <= ranges[2] - reg[1]) {
@@ -482,8 +495,8 @@ void droidvm_snd_start(void) {
                     } else {
                         snd.up = true;
                         droidvm_snd_stage = 3;
-                        snprintf(droidvm_snd_status, sizeof(droidvm_snd_status), "up: output stream %d, input stream %d x%u",
-                                 snd.out_stream, snd.in_stream, snd.in_channels);
+                        snprintf(droidvm_snd_status, sizeof(droidvm_snd_status), "up: output stream %d, input stream %d x%u, %s",
+                                 snd.out_stream, snd.in_stream, snd.in_channels, snd.irq ? "interrupt" : "polled");
                     }
                 }
             }
