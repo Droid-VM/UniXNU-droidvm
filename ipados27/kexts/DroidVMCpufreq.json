@@ -3,8 +3,18 @@
   "name": "DroidVMCpufreq",
   "bundle": "com.droidvm.driver.DroidVMCpufreq",
   "version": "1.0.0",
-  "sources": ["DroidVMCpufreq.c"],
+  "sources": [
+    "DroidVMCpufreq.c"
+  ],
   "attach": "droidvm_cpufreq_attach",
-  "builtin": ["DroidVMCpufreq"],
-  "libraries": {"com.apple.kpi.bsd": "18.0.0", "com.apple.kpi.iokit": "18.0.0", "com.apple.kpi.libkern": "18.0.0", "com.apple.kpi.mach": "18.0.0", "com.apple.kpi.private": "18.0.0", "com.apple.kpi.unsupported": "18.0.0"}
+  "builtin": [
+    "DroidVMCpufreq"
+  ],
+  "libraries": {
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  }
 }

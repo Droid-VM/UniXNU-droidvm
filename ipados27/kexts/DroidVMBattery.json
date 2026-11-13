@@ -3,15 +3,18 @@
   "name": "DroidVMBattery",
   "bundle": "com.droidvm.driver.DroidVMBattery",
   "version": "1.0.0",
-  "sources": ["DroidVMBattery.cpp"],
+  "sources": [
+    "DroidVMBattery.cpp"
+  ],
   "attach": "droidvm_battery_attach",
-  "builtin": ["DroidVMBattery"],
+  "builtin": [
+    "DroidVMBattery"
+  ],
   "libraries": {
     "com.apple.kpi.bsd": "18.0.0",
     "com.apple.kpi.iokit": "18.0.0",
     "com.apple.kpi.libkern": "18.0.0",
     "com.apple.kpi.mach": "18.0.0",
-    "com.apple.kpi.private": "18.0.0",
     "com.apple.kpi.unsupported": "18.0.0"
   }
 }
