@@ -279,6 +279,7 @@ struct Session {
     uint32_t codec = 0, width = 0, height = 0;
     bool encoder = false;
     uint32_t nalLength = 4;
+    bool tenBit = false;   // hvcC's bitDepthLumaMinus8 above 0: the pixel buffers asked for are x420
     uint8_t parameterSets[512] = {};
     uint32_t parameterSetsSize = 0;
     bool parametersSent = false;
@@ -488,6 +489,7 @@ int queueBuffer(Session *s, V4l2Buffer &b, const Mapped &m) {
 
 // The parameter sets of an avcC or hvcC, as Annex B, and the NAL length size.
 bool parameterSets(Session *s, const ImageDescription &d) {
+    s->tenBit = false;
     Atom ext;
     const uint8_t start[4] = {0, 0, 0, 1};
     s->parameterSetsSize = 0;
@@ -519,6 +521,7 @@ bool parameterSets(Session *s, const ImageDescription &d) {
         const uint8_t *p = ext.body, *end = ext.body + ext.size;
         if (ext.size < 23) return false;
         s->nalLength = (p[21] & 3) + 1;
+        s->tenBit = (p[17] & 7) != 0;
         const unsigned arrays = p[22];
         p += 23;
         for (unsigned a = 0; a < arrays; ++a) {
@@ -613,11 +616,21 @@ void copyFrame(Session *s, const Mapped &from, const SurfaceView &to) {
         const uint32_t width = s->captureWidth < to.plane[0].width ? s->captureWidth : uint32_t(to.plane[0].width);
         const uint32_t height = s->captureHeight < to.plane[0].height ? s->captureHeight : uint32_t(to.plane[0].height);
         const uint8_t *luma = from.bytes, *chroma = from.bytes + uint64_t(s->captureStride) * s->captureHeight;
+        // A 10-bit stream's player asks for x420/xf20 pixel buffers (16 bits a sample, the value in the top 10): the 8 bits the
+        // device gives widened, not copied as they are -- 8-bit samples in the low byte of each word read as black.
+        const bool wide = to.format == cc("x420") || to.format == cc("xf20");
+        auto row = [&](uint8_t *out, const uint8_t *in, uint32_t samples, uint64_t room) {
+            if (!wide) { memcpy(out, in, samples < room ? samples : uint32_t(room)); return; }
+            uint16_t *words = reinterpret_cast<uint16_t *>(out);
+            const uint32_t n = samples < room / 2 ? samples : uint32_t(room / 2);
+            for (uint32_t x = 0; x < n; ++x) words[x] = uint16_t(in[x] << 8);
+        };
         for (uint32_t y = 0; y < height; ++y)
-            memcpy(surface + to.plane[0].offset + y * to.plane[0].bytesPerRow, luma + uint64_t(y) * s->captureStride, width);
+            row(surface + to.plane[0].offset + y * to.plane[0].bytesPerRow, luma + uint64_t(y) * s->captureStride, width,
+                to.plane[0].bytesPerRow);
         for (uint32_t y = 0; y < (height + 1) / 2 && y < to.plane[1].height; ++y)
-            memcpy(surface + to.plane[1].offset + y * to.plane[1].bytesPerRow, chroma + uint64_t(y) * s->captureStride,
-                   width < to.plane[1].bytesPerRow ? width : uint32_t(to.plane[1].bytesPerRow));
+            row(surface + to.plane[1].offset + y * to.plane[1].bytesPerRow, chroma + uint64_t(y) * s->captureStride, width,
+                to.plane[1].bytesPerRow);
     } else {
         failed(61, 0);
     }
@@ -1554,7 +1567,9 @@ void pixelBufferAttributes(Session *s) {
     Plist *p = new Plist();
     uint8_t buffer[512];
     if (!p) return;
-    const int format = p->integer(875704438);   // '420v'
+    // '420v', or 'x420' for a 10-bit stream: the player of a 10-bit (HDR) video takes nothing else and drops 420v frames
+    // unseen (the lock screen's aerials stayed black), so the device's 8 bits are widened into it (copyFrame).
+    const int format = p->integer(s->tenBit ? int64_t(cc("x420")) : 875704438);
     const int keys[6] = {p->string("Width"), p->string("Height"), p->string("PixelFormatType"), p->string("BytesPerRowAlignment"),
                          p->string("PlaneAlignment"), p->string("IOSurfaceProperties")};
     const int values[6] = {p->integer(s->width), p->integer(s->height), p->array(&format, 1), p->integer(64), p->integer(256),
