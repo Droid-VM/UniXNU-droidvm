@@ -475,6 +475,11 @@ class Build:
         shutil.copyfile(self.work / 'payload/droidvm-disk.img', self.release / 'droidvm-disk.img')
         shutil.copyfile(self.tree / NATIVE_KERNEL, self.release / 'kernel.native.macho')
         shutil.copyfile(self.work / 'kernel/kernel.macho', self.release / 'kernel.macho')
+        # Where fileset-add-kexts.py put the board's kexts, with their symbols (no symbol table of the collection has them).
+        kexts = self.work / 'kernel/kexts.json'
+        (self.release / 'kexts.json').unlink(missing_ok=True)
+        if kexts.is_file():
+            shutil.copyfile(kexts, self.release / 'kexts.json')
         plugin = self.release / 'plugin'
         if plugin.exists():
             shutil.rmtree(plugin)
@@ -504,7 +509,8 @@ class Build:
             'owner_tools': tools,
             'checks': self.record('checks') or {},
             'files': {name: {'bytes': (self.release / name).stat().st_size, 'sha256': sha256(self.release / name)}
-                      for name in ('droidvm-disk.img', 'kernel.macho', 'kernel.native.macho', 'os.img', 'systemos.img')},
+                      for name in ('droidvm-disk.img', 'kernel.macho', 'kernel.native.macho', 'os.img', 'systemos.img', 'kexts.json')
+                      if (self.release / name).is_file()},
         }
         (self.release / 'release.json').write_text(json.dumps(release, indent=2) + '\n')
         log(f'release in {self.release}' + ('' if release['clean'] else ' (NOT clean: see "changed")'))

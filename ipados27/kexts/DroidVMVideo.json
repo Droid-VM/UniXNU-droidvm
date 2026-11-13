@@ -1,0 +1,10 @@
+{
+  "_comment": "VideoToolbox on the host's codecs: the virtio-media transport (package/DroidVMVirtioMedia.c), the paravirtualization host (DroidVMVTHost.cpp) and Apple's paravirt channel (DroidVMVTParavirt.cpp), as a kext of the kernel collection. See scripts/build-droidvm-kexts.py.",
+  "name": "DroidVMVideo",
+  "bundle": "com.droidvm.driver.DroidVMVideo",
+  "version": "1.0.0",
+  "sources": ["DroidVMVirtioMedia.c", "DroidVMVTHost.cpp", "DroidVMVTParavirt.cpp"],
+  "attach": ["droidvm_media_start", "droidvm_vt_paravirt_attach"],
+  "builtin": ["DroidVMVirtioMedia", "DroidVMVTHost", "DroidVMVTParavirt"],
+  "libraries": {"com.apple.kpi.bsd": "18.0.0", "com.apple.kpi.iokit": "18.0.0", "com.apple.kpi.libkern": "18.0.0", "com.apple.kpi.mach": "18.0.0", "com.apple.kpi.private": "18.0.0", "com.apple.kpi.unsupported": "18.0.0"}
+}

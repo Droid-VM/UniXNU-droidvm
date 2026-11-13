@@ -1,0 +1,10 @@
+{
+  "_comment": "The vCPUs' performance requests to the host (package/DroidVMCpufreq.c, crosvm's virtual cpufreq), as a kext of the kernel collection. See scripts/build-droidvm-kexts.py.",
+  "name": "DroidVMCpufreq",
+  "bundle": "com.droidvm.driver.DroidVMCpufreq",
+  "version": "1.0.0",
+  "sources": ["DroidVMCpufreq.c"],
+  "attach": "droidvm_cpufreq_attach",
+  "builtin": ["DroidVMCpufreq"],
+  "libraries": {"com.apple.kpi.bsd": "18.0.0", "com.apple.kpi.iokit": "18.0.0", "com.apple.kpi.libkern": "18.0.0", "com.apple.kpi.mach": "18.0.0", "com.apple.kpi.private": "18.0.0", "com.apple.kpi.unsupported": "18.0.0"}
+}

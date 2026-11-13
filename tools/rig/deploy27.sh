@@ -170,6 +170,9 @@ fetch() {            # NAME in release/, checked against release.json; kept when
   echo "$name: fetched"
 }
 for name in droidvm-disk.img kernel.macho kernel.native.macho; do fetch "$name"; done
+# The board's kexts (fileset-add-kexts.py) and their symbols, when the release has any.
+rm -f "$R/kexts.json"
+[ -n "$(field "$R/release.json" "files.kexts.json.sha256")" ] && fetch kexts.json
 [ $IMAGES = 1 ] && for name in os.img systemos.img; do fetch "$name"; done
 rm -rf "$R/plugin.new" && mkdir -p "$R/plugin.new"
 ssh -o BatchMode=yes "$MAC" "cd $M/release/plugin && COPYFILE_DISABLE=1 tar --no-xattrs -cf - ." | tar xf - -C "$R/plugin.new"
@@ -194,6 +197,16 @@ symbols() {          # the release's kernel and its symbols where the rig's tool
   llvm-nm -n --defined-only "$O/kernel.native.macho" > "$O/kernel.native.nm"
   # kernel.nm for the rig's tools: the native kernel's symbols at the addresses the collection gives them
   python3 "$RIG/fileset-syms.py" "$O/kernel.macho" "$O/kernel.native.macho" "$O/kernel.native.nm" "$O/kernel.nm" >/dev/null
+  # and the board's kexts' symbols, which no symbol table of the collection holds (kexts.json, fileset-add-kexts.py)
+  if [ -f "$R/kexts.json" ]; then
+    python3 - "$R/kexts.json" >> "$O/kernel.nm" <<'PY'
+import json, sys
+for kext in json.load(open(sys.argv[1]))['kexts']:
+    for name, address in kext.get('symbols', {}).items():
+        print(f'{int(address, 16):016x} S {name}')
+PY
+    sort -o "$O/kernel.nm" "$O/kernel.nm"
+  fi
 }
 
 if [ $NEWVM = 1 ]; then

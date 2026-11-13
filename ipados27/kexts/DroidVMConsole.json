@@ -1,0 +1,11 @@
+{
+  "_comment": "The virtio-console ports as BSD terminals (package/DroidVMVirtioConsole.c, /dev/cu.NAME; compiled with a BSD file's flags for the tty and devfs interfaces), as a kext of the kernel collection. See scripts/build-droidvm-kexts.py.",
+  "name": "DroidVMConsole",
+  "bundle": "com.droidvm.driver.DroidVMConsole",
+  "version": "1.0.0",
+  "sources": ["DroidVMVirtioConsole.c"],
+  "records": {"DroidVMVirtioConsole.c": "bsd/DEVELOPMENT/kern_exec.o.json"},
+  "attach": "droidvm_console_start",
+  "builtin": ["DroidVMVirtioConsole"],
+  "libraries": {"com.apple.kpi.bsd": "18.0.0", "com.apple.kpi.iokit": "18.0.0", "com.apple.kpi.libkern": "18.0.0", "com.apple.kpi.mach": "18.0.0", "com.apple.kpi.private": "18.0.0", "com.apple.kpi.unsupported": "18.0.0"}
+}

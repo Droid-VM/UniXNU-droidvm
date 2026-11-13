@@ -29,4 +29,8 @@ def builtin_left_out():
 
 def attach_left_out():
     """The attach functions the board's late probe no longer calls."""
-    return {spec['attach'] for spec in specs()}
+    found = set()
+    for spec in specs():
+        attach = spec['attach']
+        found.update(attach if isinstance(attach, list) else [attach])
+    return found

@@ -1,0 +1,10 @@
+{
+  "_comment": "The speaker and microphone (package/DroidVMAudio.cpp, IOAudio2Devices re-parented under the original IOAudio2Family at attach) over virtio-snd (DroidVMVirtioSnd.c), as a kext of the kernel collection. See scripts/build-droidvm-kexts.py.",
+  "name": "DroidVMAudio",
+  "bundle": "com.droidvm.driver.DroidVMAudio",
+  "version": "1.0.0",
+  "sources": ["DroidVMVirtioSnd.c", "DroidVMAudio.cpp"],
+  "attach": "droidvm_snd_start",
+  "builtin": ["DroidVMVirtioSnd", "DroidVMAudio"],
+  "libraries": {"com.apple.kpi.bsd": "18.0.0", "com.apple.kpi.iokit": "18.0.0", "com.apple.kpi.libkern": "18.0.0", "com.apple.kpi.mach": "18.0.0", "com.apple.kpi.private": "18.0.0", "com.apple.kpi.unsupported": "18.0.0"}
+}

@@ -150,13 +150,16 @@ def main():
         objects.append(stage_late(obj, name) if late else obj)
         sources.append(source)
     for name in ('DroidVMVirtioNet', 'DroidVMVirtioSnd', 'DroidVMVirtioMedia', 'DroidVMCpufreq', 'DroidVMSchedTrace'):
+        if name in as_kexts:
+            continue
         source = ROOT / 'kits/droidvm' / f'{name}.c'
         objects.append(command(c_mach, source, OUT / f'{name}.o', ('-DDROIDVM_DEVICE_DYNAMIC=1',)))
         sources.append(source)
     console_source = ROOT / 'kits/droidvm/DroidVMVirtioConsole.c'
-    objects.append(command(record('bsd/DEVELOPMENT/kern_exec.o.json'), console_source, OUT / 'DroidVMVirtioConsole.o',
-                           ('-DDROIDVM_DEVICE_DYNAMIC=1',)))
-    sources.append(console_source)
+    if 'DroidVMVirtioConsole' not in as_kexts:
+        objects.append(command(record('bsd/DEVELOPMENT/kern_exec.o.json'), console_source, OUT / 'DroidVMVirtioConsole.o',
+                               ('-DDROIDVM_DEVICE_DYNAMIC=1',)))
+        sources.append(console_source)
     sources += [ROOT / 'kits/droidvm/DroidVMDmaRegion.h', ROOT / 'kits/droidvm/DroidVMWifi.inc', ROOT / 'kits/droidvm/DroidVMVTWire.h']
     # SoftwareAES's NativeAES, from a staged copy compiled with component:SoftwareAES's own command: the hardware keys the guest is
     # asked for derived in software (SoftwareAESKeys.inc), its static initializer staged for DroidVMSoftwareAES.cpp's registration,
