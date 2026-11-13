@@ -538,13 +538,17 @@ void native_legacy_display_late_probe(void);
 #if !DROIDVM_KEXT_INPUT
 extern void native_hid_input_probe(void);
 #endif
+#if !DROIDVM_KEXT_KEYSTORE
 extern void native_keystore_probe(void);
+#endif
 extern void native_touch_probe(void);
 extern void sheng_cpufreq_probe(void);
 extern void sheng_gpu_power_probe(void);
 void native_legacy_display_late_probe(void) {
     droidvm_virtio_gpu_display_start();
+#if !DROIDVM_KEXT_KEYSTORE   // the keystore kext (ipados27/kexts/DroidVMKeyStore.json) runs it from its own starter
     native_keystore_probe();
+#endif
     sheng_cpufreq_probe();
     sheng_gpu_power_probe();
     native_touch_probe();

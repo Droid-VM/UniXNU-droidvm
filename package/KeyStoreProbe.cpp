@@ -8,8 +8,10 @@
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
+#if !DROIDVM_NATIVE_KEXT
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" void native_keyevents_static_init(void) __asm__("__GLOBAL__sub_I_NativeKeyStoreEvents.cpp");
+#endif
 extern "C" IOService *native_keyevents_allocate(void);
 extern "C" {
 volatile uint32_t native_keyevents_stage, native_keyevents_refused_opens;
@@ -89,6 +91,7 @@ static void native_keyevents_probe(void) {
         memcpy(&ephemeral, data->getBytesNoCopy(), sizeof(ephemeral));
     OSSafeReleaseNULL(chosen);
     if (ephemeral != 1 || original) return;
+#if !DROIDVM_NATIVE_KEXT
     const OSSymbol *name = OSSymbol::withCString("AppleKeyStore");
     bool absent = name && !OSMetaClass::getMetaClassWithName(name);
     OSSafeReleaseNULL(name);
@@ -100,6 +103,12 @@ static void native_keyevents_probe(void) {
     native_keyevents_static_init();
     native_keyevents_status = OSMetaClass::postModLoad(handle);
     if (native_keyevents_status) return;
+#else
+    // The keystore kext (ipados27/kexts/DroidVMKeyStore.json): AppleKeyStore was registered as the kext loaded (a second
+    // AppleKeyStore, the original AppleSEPKeyStore's, would have failed to load, so the class is this one).
+    IOService *provider = IOService::getResourceService();
+    if (!provider) return;
+#endif
     native_keyevents_stage = 2;
     IOService *service = native_keyevents_allocate();
     bool initialized = service && service->init();
