@@ -431,13 +431,17 @@ void unmapBuffer(Session *s, Mapped &m) {
 
 // Buffer `index` of the queue (after REQBUFS with USERPTR): as long as the device says (QUERYBUF's plane length, the queue's
 // sizeimage, which a USERPTR buffer must give exactly), wired, and the list of its pages, adjacent ones merged.
+// Pageable kernel memory that prepare() wires: the wiring waits for the pageout daemon to reclaim and compress pages where few are
+// free. A wired allocation (inTaskWithOptions without kIOMemoryPageable) does not: at the lock screen, with 20-50 MB free, every
+// 4K buffer (13 MB capture, 6.6 MB bitstream) came back null, and VideoToolbox fell back to software decoding.
 bool mapBuffer(Session *s, uint32_t type, uint32_t index, Mapped &m) {
     V4l2Buffer b = {};
     b.index = index; b.type = type; b.memory = MemoryUserPtr; b.length = 1;
     int r = ioctl(s, IocQuerybuf, &b, sizeof b, sizeof b);
     if (r || !b.plane.length) { failed(10, r ? r : -1); return false; }
     m.length = b.plane.length;
-    m.buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, m.length, 16384);
+    m.buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPageable),
+                                                           m.length, 16384);
     if (!m.buffer || m.buffer->prepare() != kIOReturnSuccess) { OSSafeReleaseNULL(m.buffer); failed(11, int32_t(m.length)); return false; }
     m.bytes = static_cast<uint8_t *>(m.buffer->getBytesNoCopy());
     SgEntry *entries = static_cast<SgEntry *>(IOMalloc(MaxSgEntries * sizeof(SgEntry)));
