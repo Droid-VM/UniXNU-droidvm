@@ -2828,7 +2828,13 @@ int droidvm_vthost_message(void *host, const uint8_t *m, uint32_t n, const uint3
                 if (s->known[i].id == surfaces[0]) { view = s->known[i].view; surface = true; }
             if (!surface) {
                 if (!s->surfaces) s->surfaces = openSurfaceClient(c->task);
-                surface = s->surfaces && lookupSurface(s->surfaces, surfaces[0], view);
+                surface = s->surfaces && !s->holder && lookupSurface(s->surfaces, surfaces[0], view);
+                // A pool another process made (WebKit's: the task may not look it up by ID, kIOReturnNotPermitted): through the
+                // process's own client, as an efrm's frame.
+                if (!surface && s->surfaces) {
+                    if (!s->holder) s->holder = processSurfaceClient(c->pid);
+                    surface = s->holder && lookupSurface(s->surfaces, surfaces[0], view, s->holder);
+                }
                 if (surface && s->knownCount < 48) s->known[s->knownCount++] = {surfaces[0], view};
             }
             IOLockUnlock(s->surfaceLock);
