@@ -9,10 +9,10 @@ payload is a FAT disk attached to the VM, with `UniXNU.efi`, `DarwinBoot.efi`, t
 
 ## Build
 
-On the build Mac, with the UniXNU fork (Droid-VM/UniXNU, branch `wip/droidvm`) checked out beside this repository:
+On the build Mac, with the UniXNU fork (Droid-VM/UniXNU, branch `wip/hackintosh`) checked out beside this repository:
 
 ```sh
-git clone --recurse-submodules -b wip/droidvm https://github.com/Droid-VM/UniXNU
+git clone --recurse-submodules -b wip/hackintosh https://github.com/Droid-VM/UniXNU
 git clone -b wip/hackintosh https://github.com/Droid-VM/UniXNU-droidvm
 cd UniXNU-droidvm
 python3 scripts/build-droidvm-all.py --unique-chip-id <16 hex digits>
