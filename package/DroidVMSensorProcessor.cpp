@@ -21,7 +21,9 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <mach/kmod.h>
 
+#if !DROIDVM_NATIVE_KEXT
 extern kmod_info_t g_kernel_kmod_info;
+#endif
 
 extern "C" {
 volatile uint32_t droidvm_spu_opens, droidvm_spu_commands;
@@ -53,19 +55,25 @@ public:
 };
 OSDefineMetaClassAndStructors(AppleSPUHIDDeviceUserClient, IOUserClient)
 
+#if !DROIDVM_NATIVE_KEXT
 #define DROIDVM_LATE_INIT(file) extern "C" void droidvm_late_init_##file(void) __asm__("__GLOBAL__sub_I_" #file ".cpp");
 DROIDVM_LATE_INIT(DroidVMSensorProcessor)
+#endif
 
 // Registers the class in its own OSMetaClass module load (its static initializer is staged for this call, as the other board
 // classes are), before HidInputProbe.cpp publishes the motion devices that name it.
 extern "C" int droidvm_sensor_processor_register(void) {
     if (droidvm_spu_register_status >= 0) return droidvm_spu_register_status;
+#if !DROIDVM_NATIVE_KEXT
     void *module = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     int status = 1;
     if (module) {
         droidvm_late_init_DroidVMSensorProcessor();
         status = OSMetaClass::postModLoad(module) ? 2 : 0;
     }
+#else
+    int status = 0;   // registered as the input kext loaded
+#endif
     droidvm_spu_register_status = status;
     return status;
 }

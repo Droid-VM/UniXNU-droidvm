@@ -9,7 +9,9 @@
 #include <libkern/c++/OSKext.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
+#if !DROIDVM_NATIVE_KEXT
 extern kmod_info_t g_kernel_kmod_info;
+#endif
 extern "C" void native_hid_static_init(void) __asm__("__GLOBAL__sub_I_NativeHidInput.cpp");
 extern "C" IOService *native_hid_input_allocate(void);
 extern "C" IOService *native_hid_touch_allocate(void);
@@ -187,9 +189,14 @@ void native_hid_input_probe(void) {
         native_hid_resource_found=resource!=nullptr;
         unsigned sendHome=0;PE_parse_boot_argn("offline-hid-home",&sendHome,sizeof(sendHome));
         if(resource && sendHome==1 && native_hid_class_sizes[4]==208) {
+#if !DROIDVM_NATIVE_KEXT
             void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
             if(handle) {
                 native_hid_static_init();native_hid_input_meta_status=OSMetaClass::postModLoad(handle);
+#else       // the input kext (ipados27/kexts/DroidVMInput.json): NativeHidInput was registered as the kext loaded, after IOHIDFamily
+            {
+                native_hid_input_meta_status=0;
+#endif
                 if(!native_hid_input_meta_status) {
                     IOService *device=native_hid_input_allocate();
                     native_hid_input_object=(uintptr_t)device;

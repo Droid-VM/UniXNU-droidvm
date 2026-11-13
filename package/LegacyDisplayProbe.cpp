@@ -535,7 +535,9 @@ extern "C" unsigned native_legacy_refresh_hz(void) {
     return droidvm_virtio_display_refresh_hz>60?droidvm_virtio_display_refresh_hz:0;
 }
 void native_legacy_display_late_probe(void);
+#if !DROIDVM_KEXT_INPUT
 extern void native_hid_input_probe(void);
+#endif
 extern void native_keystore_probe(void);
 extern void native_touch_probe(void);
 extern void sheng_cpufreq_probe(void);
@@ -546,7 +548,9 @@ void native_legacy_display_late_probe(void) {
     sheng_cpufreq_probe();
     sheng_gpu_power_probe();
     native_touch_probe();
+#if !DROIDVM_KEXT_INPUT   // the input kext (ipados27/kexts/DroidVMInput.json) runs it from its own starter
     native_hid_input_probe();
+#endif
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
     native_legacy_surface_status=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
     OSDictionary *matching=IOService::nameMatching("IOCoreSurfaceRoot");

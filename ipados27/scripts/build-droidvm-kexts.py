@@ -15,6 +15,8 @@ The board's drivers that ship as kexts of the kernel collection rather than insi
                           IONetworkingFamily, as build-droidvm-devices.py compiles it)
   objects                 optional: objects another step of the kernel build made, tree:PATH (SoftwareAES's NativeAES.o, compiled
                           with its component's own command, and its fileset bindings, by build-droidvm-devices.py)
+  object_lists            optional: tree:PATH of a JSON list of such objects (paths in the tree), as a builder writes it
+                          (build-droidvm-hid-input.py's kext-objects.json)
 A source is a file of package/ (kits/droidvm), or tree:PATH, a path in the build tree (.cache/sources/...).
   builtin                 the build-droidvm-devices.py objects this kext replaces (left out of the kernel)
   libraries               OSBundleLibraries
@@ -100,7 +102,12 @@ def main():
                 rec = record(named) if named else c if path.suffix == '.c' else cpp
                 objects.append(command(rec, path, work / (path.stem + '.o'), tree, (*LIB, *defines, *flags),
                                        group.get('warnings', True)))
-        for prebuilt in spec.get('objects', []):
+        listed = []
+        for listing in spec.get('object_lists', []):
+            if not listing.startswith('tree:'):
+                raise SystemExit(f'{name}: object_lists are tree:PATH')
+            listed += ['tree:' + p for p in json.loads((tree / listing[len('tree:'):]).read_text())]
+        for prebuilt in [*spec.get('objects', []), *listed]:
             if not prebuilt.startswith('tree:'):
                 raise SystemExit(f'{name}: objects are tree:PATH')
             path = tree / prebuilt[len('tree:'):]

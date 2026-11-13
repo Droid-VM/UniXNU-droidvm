@@ -4,7 +4,9 @@
 # __BOOTDATA,__static_if entries stay out: XNU rewrites only the kernel's own static branches at boot, a kext's keep what they
 # were compiled with (mach_assert on, as on this DEVELOPMENT kernel). And absolute symbols (N_ABS, `.set NAME, ADDRESS`) are
 # defined at their value: the board's bindings to classes of the stripped iPadOS fileset name the original objects that way
-# (SoftwareAES-24A446.S: IOAESAccelerator's metaclass, reached through a GOT entry that keeps the value).
+# (SoftwareAES-24A446.S: IOAESAccelerator's metaclass, reached through a GOT entry that keeps the value); a 64-bit value naming
+# one is written as that value, not made a pointer of the collection's chains: the stubs of the HID bindings keep the original
+# entry's address as a literal in their code (`.quad NAME.original`), which nothing may move.
 """A small static linker: relocatable arm64e objects of a driver -> the four segments of a kext inside a fileset kernel collection.
 
 The driver refers to classes of kexts of the collection (it derives from IOBlockStorageDevice), so it cannot be linked into the kernel
@@ -151,11 +153,12 @@ def link(objects, resolve, allocate, header_reserve, data_reserve, start_symbol,
             segments[seg]['sections'].append(('__got', base + got_at, 8 * len(got_names), 6))
     got_address = {name: segments['__DATA_CONST']['va'] + segments['__DATA_CONST']['got_at'] + 8 * i for i, name in enumerate(got_names)}
     # 3. symbols
-    defined = {}
+    defined, absolute = {}, set()
     for obj in objs:
         for symbol in obj.symbols:
             if symbol['type'] & 0x0e == 0x02 and symbol['type'] & 1 and not symbol['type'] & 0xe0:   # N_ABS, external
                 defined[symbol['name']] = symbol['value']
+                absolute.add(symbol['name'])
             elif symbol['type'] & 0x0e == 0x0e and symbol['type'] & 1 and not symbol['type'] & 0xe0:
                 sect = obj.sections[symbol['sect'] - 1]
                 if (id(obj), sect['index']) in placement:
@@ -231,8 +234,12 @@ def link(objects, resolve, allocate, header_reserve, data_reserve, start_symbol,
                 elif kind == UNSIGNED and length == 3:
                     value, = struct.unpack_from('<Q', buf, at)
                     target = address_of(obj, symbolnum) + value
-                    sites.append((pc, target, False, 0, False, 0))
-                    struct.pack_into('<Q', buf, at, 0)
+                    named = obj.symbols[symbolnum]
+                    if named['type'] & 0x0e == 0x02 or named['name'] in absolute:   # an absolute symbol: the value itself
+                        struct.pack_into('<Q', buf, at, target & (2 ** 64 - 1))
+                    else:
+                        sites.append((pc, target, False, 0, False, 0))
+                        struct.pack_into('<Q', buf, at, 0)
                 elif kind == AUTH:
                     value, = struct.unpack_from('<Q', buf, at)
                     plus = value & 0xffffffff

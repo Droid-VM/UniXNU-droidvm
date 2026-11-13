@@ -1,0 +1,28 @@
+{
+  "_comment": "The touch screen, keyboard, pen, trackpad and motion sensors: the virtio-input transport (DroidVMVirtioInput.c), NativeHidInput under the original IOHIDDevice of the 24A446 fileset with its bindings, the HID probe (HidInputProbe.cpp), the motion sysctl (DroidVMMotion.c), all built by build-droidvm-hid-input.py (kext-objects.json), and the sensor processor's channel (DroidVMSensorProcessor.cpp), as one kext of the kernel collection. Depends on IOHIDFamily, so OSKext loads it before NativeHidInput's metaclass is built. See scripts/build-droidvm-kexts.py.",
+  "name": "DroidVMInput",
+  "bundle": "com.droidvm.driver.DroidVMInput",
+  "version": "1.0.0",
+  "sources": [
+    "DroidVMSensorProcessor.cpp"
+  ],
+  "object_lists": [
+    "tree:build/droidvm-hid-input/kext-objects.json"
+  ],
+  "attach": [
+    "droidvm_input_start",
+    "native_hid_input_probe"
+  ],
+  "builtin": [
+    "DroidVMSensorProcessor",
+    "NativeHidInput"
+  ],
+  "libraries": {
+    "com.apple.iokit.IOHIDFamily": "2.0.0",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  }
+}

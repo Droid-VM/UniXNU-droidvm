@@ -377,6 +377,8 @@ def main():
     command(cpp, staged, hid_obj, (*hid_includes, '-DNATIVE_HID_SOURCE_API=1'))
     probe = ROOT / 'kits/droidvm/HidInputProbe.cpp'
     command(cpp, probe, OUT / 'HidInputProbe.o')
+    # and as the input kext's (ipados27/kexts/DroidVMInput.json): NativeHidInput registered as the kext loads, not staged here
+    command(cpp, probe, OUT / 'HidInputProbe.kext.o', ('-DDROIDVM_NATIVE_KEXT=1',))
     transport = ROOT / 'kits/droidvm/DroidVMVirtioInput.c'
     # Its queue and event pages come from the kernel map (DROIDVM_INPUT_DYNAMIC): the native __DATA must fit the original kernel's slot.
     command(c_mach, transport, OUT / 'DroidVMVirtioInput.o', ('-DDROIDVM_INPUT_DYNAMIC=1',))
@@ -447,6 +449,10 @@ def main():
     sources = [original, ROOT / 'kits/droidvm/DroidVMMotionHid.inc', ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc', probe, transport,
                motion, HERE / 'hid-device-24A446.json']
     (OUT / 'objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in objects], indent=2) + '\n')
+    # The same driver as a kext of the collection: NativeHidInput with its static initializer, the kext form of the probe.
+    kext_objects = [hid_obj, OUT / 'hid-bindings.o', OUT / 'hid-addresses.o', OUT / 'HidInputProbe.kext.o',
+                    OUT / 'DroidVMVirtioInput.o', OUT / 'DroidVMMotion.o']
+    (OUT / 'kext-objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in kext_objects], indent=2) + '\n')
     (OUT / 'sources.json').write_text(json.dumps([str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p) for p in sources],
                                                  indent=2) + '\n')
     (OUT / 'report.json').write_text(json.dumps(dict(
