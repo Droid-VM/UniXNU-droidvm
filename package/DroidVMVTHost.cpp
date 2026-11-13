@@ -139,7 +139,8 @@ constexpr uint32_t LockResultBytes = 0xc68;
 IOService *surfaceRoot() {
     static IOService *root;
     if (!root) {
-        OSDictionary *matching = IOService::nameMatching("IOCoreSurfaceRoot");
+        // by class: iPadOS names the service IOCoreSurfaceRoot, macOS leaves it the class's name
+        OSDictionary *matching = IOService::serviceMatching("IOSurfaceRoot");
         IOService *found = matching ? IOService::waitForMatchingService(matching, 1000000000ULL) : nullptr;
         OSSafeReleaseNULL(matching);
         if (found && !OSCompareAndSwapPtr(nullptr, found, &root)) found->release();
