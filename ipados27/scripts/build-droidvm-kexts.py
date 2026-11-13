@@ -10,6 +10,10 @@ The board's drivers that ship as kexts of the kernel collection rather than insi
   records                 optional {source: the kernel compile record to compile it with}, for a source that needs another
                           object's flags (a BSD file's, bsd/DEVELOPMENT/kern_exec.o.json); C++ takes
                           iokit/DEVELOPMENT/IOPlatformExpert.cpo.json and C osfmk/DEVELOPMENT/startup.o.json otherwise
+  groups                  optional, beside or instead of sources: [{sources, flags, warnings}] -- sources compiled with extra
+                          flags ({tree} is the build tree) and, with warnings false, without the board's -Werror set (Apple's
+                          IONetworkingFamily, as build-droidvm-devices.py compiles it)
+A source is a file of package/ (kits/droidvm), or tree:PATH, a path in the build tree (.cache/sources/...).
   builtin                 the build-droidvm-devices.py objects this kext replaces (left out of the kernel)
   libraries               OSBundleLibraries
 Each is compiled with the kernel's own compile records, as the built-in drivers are (build-droidvm-devices.py), with the starter
@@ -36,7 +40,7 @@ def run(cmd, **kw):
     return subprocess.check_output([str(x) for x in cmd], timeout=600, **kw)
 
 
-def command(rec, src, dst, tree, extra=()):
+def command(rec, src, dst, tree, extra=(), warnings=True):
     """A kernel compile record with another source and output, the board's warnings (as build-droidvm-devices.py's)."""
     cmd, args, i = [], rec['arguments'], 0
     while i < len(args):
@@ -54,10 +58,13 @@ def command(rec, src, dst, tree, extra=()):
         elif not value.startswith('-W'):
             cmd.append(value)
         i += 1
-    cmd += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter']
-    if Path(src).suffix != '.c':
-        cmd += ['-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
-                '-Wno-unnecessary-virtual-specifier', '-Wno-macro-redefined']
+    if warnings:
+        cmd += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter']
+        if Path(src).suffix != '.c':
+            cmd += ['-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
+                    '-Wno-unnecessary-virtual-specifier', '-Wno-macro-redefined']
+    else:
+        cmd += ['-Wno-everything']
     cmd += ['-I', str(tree / '.cache/xnu-work/osfmk'), '-I', str(tree / 'kits/droidvm'), *extra]
     run(cmd, cwd=rec['directory'])
     return dst
@@ -82,11 +89,15 @@ def main():
         work.mkdir(exist_ok=True)
         defines = ('-DDROIDVM_NATIVE_KEXT=1', '-DDROIDVM_DEVICE_DYNAMIC=1')
         objects = []
-        for source in spec['sources']:
-            path = tree / 'kits/droidvm' / source
-            named = spec.get('records', {}).get(source)
-            rec = record(named) if named else c if path.suffix == '.c' else cpp
-            objects.append(command(rec, path, work / (path.stem + '.o'), tree, (*LIB, *defines)))
+        groups = [{'sources': spec.get('sources', []), 'flags': [], 'warnings': True}, *spec.get('groups', [])]
+        for group in groups:
+            flags = [f.replace('{tree}', str(tree)) for f in group.get('flags', [])]
+            for source in group['sources']:
+                path = tree / source[len('tree:'):] if source.startswith('tree:') else tree / 'kits/droidvm' / source
+                named = spec.get('records', {}).get(source)
+                rec = record(named) if named else c if path.suffix == '.c' else cpp
+                objects.append(command(rec, path, work / (path.stem + '.o'), tree, (*LIB, *defines, *flags),
+                                       group.get('warnings', True)))
         starter = f'{name}Starter'
         attach = spec['attach']
         if isinstance(attach, list):

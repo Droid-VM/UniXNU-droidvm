@@ -132,14 +132,17 @@ def main():
     universe = ('-include', 'sys/systm.h', '-include', str(include / 'droidvm-mbuf-crumbs.h'), '-I', str(ROOT / '.cache/xnu-work/bsd'),
                 '-D__PRIVATE_SPI__')
     objects, sources = [], []
+    # A driver that ships as a kext of the collection (ipados27/kexts, build-droidvm-kexts.py) is not built into the kernel.
+    # The family's sources are still fetched above: the network kext compiles them from there.
+    as_kexts = droidvm_kexts.builtin_left_out()
     for stem in IONET_FILES:
+        if stem in as_kexts:
+            continue
         obj = command(cpp, family / f'{stem}.cpp', OUT / f'{stem}.o', (*lib, *universe, '-I', str(include), '-I', str(family)),
                       warnings=False)
         objects.append(stage_late(obj, stem))
         sources.append(family / f'{stem}.cpp')
     strict = (*lib, *universe, '-isystem', str(include))
-    # A driver that ships as a kext of the collection (ipados27/kexts, build-droidvm-kexts.py) is not built into the kernel.
-    as_kexts = droidvm_kexts.builtin_left_out()
     for name, late in (('DroidVMVirtioEthernet', True), ('DroidVMVirtioNetIf', False), ('DroidVMAudio', True),
                        ('DroidVMBattery', True), ('DroidVMSensorProcessor', True), ('DroidVMSoftwareAES', False),
                        ('DroidVMVTParavirt', True), ('DroidVMVTHost', False)):

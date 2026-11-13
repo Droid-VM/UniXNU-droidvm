@@ -1,5 +1,8 @@
-# From Droid-VM/macOS-DroidVM scripts/kc_native.py (lateautumn233, 1edf517), unchanged: the static linker of the native kexts of
-# its macOS kernel collection; fileset-add-kexts.py links the iPadOS board's kexts with it.
+# From Droid-VM/macOS-DroidVM scripts/kc_native.py (lateautumn233, 1edf517): the static linker of the native kexts of its macOS
+# kernel collection; fileset-add-kexts.py links the iPadOS board's kexts with it. One change: __DATA_CONST,__assert is placed
+# (XNU's assert descriptors, which code built with the kernel's own flags refers to: Apple's IONetworkingFamily). Its
+# __BOOTDATA,__static_if entries stay out: XNU rewrites only the kernel's own static branches at boot, a kext's keep what they
+# were compiled with (mach_assert on, as on this DEVELOPMENT kernel).
 """A small static linker: relocatable arm64e objects of a driver -> the four segments of a kext inside a fileset kernel collection.
 
 The driver refers to classes of kexts of the collection (it derives from IOBlockStorageDevice), so it cannot be linked into the kernel
@@ -27,6 +30,7 @@ PLACEMENT = {
     ('__DATA_CONST', '__kalloc_type'): ('__DATA_CONST', '__kalloc_type'),
     ('__DATA', '__kalloc_var'): ('__DATA_CONST', '__kalloc_var'),
     ('__DATA_CONST', '__kalloc_var'): ('__DATA_CONST', '__kalloc_var'),
+    ('__DATA_CONST', '__assert'): ('__DATA_CONST', '__assert'),
     ('__DATA', '__mod_init_func'): ('__DATA_CONST', '__mod_init_func'),
     ('__DATA', '__mod_term_func'): ('__DATA_CONST', '__mod_term_func'),
     ('__DATA', '__data'): ('__DATA', '__data'),

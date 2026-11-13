@@ -11,12 +11,17 @@
 //
 // The controller sits on a nub of its own carrying "built-in", which IONetworkInterface turns into IOBuiltin, so configd's
 // InterfaceNamer names the interface en0 and IPConfiguration configures it from the Data seed's network service.
+//
+// As a kext of the kernel collection (DROIDVM_NATIVE_KEXT, ipados27/kexts/DroidVMNetwork.json: the family's sources, this file,
+// the controller and the transport in one kext) OSKext registers the family's classes and the controller's as the kext loads,
+// so attach starts IONetworkStack and the controllers without a module load of its own.
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOService.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 
+#if !DROIDVM_NATIVE_KEXT
 extern kmod_info_t g_kernel_kmod_info;
 
 #define DROIDVM_LATE_INIT(file) extern "C" void droidvm_late_init_##file(void) __asm__("__GLOBAL__sub_I_" #file ".cpp");
@@ -41,6 +46,7 @@ static void (*const droidvm_net_initializers[])(void) = {
     droidvm_late_init_IONetworkUserClient, droidvm_late_init_IOOutputQueue, droidvm_late_init_IOPacketQueue,
     droidvm_late_init_DroidVMVirtioEthernet,
 };
+#endif
 
 extern "C" {
 // For the host rig (peek.py): how far attach got, the module load's result, and the controller.
@@ -97,11 +103,15 @@ int droidvm_net_if_attach(const uint8_t mac[6]) {
     IOService *resources = IOService::getResourceService();
     if (!resources) return -1;
     droidvm_net_if_stage = 1;
+#if !DROIDVM_NATIVE_KEXT
     void *module = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!module) return -1;
     for (auto initializer : droidvm_net_initializers) initializer();
     droidvm_net_family_status = OSMetaClass::postModLoad(module);
     if (droidvm_net_family_status) return -1;
+#else
+    droidvm_net_family_status = 0;   // registered as the kext loaded
+#endif
     droidvm_net_if_stage = 2;
     if (!droidvm_net_start_service("IONetworkStack", resources)) return -1;
     droidvm_net_if_stage = 3;

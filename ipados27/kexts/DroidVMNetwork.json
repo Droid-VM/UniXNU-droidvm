@@ -1,0 +1,83 @@
+{
+  "_comment": "The network: Apple's IONetworkingFamily-188 compiled from source (build-droidvm-devices.py fetches it and stages its headers), the virtio-net controller and the Wi-Fi interface on it (package/DroidVMVirtioEthernet.cpp, DroidVMWifi.inc), the late IONetworkStack start (DroidVMVirtioNetIf.cpp) and the virtio-mmio transport (DroidVMVirtioNet.c), as one kext of the kernel collection. See scripts/build-droidvm-kexts.py.",
+  "name": "DroidVMNetwork",
+  "bundle": "com.droidvm.driver.DroidVMNetwork",
+  "version": "1.0.0",
+  "sources": [
+    "DroidVMVirtioNet.c"
+  ],
+  "groups": [
+    {
+      "sources": [
+        "tree:.cache/sources/IONetworkingFamily/IOEthernetController.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IOEthernetInterface.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IOKernelDebugger.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IOMbufMemoryCursor.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IONetworkController.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IONetworkData.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IONetworkInterface.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IONetworkMedium.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IONetworkStack.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IONetworkUserClient.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IOOutputQueue.cpp",
+        "tree:.cache/sources/IONetworkingFamily/IOPacketQueue.cpp"
+      ],
+      "flags": [
+        "-include",
+        "sys/systm.h",
+        "-include",
+        "{tree}/build/droidvm-devices/ionetworking-include/droidvm-mbuf-crumbs.h",
+        "-I",
+        "{tree}/.cache/xnu-work/bsd",
+        "-D__PRIVATE_SPI__",
+        "-I",
+        "{tree}/build/droidvm-devices/ionetworking-include",
+        "-I",
+        "{tree}/.cache/sources/IONetworkingFamily"
+      ],
+      "warnings": false
+    },
+    {
+      "sources": [
+        "DroidVMVirtioEthernet.cpp",
+        "DroidVMVirtioNetIf.cpp"
+      ],
+      "flags": [
+        "-include",
+        "sys/systm.h",
+        "-include",
+        "{tree}/build/droidvm-devices/ionetworking-include/droidvm-mbuf-crumbs.h",
+        "-I",
+        "{tree}/.cache/xnu-work/bsd",
+        "-D__PRIVATE_SPI__",
+        "-isystem",
+        "{tree}/build/droidvm-devices/ionetworking-include"
+      ]
+    }
+  ],
+  "attach": "droidvm_net_start",
+  "builtin": [
+    "IOEthernetController",
+    "IOEthernetInterface",
+    "IOKernelDebugger",
+    "IOMbufMemoryCursor",
+    "IONetworkController",
+    "IONetworkData",
+    "IONetworkInterface",
+    "IONetworkMedium",
+    "IONetworkStack",
+    "IONetworkUserClient",
+    "IOOutputQueue",
+    "IOPacketQueue",
+    "DroidVMVirtioEthernet",
+    "DroidVMVirtioNetIf",
+    "DroidVMVirtioNet"
+  ],
+  "libraries": {
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  }
+}
