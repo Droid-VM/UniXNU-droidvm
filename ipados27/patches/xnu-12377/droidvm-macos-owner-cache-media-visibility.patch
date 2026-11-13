@@ -1,0 +1,21 @@
+External (USB) disks are published at once with the owner cache's fixed driver set: macOS-DroidVM's collection boots with
+its complete driver set (XNU_OWNER_CACHE_STARTUP), so there is no later driver replacement phase to hide IOMedia for, and an
+unrelated registry stall kept the disks hidden. On XNU_TARGET_OS_OSX only.
+From macOS-DroidVM patches/xnu-12377/IOService-owner-cache-media-visibility (lateautumn233).
+
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 5e28090..11c89d5 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -258,7 +258,10 @@ bool                            gIOKitWillTerminate;
+ atomic_bool                     gInUserspaceReboot;
+ 
+ #define kIOServiceRootMediaParentInvalid ((IOService *) -1UL)
+-#if NO_KEXTD
++// The offline owner cache boots with its complete driver set in the KC.
++// Do not hide external disks while waiting for an unrelated registry stall
++// to clear: there is no later driver replacement phase to wait for.
++#if NO_KEXTD || (XNU_TARGET_OS_OSX && defined(XNU_OWNER_CACHE_STARTUP) && XNU_OWNER_CACHE_STARTUP)
+ static bool                     gIOServiceHideIOMedia = false;
+ static IOService *              gIOServiceRootMediaParent = NULL;
+ #else /* NO_KEXTD */

@@ -1,0 +1,29 @@
+mach_absolute_time starts at 0 at boot on macOS: Gunyah passes the host's counter through (no CNTVOFF), so the timebase
+stood at the host's uptime. On a Mac it starts near 0, and macOS reads it so: HID idle time is now minus the last event
+(none yet: 0), and a timebase hours past 0 put every display to sleep as soon as WindowServer came up. The boot CPU sets
+rtclock_base_abstime the way wake does, the secondaries take it (cpu_timebase_init(FALSE)). Under XNU_TARGET_OS_OSX: the
+iPadOS board has run on the host's counter from the start.
+From macOS-DroidVM patches/xnu-12377/0018 (its cpu.c hunk; lateautumn233).
+
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index ee39d9a..236c656 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -1056,6 +1056,17 @@ cpu_timebase_init(boolean_t from_boot)
+ 		 */
+ 		rtclock_base_abstime = wake_abstime - ml_get_hwclock();
+ 	} else if (from_boot) {
++#if XNU_TARGET_OS_OSX
++		/*
++		 * The hypervisor passes the host's counter through (no CNTVOFF), so the timebase stood at the host's uptime
++		 * at boot. Start mach_absolute_time() at 0, as a Mac's does, the way wake does above: HID idle time is now minus
++		 * the last event (none yet: 0), and a timebase hours past 0 put every display to sleep as soon as WindowServer
++		 * came up. The secondary CPUs take this base (cpu_timebase_init(FALSE)).
++		 */
++		if (cdp == &BootCpuData) {
++			rtclock_base_abstime = 0 - ml_get_hwclock();
++		}
++#endif
+ #if DEBUG || DEVELOPMENT
+ 		if (PE_parse_boot_argn("timebase_offset", &timebase_offset, sizeof(timebase_offset))) {
+ 			rtclock_base_abstime += timebase_offset;

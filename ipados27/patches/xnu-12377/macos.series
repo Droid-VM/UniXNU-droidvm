@@ -1,0 +1,10 @@
+# The board's XNU patches for macOS 27 only, after series ([os_overrides."macos-27.0.1-26A434"] of board.toml).
+droidvm-macos-kc-layout.patch
+droidvm-macos-timebase-from-zero.patch
+droidvm-macos-external-method-hook.patch
+droidvm-macos-amfi-page-shift.patch
+droidvm-macos-boot-manifest-placeholder.patch
+droidvm-macos-owner-cache-media-visibility.patch
+droidvm-macos-jetsam-floors.patch
+droidvm-macos-rootauth.patch
+droidvm-macos-owner-root-unverified.patch

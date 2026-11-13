@@ -1,0 +1,26 @@
+The owner boot manifest replaces an all-zero boot-manifest-hash: macOS-DroidVM's run-macos-vm.py
+(MACOS_BOOT_MANIFEST_HASH=1) puts that placeholder in /chosen so that macOS 27's Image4 kext can initialize its magazine
+at start, and the owner identity is published over it (never over a real firmware or Apple one). Under XNU_TARGET_OS_OSX.
+From macOS-DroidVM patches/xnu-12377/0030 (lateautumn233).
+
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 2b49e3c..e12771e 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -608,6 +608,16 @@ native_owner_publish_boot_manifest(dev_t rootDevice, const char *rootUUID,
+ 	IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+ 	if (!chosen) { native_owner_boot_manifest_status = 2; return 0; }
+ 	// Never replace an existing firmware/Apple identity with an owner identity.
++#if XNU_TARGET_OS_OSX
++	// Except the all-zero placeholder macOS-DroidVM's run-macos-vm.py (MACOS_BOOT_MANIFEST_HASH=1) puts there so that
++	// macOS 27's Image4 kext can initialize its magazine.
++	OSData *existing = OSDynamicCast(OSData, chosen->getProperty("boot-manifest-hash"));
++	static const uint8_t placeholder[48] = {};
++	if (existing && existing->getLength() == sizeof(placeholder) &&
++	    !memcmp(existing->getBytesNoCopy(), placeholder, sizeof(placeholder)) && !chosen->getProperty("owner-boot-manifest-domain")) {
++		chosen->removeProperty("boot-manifest-hash");
++	}
++#endif
+ 	if (chosen->getProperty("boot-manifest-hash") || chosen->getProperty("owner-boot-manifest-domain")) {
+ 		chosen->release();
+ 		native_owner_boot_manifest_status = 3;

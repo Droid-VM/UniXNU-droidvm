@@ -1,0 +1,44 @@
+The owner chain's two questions for a kernel linked without the verified block driver (macOS-DroidVM's collection, whose
+disks are its own kexts): every device is the authenticated one, and a volume's manifest digest is the SHA-384 of its UUID
+text. Only on XNU_TARGET_OS_OSX with -DXNU_OWNER_ROOT_UNVERIFIED=1 (k27's build adds it); a kernel with the VerifiedRoot
+component answers them from the verified driver.
+From macOS-DroidVM patches/xnu-12377/0008 (its link_compat.c stubs; lateautumn233).
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 80a139d..3890af7 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8038,6 +8038,33 @@ extern void commpage_update_dyld_flags(uint64_t);
+ volatile uint64_t native_owner_cache_dyld_flags = 0;
+ #endif
+ extern int native_verified_block_root_authorized(dev_t);
++#if XNU_TARGET_OS_OSX && defined(XNU_OWNER_ROOT_UNVERIFIED) && XNU_OWNER_ROOT_UNVERIFIED
++#include <libkern/crypto/sha2.h>
++/*
++ * A kernel linked without the verified block driver (macOS-DroidVM's kernel collection, whose disks are its own kexts):
++ * the owner chain's two questions answered without it -- every device is the authenticated one, and a volume's manifest
++ * digest is the SHA-384 of its UUID text. Only with -DXNU_OWNER_ROOT_UNVERIFIED=1; a kernel with the VerifiedRoot
++ * component answers them from the verified driver.
++ */
++int
++native_verified_block_root_authorized(dev_t device)
++{
++	(void)device;
++	return 1;
++}
++
++int native_verified_block_manifest_sha384(dev_t device, const char *uuid, uint8_t digest[48]);
++int
++native_verified_block_manifest_sha384(dev_t device, const char *uuid, uint8_t digest[48])
++{
++	SHA384_CTX context;
++	(void)device;
++	SHA384_Init(&context);
++	SHA384_Update(&context, uuid, strlen(uuid));
++	SHA384_Final(digest, &context);
++	return 1;
++}
++#endif
+ volatile int native_owner_cache_stage = 0;
+ volatile int native_owner_cache_status = -1;
+ volatile int native_owner_cache_mount_status = -1;

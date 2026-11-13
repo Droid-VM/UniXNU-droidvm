@@ -1,0 +1,28 @@
+rootauth=0: the macOS System volume mounts unauthenticated. macOS-DroidVM's single APFS container has no boot manifest to
+check the sealed volume against; the owner chain vouches for the device instead. Under XNU_TARGET_OS_OSX (the iPadOS
+kernel requires root authentication as before).
+From macOS-DroidVM patches/xnu-12377/0008 (its bsd_init.c hunk; lateautumn233).
+
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 3907c55..48eb49b 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1070,6 +1070,18 @@ bsd_init(void)
+ 		/* Non MacOS */
+ 		require_rootauth = TRUE;
+ #endif // XNU_TARGET_OS_OSX && defined(__arm64__)
++#if XNU_TARGET_OS_OSX
++		{
++			/*
++			 * rootauth=0: the System volume mounts unauthenticated. macOS-DroidVM's single APFS container has no
++			 * boot manifest to check the sealed volume against; the owner chain vouches for the device instead.
++			 */
++			int rootauth = 1;
++			if (PE_parse_boot_argn("rootauth", &rootauth, sizeof(rootauth)) && rootauth == 0) {
++				require_rootauth = FALSE;
++			}
++		}
++#endif
+ 
+ 		if (require_rootauth) {
+ 			/* enforce sealedness */

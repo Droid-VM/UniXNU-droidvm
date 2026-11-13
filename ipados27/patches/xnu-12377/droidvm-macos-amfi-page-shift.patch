@@ -1,0 +1,26 @@
+k27_amfi_page_shift (31): what macOS 27's AMFI reads as PAGE_SHIFT_CONST; macOS-DroidVM's k27/kc-build27.py binds AMFI's one
+GOT slot for it here. CoreEntitlements' CEElementIterate fails when (sp & ~(-1 << PAGE_SHIFT_CONST)) < 0x80, which on a call
+chain of fixed depth over a page aligned kernel stack is a fixed outcome, and this kernel's frames put every spawn's
+entitlement dictionary copy there; 31 compares the low 31 bits instead. AMFI's bytes stay as shipped. Under
+XNU_TARGET_OS_OSX (the iPadOS fileset pairs PAGE_SHIFT_CONST by address, ipados27/fileset-reviewed.json).
+From macOS-DroidVM patches/xnu-12377/0035 (lateautumn233).
+
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index f2e883b..341810e 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -312,6 +312,14 @@ SECURITY_READ_ONLY_LATE(static unsigned long) segSizeKCDATA;
+ SECURITY_READ_ONLY_LATE(static boolean_t) use_contiguous_hint = TRUE;
+ 
+ SECURITY_READ_ONLY_LATE(int) PAGE_SHIFT_CONST;
++#if XNU_TARGET_OS_OSX
++/*
++ * What macOS 27's AMFI reads as PAGE_SHIFT_CONST (k27/kc-build27.py binds its one reference here): CoreEntitlements'
++ * CEElementIterate fails when (sp & ~(-1 << PAGE_SHIFT_CONST)) < 0x80, which on a call chain of fixed depth over a page aligned
++ * kernel stack is a fixed outcome, and our frames put every spawn's entitlement dictionary copy there. 31: the low 31 bits of sp.
++ */
++__attribute__((used)) const int k27_amfi_page_shift = 31;
++#endif
+ 
+ SECURITY_READ_ONLY_LATE(vm_offset_t) end_kern;
+ SECURITY_READ_ONLY_LATE(vm_offset_t) etext;

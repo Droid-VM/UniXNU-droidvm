@@ -1,0 +1,66 @@
+The kernel in macOS-DroidVM's kernel collection (k27/kc-build27.py):
+- makedefs: XNU_KC_SEGADDRS, when set, replaces the kernel's __PRELINK_TEXT address and image base with the segment
+  addresses of the collection's holes (k27/segaddrs.sh); unset, the link is as before.
+- arm_vm_finalize: with 4 KiB pages the kernel's own __TEXT, inside the collection's __PRELINK_TEXT, was mapped with the
+  contiguous hint, and re-protecting it without the hint trips the active-mapping assert: the parts of __PRELINK_TEXT
+  around it are re-protected, it is already RNX (the iPadOS fileset gets the same from use_contiguous_hint=0 and
+  native-4k-block-split).
+- the device tree of that line carries no iBoot CTRR property: kernel text is never writable (iPadOS's ADT has
+  kernel-ctrr-to-be-enabled).
+The two C hunks under XNU_TARGET_OS_OSX.
+From macOS-DroidVM patches/xnu-12377/0007 (lateautumn233).
+
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 2496023..0700f70 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -1036,8 +1036,8 @@ LDFLAGS_KERNEL_PROFILEX86_64H = $(LDFLAGS_KERNEL_RELEASEX86_64H)
+ LDFLAGS_KERNEL_GENARM64 = \
+ 	-Wl,-pie \
+ 	-Wl,-static \
+-	-Wl,-segaddr,__PRELINK_TEXT,$(ARM64_PLKSEG_ADDR) \
+-	-Wl,-image_base,$(ARM64_LINK_ADDR) \
++	$(if $(XNU_KC_SEGADDRS),,-Wl,-segaddr,__PRELINK_TEXT,$(ARM64_PLKSEG_ADDR)) \
++	$(if $(XNU_KC_SEGADDRS),$(XNU_KC_SEGADDRS),-Wl,-image_base,$(ARM64_LINK_ADDR)) \
+ 	\
+ 	-Wl,-rename_section,__HIB,__text,__TEXT_EXEC,__hib_text \
+ 	\
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 341810e..e92bf71 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1702,6 +1702,16 @@ arm_vm_prot_finalize(boot_args * args __unused)
+ 	}
+ 
+ 	/* tighten permissions on kext read only data and code */
++#if XNU_TARGET_OS_OSX
++	/*
++	 * macOS-DroidVM's kernel collection: with 4 KiB pages the kernel's own __TEXT, which sits inside the collection's __PRELINK_TEXT, is large enough to have been
++	 * mapped with the contiguous hint; re-protecting it here without the hint trips the active-mapping assert. It is already RNX.
++	 */
++	if (kernel_mach_header_is_in_fileset(&_mh_execute_header) && segTEXTB >= segPRELINKTEXTB && segTEXTB + segSizeTEXT <= segPRELINKTEXTB + segSizePRELINKTEXT) {
++		arm_vm_page_granular_RNX(segPRELINKTEXTB, segTEXTB - segPRELINKTEXTB, ARM64_GRANULE_ALLOW_BLOCK);
++		arm_vm_page_granular_RNX(segTEXTB + segSizeTEXT, segPRELINKTEXTB + segSizePRELINKTEXT - (segTEXTB + segSizeTEXT), ARM64_GRANULE_ALLOW_BLOCK);
++	} else
++#endif
+ 	arm_vm_page_granular_RNX(segPRELINKTEXTB, segSizePRELINKTEXT, ARM64_GRANULE_ALLOW_BLOCK);
+ 	arm_vm_page_granular_RNX(segPLKDATACONSTB, segSizePLKDATACONST, ARM64_GRANULE_ALLOW_BLOCK);
+ 
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index ae7bb77..7055d5e 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -3441,6 +3441,13 @@ ml_unsafe_kernel_text_init(void)
+ 		_unsafe_kernel_text_initialized = true;
+ 		_unsafe_kernel_text = (0 == *(const int *)value);
+ 	}
++#if XNU_TARGET_OS_OSX
++	else {
++		/* macOS-DroidVM's device tree carries no iBoot CTRR property; kernel text is never writable here */
++		_unsafe_kernel_text_initialized = true;
++		_unsafe_kernel_text = false;
++	}
++#endif
+ }
+ STARTUP(TUNABLES, STARTUP_RANK_FIRST, ml_unsafe_kernel_text_init);
+ 

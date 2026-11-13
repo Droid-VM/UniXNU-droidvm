@@ -1,0 +1,65 @@
+Per-process jetsam floors (boot-arg jetsam-floor=NAME:MB[,NAME:MB...], default WallpaperAerialsExtension:2048): what a
+jetsamproperties Override entry would give a process the Mac's table leaves at RunningBoard's default 1000 MB soft limit.
+The aerial wallpaper's frames are plain 4:2:0 10-bit surfaces on this board (24-42 MB each, ~26 in flight between its
+decoder and the render server), not a Mac's compressed ones: a 4480x3088 clip took it past the limit, it was killed as a
+highwater process and the lock screen went grey. memstat_set_memlimits_locked raises the named processes' limits to the
+floor; no limit (0) stays. Under XNU_TARGET_OS_OSX.
+From macOS-DroidVM patches/xnu-12377/0047 (lateautumn233).
+
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index 6f8a417..3ff2bd7 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -3249,6 +3249,52 @@ memstat_set_memlimits_locked(proc_t p, int32_t active_limit,
+ 		inactive_limit = default_inactive_limit;
+ 	}
+ 
++#if XNU_TARGET_OS_OSX
++	/*
++	 * The board's per-process floors (boot-arg jetsam-floor=NAME:MB[,NAME:MB...], default WallpaperAerialsExtension:2048): what
++	 * a jetsamproperties Override entry would give a process the Mac's table leaves at RunningBoard's default. The aerial
++	 * wallpaper's frames are plain 4:2:0 10-bit surfaces here (24-42 MB each, ~26 in flight between its decoder and the render
++	 * server's queue), not the Mac's compressed ones: its 4480x3088 clips took it past the 1000 MB soft limit and the lock screen
++	 * went grey.
++	 */
++	{
++		static char floors[128];
++		static int floors_read;
++		if (!floors_read) {
++			if (!PE_parse_boot_argn("jetsam-floor", floors, sizeof(floors))) {
++				strlcpy(floors, "WallpaperAerialsExtension:2048", sizeof(floors));
++			}
++			floors_read = 1;
++		}
++		const char *name = proc_best_name(p);
++		size_t name_len = strlen(name);
++		for (const char *at = floors; *at;) {
++			const char *colon = strchr(at, ':');
++			if (!colon) {
++				break;
++			}
++			int32_t mb = 0;
++			const char *digit = colon + 1;
++			while (*digit >= '0' && *digit <= '9') {
++				mb = mb * 10 + (*digit++ - '0');
++			}
++			if ((size_t)(colon - at) == name_len && !strncmp(at, name, name_len) && mb > 0) {
++				/* 0 is no limit: left so */
++				if (active_limit > 0) {
++					active_limit = MAX(active_limit, mb);
++				}
++				if (inactive_limit > 0) {
++					inactive_limit = MAX(inactive_limit, mb);
++				}
++			}
++			at = *digit == ',' ? digit + 1 : digit;
++			if (*at && at == digit) {
++				break;
++			}
++		}
++	}
++#endif /* XNU_TARGET_OS_OSX */
++
+ #if DEVELOPMENT || DEBUG
+ 	if (p->p_memlimit_increase) {
+ 		/* Apply memlimit increase (for testing with overlay roots) */

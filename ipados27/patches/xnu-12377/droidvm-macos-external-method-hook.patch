@@ -1,0 +1,46 @@
+virt_set_external_method_hook(): a driver's look at an external method's inband arguments before the user client's
+dispatch checks them; the input lies in the MIG request's io_struct_inband_t, so the hook may rewrite it in place and
+shrink structureInputSize. macOS-DroidVM's DroidVMDisplay converts macOS 27's 1760-byte IOMobileFramebuffer swap record to
+the 1416 bytes of the 26.5 family it is built against (every swap_end failed kIOReturnBadArgument). Under
+XNU_TARGET_OS_OSX.
+From macOS-DroidVM patches/xnu-12377/0018 (its IOUserClient.cpp hunks; lateautumn233).
+
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index f256633..5b66a91 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -5178,6 +5178,21 @@ is_io_connect_method_var_output
+ 	return ret;
+ }
+ 
++#if XNU_TARGET_OS_OSX
++// A driver's look at an external method's arguments before the user client's dispatch checks them. The input structure
++// lies in the MIG request's io_struct_inband_t, so the hook may rewrite it in place and shrink structureInputSize
++// (macOS-DroidVM's DroidVMDisplay converts macOS 27's 1760-byte IOMobileFramebuffer swap record to the 1416 bytes of the
++// 26.5 family it is built against).
++typedef void (*virt_external_method_hook_t)(IOUserClient *client, IOExternalMethodArguments *args);
++static virt_external_method_hook_t virt_external_method_hook;
++
++extern "C" void
++virt_set_external_method_hook(virt_external_method_hook_t hook)
++{
++	virt_external_method_hook = hook;
++}
++#endif /* XNU_TARGET_OS_OSX */
++
+ /* Routine io_user_client_method */
+ kern_return_t
+ is_io_connect_method
+@@ -5257,6 +5272,12 @@ is_io_connect_method
+ 	    ? ((typeof(args.structureOutputDescriptorSize)) * ool_output_size)
+ 	    : 0;
+ 
++#if XNU_TARGET_OS_OSX
++	if (virt_external_method_hook && !ool_input) {
++		virt_external_method_hook(client, &args);
++	}
++#endif
++
+ 	IOStatisticsClientCall();
+ 	ret = kIOReturnSuccess;
+ 	io_filter_policy_t filterPolicy = client->filterForTask(current_task(), 0);
