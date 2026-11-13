@@ -196,3 +196,12 @@ tool_args = ["--dynamic", "--boot-video-mib", "24", "--reclaim-memory", "--displ
              "--identity-tree", ".cache/firmware/DeviceTree.j820ap.im4p", "--kernel-ctrr-to-be-enabled", "0",
              "--text-fixup", "dyld_shared_cache_arm64e.01,40b17a0,282540b9,05000014",   # ldr w8,[x9,#0x24] -> b to the height rule
              "--text-fixup", "dyld_shared_cache_arm64e.01,40b17b8,1fe110f1,1f011ef1"]   # cmp x8,#1080 -> cmp x8,#1920
+
+
+# macOS 27.0.1 (macOS-DroidVM's system) on this board, from the same XNU source: `unixnu build -D ipados27 --os
+# macos-27.0.1-26A434 kernel` (profiles/os/macos-27.0.1-26A434 of the fork: target macosx). The kernel takes the board's
+# shared series and the macOS one instead of ipados.series; packaging (the kernel collection with the macOS and board kexts)
+# is macOS-DroidVM's k27 tooling for now, so only the kernel tables are overridden.
+[os_overrides."macos-27.0.1-26A434".kernel]
+config_fragments = ["arch:configs/common.config", "os:configs/macos.config"]
+patch_series = ["arch:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu-12377/series", "device:patches/xnu-12377/macos.series"]
