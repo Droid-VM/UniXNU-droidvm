@@ -180,11 +180,22 @@ constexpr uint32_t DbufPauseMs = 500;
 // Frame thinning. The lock screen's aerials are 4K HEVC at 240 frames a second (idleassetsd's 4KSDR240FPS); its player decodes
 // every frame and shows about 30 of them a second, and nothing in AVFoundation asks for fewer (ReducedFrameDelivery is set by no
 // one but VideoToolbox's own callers). A pixel buffer and a 4K copy for each of the 240 is ten times what this path does, so the
-// player falls behind, fills MaxInputs and starts over. A frame whose presentation time is less than ThinUs after the last one
+// player falls behind, fills MaxInputs and starts over. A frame whose presentation time is less than thinUs() after the last one
 // handed over with pixels goes back as dropped (kVTDecodeInfo_FrameDropped, no pixel buffer): the references it is to the
 // stream stay in the device's decoder, which is the only place they are needed.
-constexpr int64_t ThinUs = 31000;   // a 30 Hz picture, less a little: every 8th frame of 240
-constexpr unsigned FrameTimes = 256;   // frames given to the device and not yet out: OUTPUT + the codec's delay + CAPTURE   // Qualcomm's AVC decoder asks 21 output slots at 720p
+// The boot argument droidvm-vt-thin-us sets the interval; 0, the default, thins nothing. Every stream is thinned, not only the
+// aerials -- a 60 fps video plays at 30 -- so it is the macOS board's choice (31000: a 30 Hz picture, less a little, every 8th
+// frame of 240), not the iPadOS one's, whose players already ask for what they show.
+int64_t thinUs() {
+    static int64_t us = -1;
+    if (us < 0) {
+        uint32_t value = 0;
+        PE_parse_boot_argn("droidvm-vt-thin-us", &value, sizeof value);
+        us = value;
+    }
+    return us;
+}
+constexpr unsigned FrameTimes = 256;   // frames given to the device and not yet out: OUTPUT + the codec's delay + CAPTURE
 constexpr uint32_t OutputBytes = 2u << 20;
 
 // --- IOSurface, through the guest process's own IOSurfaceRootUserClient ----------------------------------------------------
@@ -398,6 +409,8 @@ struct Session {
     // decoded -- what Apple's host does. Only then is a synchronous dfrm answered after its frame's Demt (syncReplies); in
     // display order the device keeps frames back till later ones come, and a player waiting on each would wait for ever.
     bool decodeOrder = false;
+    // The device could not start this session's stream in decode order: not asked for again (startSession).
+    bool displayOnly = false;
     // demt: its Demt's request, sent from the guest's message thread (not waited for there): the dfrm answered when the Demt is.
     // async: an asynchronous dfrm's, held while AsyncInFlight frames are out (releaseAsync), not tied to its frame.
     struct SyncReply { int64_t frame; uint64_t request, demt; bool async; } syncReplies[MaxSyncReplies];
@@ -977,8 +990,8 @@ bool emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
     const Session::FrameTime &time = s->frameTimes[uint64_t(frame) % FrameTimes];
     const int64_t pts = time.frame == frame ? time.ptsUs : -1;
     if (bytesused && pts >= 0) {
-        // Shown when ThinUs have passed since the last shown, or when time went back (a loop, a seek, a new segment).
-        if (s->lastShownUs != INT64_MIN && pts >= s->lastShownUs && pts - s->lastShownUs < ThinUs) {
+        // Shown when thinUs() have passed since the last shown, or when time went back (a loop, a seek, a new segment).
+        if (thinUs() && s->lastShownUs != INT64_MIN && pts >= s->lastShownUs && pts - s->lastShownUs < thinUs()) {
             handOverDropped(s, frame);
             return false;
         }
@@ -1241,13 +1254,14 @@ void requeueCapture(Session *s, unsigned index) {
     else s->capture[index].queued = true;
 }
 
-// The highest temporal layer given to the device: the least that still makes about 30 frames a second, layers taken as halving
-// the rate (the aerials' do), once 16 steps between inputs' times have shown the frame period; every layer till then.
+// The highest temporal layer given to the device. With frame thinning on (thinUs()), the least that still makes about 30 frames
+// a second, layers taken as halving the rate (the aerials' do), once 16 steps between inputs' times have shown the frame
+// period; every layer till then. Without it, every layer. Either way, less the layers shed while the session is behind.
 bool hevcSession(const Session *s);
 unsigned keptLayer(const Session *s) {
     if (!hevcSession(s) || s->temporalLayers < 2) return 7;
     unsigned kept = s->temporalLayers - 1;
-    if (s->steps >= 16 && s->minStepUs > 0 && s->minStepUs != INT64_MAX) {
+    if (thinUs() && s->steps >= 16 && s->minStepUs > 0 && s->minStepUs != INT64_MAX) {
         const int64_t rate = 1000000 / s->minStepUs;
         unsigned drop = 0;
         while (drop + 1 < s->temporalLayers && (rate >> (drop + 1)) >= 30) ++drop;
@@ -2529,9 +2543,12 @@ int startSession(Session *s, const uint8_t *m, uint32_t n, bool fresh) {
     r = ioctl(s, IocSFmt, &f, sizeof f, sizeof f);
     if (r) { failed(3, r); return refuse(-12911); }
     // Decode order (display delay 0): every frame out as soon as decoded, as Apple's host gives them (a crosvm without it says
-    // EINVAL: display order, every dfrm answered at once as before).
+    // EINVAL: display order, every dfrm answered at once as before). Which one the device gives is the host's choice of decoder
+    // (crosvm's backend=): the codec service (MediaCodec) has display order only and refuses the controls; a direct driver
+    // (msm_vidc) takes them. So the session asks, and is whichever the device turns out to be -- unless the device already
+    // failed to start this stream in decode order (displayOnly).
     uint32_t control[2] = {CidDecDisplayDelayEnable, 1};
-    s->decodeOrder = !ioctl(s, IocSCtrl, control, sizeof control, sizeof control);
+    s->decodeOrder = !s->displayOnly && !ioctl(s, IocSCtrl, control, sizeof control, sizeof control);
     control[0] = CidDecDisplayDelay;
     control[1] = 0;
     if (s->decodeOrder) s->decodeOrder = !ioctl(s, IocSCtrl, control, sizeof control, sizeof control);
@@ -2545,6 +2562,14 @@ int startSession(Session *s, const uint8_t *m, uint32_t n, bool fresh) {
     if (r) {
         failed(5, r);
         refuse(0);
+        // The device took the controls but could not start the stream that way: its direct driver refused this one (a coded
+        // format or size it does not take, no session free) and the codec service cannot give decode order. Started again in
+        // display order, the codec service's -- once; the session stays so.
+        if (s->decodeOrder) {
+            IOLog("DroidVMVTHost: session %u: no decode order for this stream (%d), display order instead\n", s->v4l2, r);
+            s->displayOnly = true;
+            return startSession(s, m, n, fresh);
+        }
         if (fresh && makeRoom(s, true)) return startSession(s, m, n, false);
         return -12911;
     }
