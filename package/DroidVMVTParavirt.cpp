@@ -311,8 +311,10 @@ IOReturn AppleVideoToolboxParavirtualizationUserClient::registerNotificationPort
     return result;
 }
 
+#if !DROIDVM_NATIVE_KEXT
 #define DROIDVM_LATE_INIT(file) extern "C" void droidvm_late_init_##file(void) __asm__("__GLOBAL__sub_I_" #file ".cpp");
 DROIDVM_LATE_INIT(DroidVMVTParavirt)
+#endif
 
 // Publishes the service on IOResources, once.
 static int publish(void) {
@@ -361,10 +363,12 @@ static struct sysctl_oid droidvm_vtpv_oid;
 // classes are) and the sysctl, and with droidvm-vt-paravirt=1 publishes the service.
 int droidvm_vt_paravirt_attach(void) {
     if (droidvm_vtpv_stage) return -1;
+#if !DROIDVM_NATIVE_KEXT
     void *module = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!module) return -1;
     droidvm_late_init_DroidVMVTParavirt();
     if (OSMetaClass::postModLoad(module)) return -1;
+#endif   // a native kext's classes are registered as it loads
     droidvm_vtpv_stage = 1;
     if (!(publishLock = IOLockAlloc())) return -1;
     droidvm_vtpv_oid.oid_parent = &sysctl__kern_children;
