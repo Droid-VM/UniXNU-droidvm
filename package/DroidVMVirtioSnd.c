@@ -33,6 +33,7 @@ extern int droidvm_audio_attach(void);
 
 enum {
     SND_SLOTS = 16,                  // periods in flight per direction (80 ms)
+    SND_PREFILL = 8,                 // periods of silence queued ahead as the output starts (40 ms; DroidVMAudio.cpp's OutputLead)
     SND_QUEUE = 64,                  // descriptors per queue: three per slot (header, data, status)
     SND_PERIOD_FRAMES = 240,
     SND_OUT_CHANNELS = 2, SND_IN_CHANNELS = 1,
@@ -232,6 +233,11 @@ void droidvm_snd_running(bool output, bool input) {
         if (output) {
             snd.tx_free = SND_SLOTS; snd.tx_next = 0;
             snd.out_running = pcm_command(SND_R_PCM_START, snd.out_stream);
+            // The engine hands over each period as its deadline passes, so the host's queue ran empty at every hitch of
+            // the guest or of the host (crosvm: "playback stream is running with nothing queued", 25-66 ms, heard as
+            // stutter): it starts SND_PREFILL periods ahead instead, a lead the guest's periods keep from then on.
+            static const int16_t silence[SND_PERIOD_FRAMES * SND_OUT_CHANNELS];
+            for (unsigned i = 0; snd.out_running && i < SND_PREFILL; ++i) droidvm_snd_play(silence, SND_PERIOD_FRAMES);
         } else {
             pcm_command(SND_R_PCM_STOP, snd.out_stream);
             snd.out_running = false;

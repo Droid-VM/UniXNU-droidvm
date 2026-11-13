@@ -67,6 +67,7 @@ enum : uint32_t {
     Rate = 48000, RingFrames = 8192, PeriodFrames = 240,   // 5 ms
     OutputChannels = 2, InputChannels = 1, StreamID = 1,
     SafetyOffset = 2 * PeriodFrames, Latency = PeriodFrames,
+    OutputLead = 8 * PeriodFrames,   // the silence the transport queues ahead as the output starts (DroidVMVirtioSnd.c's SND_PREFILL)
     TransportBuiltIn = 0x626c746e,                        // 'bltn'
     FormatLinearPCM = 0x6c70636d,                         // 'lpcm'
     FlagsS16 = 0x4 | 0x8,                                 // signed integer, packed (little endian)
@@ -210,7 +211,7 @@ void DroidVMAudioDevice::publish(IORegistryEntry *e) {
     e->setProperty("model UID", uid);
     setNumber(e, "transport type", TransportBuiltIn);
     setNumber(e, "clock domain", 1);   // the HAL warns that a built-in device in clock domain 0 is unusual
-    setNumber(e, "output latency", Latency);
+    setNumber(e, "output latency", Latency + OutputLead);   // so players keep their pictures in step with the sound heard
     setNumber(e, "input latency", Latency);
     setNumber(e, "output safety offset", SafetyOffset);
     setNumber(e, "input safety offset", SafetyOffset);
