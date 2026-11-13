@@ -66,7 +66,6 @@ uint32_t droidvm_media_caps(unsigned device);
 const char *droidvm_media_card(unsigned device);
 bool droidvm_media_is_up(unsigned device);
 void droidvm_media_set_sink(unsigned device, void (*sink)(void *, const uint8_t *, uint32_t), void *context);
-void droidvm_media_set_fast(unsigned device, bool on);
 int proc_selfpid(void);
 ipc_space_t get_task_ipcspace(task_t task);
 kern_return_t mach_port_deallocate(ipc_space_t space, mach_port_name_t name);
@@ -355,7 +354,7 @@ struct Session {
 
     unsigned device = ~0u;
     uint32_t v4l2 = 0;
-    bool open = false, outputStreaming = false, captureStreaming = false, fast = false;
+    bool open = false, outputStreaming = false, captureStreaming = false;
     Mapped output[OutputBuffers];
     Mapped capture[MaxCaptureBuffers];
     unsigned captureCount = 0;
@@ -491,7 +490,7 @@ void unregisterSession(Session *s) {
     IOLockUnlock(gTableLock);
 }
 
-// The device's events (with its lock held): copied into their session's ring.
+// Copied device events arrive outside the transport lock and are queued under the session lock.
 void mediaSink(void *context, const uint8_t *event, uint32_t size) {
     const unsigned device = unsigned(uintptr_t(context));
     if (size < 8) return;
@@ -2059,8 +2058,6 @@ int startEncoder(Session *s, const uint8_t *m, uint32_t n) {
     if (r) { failed(90, r); return -12911; }
     s->open = true;
     registerSession(s);
-    droidvm_media_set_fast(s->device, true);
-    s->fast = true;
     uint32_t subscription[8] = {EventEos, 0, 0, 0, 0, 0, 0, 0};
     ioctl(s, IocSubscribeEvent, subscription, sizeof subscription, 0);
     V4l2Format f = {};
@@ -2166,9 +2163,8 @@ void closeDevice(Session *s) {
         for (Mapped &m : s->capture) unmapBuffer(s, m);
         unregisterSession(s);
         droidvm_media_close(s->device, s->v4l2);
-        if (s->fast) droidvm_media_set_fast(s->device, false);
     }
-    s->open = s->outputStreaming = s->captureStreaming = s->fast = s->direct = false;
+    s->open = s->outputStreaming = s->captureStreaming = s->direct = false;
     s->captureCount = 0;
 }
 
@@ -2517,8 +2513,6 @@ int startSession(Session *s, const uint8_t *m, uint32_t n, bool fresh) {
     // device session no one would close until the dinv).
     auto refuse = [s](int error) { closeDevice(s); return error; };
     registerSession(s);
-    droidvm_media_set_fast(s->device, true);
-    s->fast = true;
     if (!decodableSize(s, d.codec == cc("avc1") ? cc("462H") : cc("CVEH"))) { teardown(s); return -12910; }
     uint32_t subscription[8] = {EventSourceChange, 0, 0, 0, 0, 0, 0, 0};
     r = ioctl(s, IocSubscribeEvent, subscription, sizeof subscription, 0);
