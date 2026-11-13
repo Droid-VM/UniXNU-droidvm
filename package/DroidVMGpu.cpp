@@ -30,11 +30,15 @@
 
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *, const NativeAdrenoRingClock *,
     const NativeAdrenoTimer *, const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
+#if !DROIDVM_NATIVE_KEXT
 extern "C" void native_adreno_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp");
+#endif
 extern "C" IOService *native_adreno_accelerator_allocate(void);
 extern "C" unsigned native_adreno_accelerator_instance_size(void);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
+#if !DROIDVM_NATIVE_KEXT
 extern "C" kmod_info_t g_kernel_kmod_info;
+#endif
 
 // NativeAdrenoVm.cpp's definitions, which the linked NativeAdreno sources use: IO coherence of imported memory (NativeAdrenoUserClient
 // maps an imported BO write-back inner-shareable when it is set), the VM's clock and the board's memory readers (none here).
@@ -266,11 +270,13 @@ void publishMetal()
     OSSafeReleaseNULL(name);
     if (!parent || parent->getClassSize() != 136) {droidvm_metal_publish[2] = uint32_t(kIOReturnNotFound); return;}
     droidvm_metal_publish[1] = 2;
+#if !DROIDVM_NATIVE_KEXT
     void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!handle) {droidvm_metal_publish[2] = uint32_t(kIOReturnNoResources); return;}
     native_adreno_accelerator_static_init();
     status = OSMetaClass::postModLoad(handle);
     if (status) {droidvm_metal_publish[2] = uint32_t(status); return;}
+#endif   // as a kext (ipados27/kexts/DroidVMGraphics.json), AGXAccelerator registered as the kext loaded, after IOGPUFamily
     if (native_adreno_accelerator_instance_size() != 136) {droidvm_metal_publish[2] = uint32_t(kIOReturnInvalid); return;}
     droidvm_metal_publish[1] = 3;
     // The accelerator's chain as Apple's too, before its first instance: Apple's AGXAccelerator derives from the family's IOGPU

@@ -1,0 +1,12 @@
+{
+  "_comment": "The display and the GPU: GopFramebuffer's owned backend under the original IOMobileFramebufferLegacy (NativeLegacyDisplay with its bindings, the GOP presenter, the support code) and its probe (LegacyDisplayProbe.cpp), the virtio GPU (transport, 3D methods over the host's DRM context, the display), and NativeAdreno's face for Metal with the staged AGXAccelerator under the original IOGPUFamily (build-droidvm-gpu.py), as one kext of the kernel collection; build-droidvm-legacy-display.py lists the objects (kext-objects.json). Its starter runs native_legacy_display_probe and native_legacy_display_late_probe once IOBSD is published; the kernel keeps the rest of the late probe (package/DroidVMLateProbe.c). Depends on IOMobileGraphicsFamily and IOGPUFamily, whose classes its own derive from. See scripts/build-droidvm-kexts.py.",
+  "name": "DroidVMGraphics",
+  "bundle": "com.droidvm.driver.DroidVMGraphics",
+  "version": "1.0.0",
+  "object_lists": ["tree:build/native-legacy-display/kext-objects.json"],
+  "attach": ["native_legacy_display_probe", "native_legacy_display_late_probe"],
+  "builtin": ["NativeLegacyDisplay", "DroidVMGpu"],
+  "libraries": {"com.apple.iokit.IOMobileGraphicsFamily": "1.0", "com.apple.iokit.IOGPUFamily": "2.0.0",
+                "com.apple.kpi.bsd": "18.0.0", "com.apple.kpi.iokit": "18.0.0", "com.apple.kpi.libkern": "18.0.0",
+                "com.apple.kpi.mach": "18.0.0", "com.apple.kpi.unsupported": "18.0.0"}
+}
