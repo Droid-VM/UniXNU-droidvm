@@ -25,6 +25,8 @@ from pathlib import Path
 import subprocess
 import sys
 from kernel_target import ARCH, IOS_VERSION, TRIPLE
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import droidvm_kexts  # noqa: E402
 if ARCH != 'arm64e' or IOS_VERSION.split('.')[0] != '27':
     raise SystemExit('This device builder only supports arm64e iPadOS 27 (24A446).')
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,9 +138,13 @@ def main():
         objects.append(stage_late(obj, stem))
         sources.append(family / f'{stem}.cpp')
     strict = (*lib, *universe, '-isystem', str(include))
+    # A driver that ships as a kext of the collection (ipados27/kexts, build-droidvm-kexts.py) is not built into the kernel.
+    as_kexts = droidvm_kexts.builtin_left_out()
     for name, late in (('DroidVMVirtioEthernet', True), ('DroidVMVirtioNetIf', False), ('DroidVMAudio', True),
                        ('DroidVMBattery', True), ('DroidVMSensorProcessor', True), ('DroidVMSoftwareAES', False),
                        ('DroidVMVTParavirt', True), ('DroidVMVTHost', False)):
+        if name in as_kexts:
+            continue
         source = ROOT / 'kits/droidvm' / f'{name}.cpp'
         obj = command(cpp, source, OUT / f'{name}.o', strict)
         objects.append(stage_late(obj, name) if late else obj)

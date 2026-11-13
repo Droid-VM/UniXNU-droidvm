@@ -426,6 +426,22 @@ class Build:
         self.script('apply-fileset-reviewed.py', '--tree', self.tree, '--map', self.work / 'kernel/kernel.map.json',
                     '--reviewed', BOARD / 'fileset-reviewed.json')
         self.unixnu_cmd('build', 'prelink', logfile=self.logs / 'prelink.log')
+        self.add_kexts()
+
+    def add_kexts(self):
+        """The board's drivers that ship as kexts (ipados27/kexts) into the collection the prelink just made (kernel.macho, rewritten
+        by every prelink): compiled against this kernel, then linked and added to the fileset (scripts/fileset-add-kexts.py)."""
+        if not sorted((BOARD / 'kexts').glob('*.json')):
+            return
+        self.script('build-droidvm-kexts.py', '--tree', self.tree)
+        kernel = self.work / 'kernel'
+        native = json.loads((kernel / 'kernel.json').read_text())['native']
+        staged = kernel / 'kernel.kexts.macho'
+        staged.unlink(missing_ok=True)
+        self.script('fileset-add-kexts.py', '--tree', self.tree, '--fileset', kernel / 'kernel.macho', '--native', native,
+                    '--manifest', self.tree / 'build/droidvm-kexts/manifest.json', '--output', staged,
+                    '--report', kernel / 'kexts.json')
+        staged.replace(kernel / 'kernel.macho')
 
     # trust ---------------------------------------------------------------------------------------------------------------
     def trust_records(self):

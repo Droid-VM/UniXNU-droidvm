@@ -24,7 +24,9 @@
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern "C" void IOSleep(unsigned milliseconds);
+#if !DROIDVM_NATIVE_KEXT
 extern kmod_info_t g_kernel_kmod_info;
+#endif
 
 extern "C" {
 int droidvm_battery_attach(void);
@@ -121,11 +123,15 @@ void DroidVMBattery::run() {
     release();
 }
 
+#if !DROIDVM_NATIVE_KEXT
 #define DROIDVM_LATE_INIT(file) extern "C" void droidvm_late_init_##file(void) __asm__("__GLOBAL__sub_I_" #file ".cpp");
 DROIDVM_LATE_INIT(DroidVMBattery)
+#endif
 
 // Registers the class in its own OSMetaClass module load (its static initializer is staged for this call, as the other board
-// classes are), finds /arm-io/battery, maps the goldfish MMIO and publishes the IOPMPowerSource on a built-in nub.
+// classes are), finds /arm-io/battery, maps the goldfish MMIO and publishes the IOPMPowerSource on a built-in nub. In the kext
+// form (DROIDVM_NATIVE_KEXT, ipados27/kexts/DroidVMBattery.json) OSKext registers the class as the kext loads, and the kext's
+// starter calls this once IOResources matches it.
 int droidvm_battery_attach(void) {
     if (droidvm_battery_stage) return -1;
     uint32_t enabled = 1;
@@ -144,10 +150,12 @@ int droidvm_battery_attach(void) {
     uintptr_t regs = ml_io_map((vm_offset_t)(reg[0] - ranges[0] + ranges[1]), 0x1000);
     if (!regs) return -1;
 
+#if !DROIDVM_NATIVE_KEXT
     void *module = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!module) return -1;
     droidvm_late_init_DroidVMBattery();
     if (OSMetaClass::postModLoad(module)) return -1;
+#endif
     droidvm_battery_stage = 3;
 
     gFullyCharged = OSSymbol::withCString(kIOPMFullyChargedKey);
