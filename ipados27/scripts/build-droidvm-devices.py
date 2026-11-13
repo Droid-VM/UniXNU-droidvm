@@ -190,10 +190,13 @@ def main():
     aes_obj = aes_staged.with_suffix('.o')
     run([str(aes_staged) if a == str(aes_original) else str(aes_obj) if a == str(aes_dir / 'NativeAES.o') else a for a in aes_command]
         + ['-I', str(ROOT / 'drivers/SoftwareAES')], cwd=cpp['directory'])
-    objects.append(stage_late(aes_obj, 'NativeAES'))
     aes_bindings = ROOT / 'kits/droidvm/SoftwareAES-24A446.S'
     run(['xcrun', 'clang', '-target', TRIPLE, '-Werror', '-Wno-incompatible-sysroot', '-c', aes_bindings, '-o', OUT / 'SoftwareAES-24A446.o'])
-    objects.append(OUT / 'SoftwareAES-24A446.o')
+    # Built either way: the AES kext (ipados27/kexts/DroidVMSoftwareAES.json) takes NativeAES.o, with its static initializer, and
+    # the bindings from here.
+    if 'NativeAES' not in as_kexts:
+        objects.append(stage_late(aes_obj, 'NativeAES'))
+        objects.append(OUT / 'SoftwareAES-24A446.o')
     sources += [aes_original, ROOT / 'drivers/SoftwareAES/OriginalAESABI.h', aes_keys, aes_bindings]
     rel = lambda p: str(p.relative_to(ROOT))  # noqa: E731
     (OUT / 'objects.json').write_text(json.dumps([rel(p) for p in objects], indent=2) + '\n')

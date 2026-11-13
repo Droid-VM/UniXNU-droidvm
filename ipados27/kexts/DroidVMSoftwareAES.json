@@ -1,0 +1,26 @@
+{
+  "_comment": "The IOAESAccelerator AppleImage4 waits for (package/DroidVMSoftwareAES.cpp registering SoftwareAES's NativeAES, the hardware keys derived in software), subclassing the original IOAESAccelerator of the 24A446 fileset through SoftwareAES-24A446.S, as a kext of the kernel collection. Depends on IOCryptoAcceleratorFamily, so OSKext constructs the original metaclass before NativeAES's. See scripts/build-droidvm-kexts.py.",
+  "name": "DroidVMSoftwareAES",
+  "bundle": "com.droidvm.driver.DroidVMSoftwareAES",
+  "version": "1.0.0",
+  "sources": [
+    "DroidVMSoftwareAES.cpp"
+  ],
+  "objects": [
+    "tree:build/software-aes/droidvm/NativeAES.o",
+    "tree:build/droidvm-devices/SoftwareAES-24A446.o"
+  ],
+  "attach": "droidvm_software_aes_attach",
+  "builtin": [
+    "DroidVMSoftwareAES",
+    "NativeAES"
+  ],
+  "libraries": {
+    "com.apple.iokit.IOCryptoAcceleratorFamily": "1.0.0",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  }
+}

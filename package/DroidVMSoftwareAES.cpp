@@ -17,8 +17,10 @@
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 
+#if !DROIDVM_NATIVE_KEXT
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" void droidvm_late_init_NativeAES(void) __asm__("__GLOBAL__sub_I_NativeAES.cpp");
+#endif
 extern "C" const char droidvm_aes_parent_meta[] __asm__("__ZN16IOAESAccelerator10gMetaClassE");
 extern "C" volatile uint32_t native_aes_kat_status;
 
@@ -44,6 +46,7 @@ int droidvm_software_aes_attach(void) {
     }
     droidvm_software_aes_stage = 1;
 
+#if !DROIDVM_NATIVE_KEXT
     void *module = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!module) {
         droidvm_software_aes_stage = 0x82;
@@ -54,6 +57,7 @@ int droidvm_software_aes_attach(void) {
         droidvm_software_aes_stage = 0x82;
         return -1;
     }
+#endif   // a kext's NativeAES is registered as it loads, after IOCryptoAcceleratorFamily (its OSBundleLibraries)
     droidvm_software_aes_stage = 2;
 
     IOService *resources = IOService::getResourceService();

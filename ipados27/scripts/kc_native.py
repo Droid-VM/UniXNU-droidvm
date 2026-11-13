@@ -2,7 +2,9 @@
 # kernel collection; fileset-add-kexts.py links the iPadOS board's kexts with it. One change: __DATA_CONST,__assert is placed
 # (XNU's assert descriptors, which code built with the kernel's own flags refers to: Apple's IONetworkingFamily). Its
 # __BOOTDATA,__static_if entries stay out: XNU rewrites only the kernel's own static branches at boot, a kext's keep what they
-# were compiled with (mach_assert on, as on this DEVELOPMENT kernel).
+# were compiled with (mach_assert on, as on this DEVELOPMENT kernel). And absolute symbols (N_ABS, `.set NAME, ADDRESS`) are
+# defined at their value: the board's bindings to classes of the stripped iPadOS fileset name the original objects that way
+# (SoftwareAES-24A446.S: IOAESAccelerator's metaclass, reached through a GOT entry that keeps the value).
 """A small static linker: relocatable arm64e objects of a driver -> the four segments of a kext inside a fileset kernel collection.
 
 The driver refers to classes of kexts of the collection (it derives from IOBlockStorageDevice), so it cannot be linked into the kernel
@@ -152,7 +154,9 @@ def link(objects, resolve, allocate, header_reserve, data_reserve, start_symbol,
     defined = {}
     for obj in objs:
         for symbol in obj.symbols:
-            if symbol['type'] & 0x0e == 0x0e and symbol['type'] & 1 and not symbol['type'] & 0xe0:
+            if symbol['type'] & 0x0e == 0x02 and symbol['type'] & 1 and not symbol['type'] & 0xe0:   # N_ABS, external
+                defined[symbol['name']] = symbol['value']
+            elif symbol['type'] & 0x0e == 0x0e and symbol['type'] & 1 and not symbol['type'] & 0xe0:
                 sect = obj.sections[symbol['sect'] - 1]
                 if (id(obj), sect['index']) in placement:
                     defined[symbol['name']] = placement[(id(obj), sect['index'])] + symbol['value'] - sect['addr']
@@ -161,6 +165,8 @@ def link(objects, resolve, allocate, header_reserve, data_reserve, start_symbol,
 
     def address_of(obj, index):
         symbol = obj.symbols[index]
+        if symbol['type'] & 0x0e == 0x02 and not symbol['type'] & 0xe0:   # N_ABS
+            return symbol['value']
         if symbol['type'] & 0x0e == 0x0e:
             sect = obj.sections[symbol['sect'] - 1]
             key = (id(obj), sect['index'])

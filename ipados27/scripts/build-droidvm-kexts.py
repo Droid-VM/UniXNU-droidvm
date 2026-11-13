@@ -13,6 +13,8 @@ The board's drivers that ship as kexts of the kernel collection rather than insi
   groups                  optional, beside or instead of sources: [{sources, flags, warnings}] -- sources compiled with extra
                           flags ({tree} is the build tree) and, with warnings false, without the board's -Werror set (Apple's
                           IONetworkingFamily, as build-droidvm-devices.py compiles it)
+  objects                 optional: objects another step of the kernel build made, tree:PATH (SoftwareAES's NativeAES.o, compiled
+                          with its component's own command, and its fileset bindings, by build-droidvm-devices.py)
 A source is a file of package/ (kits/droidvm), or tree:PATH, a path in the build tree (.cache/sources/...).
   builtin                 the build-droidvm-devices.py objects this kext replaces (left out of the kernel)
   libraries               OSBundleLibraries
@@ -98,6 +100,13 @@ def main():
                 rec = record(named) if named else c if path.suffix == '.c' else cpp
                 objects.append(command(rec, path, work / (path.stem + '.o'), tree, (*LIB, *defines, *flags),
                                        group.get('warnings', True)))
+        for prebuilt in spec.get('objects', []):
+            if not prebuilt.startswith('tree:'):
+                raise SystemExit(f'{name}: objects are tree:PATH')
+            path = tree / prebuilt[len('tree:'):]
+            if not path.is_file():
+                raise SystemExit(f'{name}: {path} was not built')
+            objects.append(path)
         starter = f'{name}Starter'
         attach = spec['attach']
         if isinstance(attach, list):
@@ -112,13 +121,13 @@ def main():
                                (*LIB, f'-DDROIDVM_KEXT_STARTER={starter}', f'-DDROIDVM_KEXT_ATTACH={attach}')))
         manifest.append({
             'name': name, 'bundle': spec['bundle'], 'version': spec['version'],
-            'objects': [str(o.relative_to(out)) for o in objects],
+            'objects': [str(o.relative_to(out)) if o.is_relative_to(out) else str(o) for o in objects],
             'start': '_droidvm_kext_start', 'stop': '_droidvm_kext_stop',
             'libraries': spec['libraries'],
             # The starter matches IOResources once BSD is up (IOBSD), where the board's late probe would have called the attach.
             'personalities': {name: {'CFBundleIdentifier': spec['bundle'], 'IOClass': starter, 'IOProviderClass': 'IOResources',
                                      'IOResourceMatch': 'IOBSD', 'IOMatchCategory': name}},
-            'sha256': {str(o.relative_to(out)): hashlib.sha256(o.read_bytes()).hexdigest() for o in objects},
+            'sha256': {str(o): hashlib.sha256(o.read_bytes()).hexdigest() for o in objects},
         })
         print(f'{spec["bundle"]}: {len(objects)} objects')
     (out / 'manifest.json').write_text(json.dumps({'kexts': manifest}, indent=2) + '\n')
