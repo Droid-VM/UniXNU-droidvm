@@ -5,7 +5,7 @@
 // fork's --virtio-mmio-snd, and make-droidvm-adt.py (--snd-mmio) publishes its window as /arm-io/virtio-snd, compatible
 // "droidvm,virtio-snd". This file is the transport half: it maps that window, brings the device up (VIRTIO_F_VERSION_1 only),
 // picks the first output and the first input PCM stream, sets them to 48 kHz S16 and moves PCM periods on the transmit and
-// receive queues, polling as every virtio driver of this guest does (the queues are NO_INTERRUPT).
+// receive queues. Level SPI completions wake the control waiter and PCM/event worker.
 //
 // Above it the device is iOS's built-in audio device (DroidVMAudio.cpp, an IOAudio2Device). The engine there calls, from its
 // one thread, in periods of 240 frames (5 ms):
@@ -20,6 +20,9 @@
 #include <string.h>
 #include <kern/misc_protos.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
+#include <kern/clock.h>
+#include <kern/locks.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
@@ -27,6 +30,7 @@
 #include "DroidVMDmaRegion.h"
 #endif
 
+extern int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);
 extern void IOSleep(unsigned milliseconds);
 extern void delay(int usec);
 extern int droidvm_audio_attach(void);
@@ -88,7 +92,13 @@ static struct {
     uint16_t tx_free;                 // transmit slots not with the device
     uint8_t tx_next;                  // the next transmit slot to fill (they return in order)
     bool up, out_running, in_running;
+    uint32_t interrupt_id;
+    uint16_t rx_ready[SND_SLOTS], rx_head, rx_count;
+    lck_mtx_t *lock;
 } snd;
+
+static bool snd_pending;
+volatile uint64_t droidvm_snd_interrupts, droidvm_snd_events, droidvm_snd_xruns, droidvm_snd_timeouts;
 
 // For the host rig (peek.py).
 volatile uint32_t droidvm_snd_found, droidvm_snd_stage, droidvm_snd_streams;
@@ -137,9 +147,17 @@ static bool control(uint32_t request_size, uint32_t reply_size) {
     d[1] = (struct snd_desc){pa(snd_control_reply), reply_size, VIRTQ_DESC_F_WRITE, 0};
     memset(snd_control_reply, 0, reply_size);
     post(SND_CONTROL, 0);
-    for (unsigned waited = 0; used(SND_CONTROL)[1] == snd.used[SND_CONTROL]; ++waited) {
-        if (waited == 2000) { droidvm_snd_errors++; return false; }   // 2 s
-        IOSleep(1);
+    uint64_t deadline;
+    clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
+    for (;;) {
+        assert_wait_deadline((event_t)&snd.used[SND_CONTROL], THREAD_UNINT, deadline);
+        if (used(SND_CONTROL)[1] != snd.used[SND_CONTROL]) {
+            clear_wait(current_thread(), THREAD_AWAKENED);
+            break;
+        }
+        if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
+            droidvm_snd_timeouts++; droidvm_snd_errors++; return false;
+        }
     }
     snd_barrier();
     ++snd.used[SND_CONTROL];
@@ -160,7 +178,7 @@ static bool set_params(int32_t stream, uint8_t channels) {
     struct snd_set_params p = {SND_R_PCM_SET_PARAMS, (uint32_t)stream, period * SND_SLOTS, period, 0, channels,
                                SND_PCM_FMT_S16, SND_PCM_RATE_48000, 0};
     memcpy(snd_control_request, &p, sizeof(p));
-    return control(sizeof(p), 4) && pcm_command(SND_R_PCM_PREPARE, stream);
+    return control(sizeof(p), 4);
 }
 
 // The receive slots all go to the device at once; each comes back holding one period.
@@ -188,10 +206,75 @@ static void tx_reap(void) {
     }
 }
 
+// The IRQ acknowledges the level before EOI/resample; mutex work stays on the worker.
+static void snd_interrupt(void *context) {
+    (void)context;
+    uint32_t status = snd_read32(0x60) & 3;
+    if (status) snd_write32(0x64, status);
+    droidvm_snd_interrupts++;
+    thread_wakeup((event_t)&snd.used[SND_CONTROL]);
+    __atomic_store_n(&snd_pending, true, __ATOMIC_RELEASE);
+    thread_wakeup((event_t)&snd_pending);
+}
+
+static void snd_worker(void *arg, wait_result_t result) {
+    (void)arg; (void)result;
+    for (;;) {
+        assert_wait((event_t)&snd_pending, THREAD_UNINT);
+        if (__atomic_exchange_n(&snd_pending, false, __ATOMIC_ACQ_REL))
+            clear_wait(current_thread(), THREAD_AWAKENED);
+        else thread_block(THREAD_CONTINUE_NULL);
+        lck_mtx_lock(snd.lock);
+        tx_reap();
+        while (used(SND_RX)[1] != snd.used[SND_RX]) {
+            snd_barrier();
+            const uint32_t *ring = (const uint32_t *)(used(SND_RX) + 2);
+            uint16_t slot = (uint16_t)(ring[(snd.used[SND_RX] % SND_QUEUE) * 2] / 3 % SND_SLOTS);
+            ++snd.used[SND_RX];
+            if (snd_rx[slot].status[0] != SND_S_OK) droidvm_snd_errors++;
+            if (snd.in_running) {
+                snd.rx_ready[(snd.rx_head + snd.rx_count) % SND_SLOTS] = slot;
+                ++snd.rx_count;
+            }
+        }
+        while (used(SND_EVENT)[1] != snd.used[SND_EVENT]) {
+            snd_barrier();
+            const uint32_t *ring = (const uint32_t *)(used(SND_EVENT) + 2);
+            uint16_t id = (uint16_t)ring[(snd.used[SND_EVENT] % SND_QUEUE) * 2];
+            uint32_t code;
+            memcpy(&code, snd_rings[SND_EVENT] + 3072 + id * 8, 4);
+            ++snd.used[SND_EVENT];
+            droidvm_snd_events++;
+            if (code == 0x1101) droidvm_snd_xruns++;
+            post(SND_EVENT, id);
+        }
+        thread_wakeup((event_t)&snd.used[SND_TX]);
+        thread_wakeup((event_t)&snd.used[SND_RX]);
+        lck_mtx_unlock(snd.lock);
+    }
+}
+
+// Called with the PCM lock held. Completion processing runs while the waiter sleeps.
+static bool drain(unsigned q) {
+    uint64_t deadline;
+    clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
+    while (snd.used[q] != snd.avail[q]) {
+        assert_wait_deadline((event_t)&snd.used[q], THREAD_UNINT, deadline);
+        lck_mtx_unlock(snd.lock);
+        wait_result_t result = thread_block(THREAD_CONTINUE_NULL);
+        lck_mtx_lock(snd.lock);
+        if (result == THREAD_TIMED_OUT && snd.used[q] != snd.avail[q]) {
+            droidvm_snd_timeouts++; droidvm_snd_errors++; return false;
+        }
+    }
+    return true;
+}
+
 uint32_t droidvm_snd_play(const int16_t *frames, uint32_t count) {
-    if (!snd.out_running || count != SND_PERIOD_FRAMES) return count;
-    tx_reap();
-    if (!snd.tx_free) { droidvm_snd_tx_drops++; return 0; }   // the host is behind: this period is dropped
+    if (!snd.up) return count;
+    lck_mtx_lock(snd.lock);
+    if (!snd.out_running || count != SND_PERIOD_FRAMES) { lck_mtx_unlock(snd.lock); return count; }
+    if (!snd.tx_free) { droidvm_snd_tx_drops++; lck_mtx_unlock(snd.lock); return 0; }   // the host is behind: this period is dropped
     const uint8_t s = snd.tx_next;
     snd.tx_next = (uint8_t)((s + 1) % SND_SLOTS);
     --snd.tx_free;
@@ -205,55 +288,68 @@ uint32_t droidvm_snd_play(const int16_t *frames, uint32_t count) {
     d[3 * s + 2] = (struct snd_desc){pa(snd_tx[s].status), 8, VIRTQ_DESC_F_WRITE, 0};
     post(SND_TX, (uint16_t)(3 * s));
     droidvm_snd_tx_periods++;
+    lck_mtx_unlock(snd.lock);
     return count;
 }
 
 uint32_t droidvm_snd_capture(int16_t *frames, uint32_t count) {
-    if (!snd.in_running || count != SND_PERIOD_FRAMES) return 0;
-    if (used(SND_RX)[1] == snd.used[SND_RX]) { droidvm_snd_rx_empty++; return 0; }
-    snd_barrier();
-    const uint32_t *ring = (const uint32_t *)(used(SND_RX) + 2);
-    const uint32_t id = ring[(snd.used[SND_RX] % SND_QUEUE) * 2];
-    ++snd.used[SND_RX];
-    const uint16_t s = (uint16_t)(id / 3 % SND_SLOTS);
+    if (!snd.up) return 0;
+    lck_mtx_lock(snd.lock);
+    if (!snd.in_running || count != SND_PERIOD_FRAMES) { lck_mtx_unlock(snd.lock); return 0; }
+    if (!snd.rx_count) { droidvm_snd_rx_empty++; lck_mtx_unlock(snd.lock); return 0; }
+    const uint16_t s = snd.rx_ready[snd.rx_head];
+    snd.rx_head = (snd.rx_head + 1) % SND_SLOTS;
+    --snd.rx_count;
     const int16_t *data = (const int16_t *)snd_rx[s].data;
     if (snd.in_channels == 1) memcpy(frames, data, count * 2);
     else for (uint32_t i = 0; i < count; ++i) frames[i] = data[i * snd.in_channels];   // the first channel of a wider stream
     post(SND_RX, (uint16_t)(3 * s));
     droidvm_snd_rx_periods++;
+    lck_mtx_unlock(snd.lock);
     return count;
 }
 
-// START/STOP of both streams. Called by the engine while its thread is not running, so the queues have one user at a time.
-// A stopped stream's chains come back to us (the device returns what it held), so the indices are taken up to date before
-// the next start.
+// The HAL serializes START/STOP and joins the corresponding engine before stopping.
+// RELEASE returns outstanding buffers; a subsequent PREPARE starts with drained queues.
 void droidvm_snd_running(bool output, bool input) {
     if (!snd.up) return;
     if (snd.out_stream >= 0 && output != snd.out_running) {
         if (output) {
-            snd.tx_free = SND_SLOTS; snd.tx_next = 0;
-            snd.out_running = pcm_command(SND_R_PCM_START, snd.out_stream);
-            // The engine hands over each period as its deadline passes, so the host's queue ran empty at every hitch of
-            // the guest or of the host (crosvm: "playback stream is running with nothing queued", 25-66 ms, heard as
-            // stutter): it starts SND_PREFILL periods ahead instead, a lead the guest's periods keep from then on.
+            if (!pcm_command(SND_R_PCM_PREPARE, snd.out_stream)) return;
+            bool started = pcm_command(SND_R_PCM_START, snd.out_stream);
+            lck_mtx_lock(snd.lock);
+            snd.out_running = started;
+            snd.tx_next = 0;
+            lck_mtx_unlock(snd.lock);
             static const int16_t silence[SND_PERIOD_FRAMES * SND_OUT_CHANNELS];
-            for (unsigned i = 0; snd.out_running && i < SND_PREFILL; ++i) droidvm_snd_play(silence, SND_PERIOD_FRAMES);
+            for (unsigned i = 0; started && i < SND_PREFILL; ++i) droidvm_snd_play(silence, SND_PERIOD_FRAMES);
         } else {
-            pcm_command(SND_R_PCM_STOP, snd.out_stream);
-            snd.out_running = false;
-            for (unsigned waited = 0; waited < 200 && snd.tx_free < SND_SLOTS; ++waited) { tx_reap(); IOSleep(1); }
+            lck_mtx_lock(snd.lock); snd.out_running = false; lck_mtx_unlock(snd.lock);
+            if (!pcm_command(SND_R_PCM_STOP, snd.out_stream) || !pcm_command(SND_R_PCM_RELEASE, snd.out_stream)) return;
+            lck_mtx_lock(snd.lock);
+            bool drained = drain(SND_TX);
+            lck_mtx_unlock(snd.lock);
+            if (!drained) snd.up = false;
         }
     }
     if (snd.in_stream >= 0 && input != snd.in_running) {
         if (input) {
-            snd.used[SND_RX] = used(SND_RX)[1];
+            if (!pcm_command(SND_R_PCM_PREPARE, snd.in_stream)) return;
+            lck_mtx_lock(snd.lock);
+            snd.rx_head = snd.rx_count = 0;
+            snd.in_running = true;
             rx_post_all();
-            snd.in_running = pcm_command(SND_R_PCM_START, snd.in_stream);
+            lck_mtx_unlock(snd.lock);
+            bool started = pcm_command(SND_R_PCM_START, snd.in_stream);
+            lck_mtx_lock(snd.lock); snd.in_running = started; lck_mtx_unlock(snd.lock);
         } else {
-            pcm_command(SND_R_PCM_STOP, snd.in_stream);
-            snd.in_running = false;
-            IOSleep(20);
-            snd.used[SND_RX] = used(SND_RX)[1];
+            lck_mtx_lock(snd.lock); snd.in_running = false; lck_mtx_unlock(snd.lock);
+            if (!pcm_command(SND_R_PCM_STOP, snd.in_stream) || !pcm_command(SND_R_PCM_RELEASE, snd.in_stream)) return;
+            lck_mtx_lock(snd.lock);
+            bool drained = drain(SND_RX);
+            snd.rx_head = snd.rx_count = 0;
+            lck_mtx_unlock(snd.lock);
+            if (!drained) snd.up = false;
         }
     }
 }
@@ -275,7 +371,7 @@ static const char *snd_bring_up(void) {
     if (!(snd_read32(0x70) & 8)) return "features refused";
     for (unsigned q = 0; q < 4; ++q) {
         memset(snd_rings[q], 0, sizeof(snd_rings[q]));
-        *(volatile uint16_t *)(snd_rings[q] + 1024) = 1;   // VIRTQ_AVAIL_F_NO_INTERRUPT: we poll
+        *(volatile uint16_t *)(snd_rings[q] + 1024) = 0;   // used-buffer interrupts
         snd_write32(0x30, q);
         if (snd_read32(0x44) || snd_read32(0x34) < SND_QUEUE) return "queue unavailable or too small";
         const uint64_t base = pa(snd_rings[q]);
@@ -283,6 +379,15 @@ static const char *snd_bring_up(void) {
         snd_write64(0x80, base); snd_write64(0x90, base + 1024); snd_write64(0xa0, base + 2048);
         snd_write32(0x44, 1);
     }
+    for (uint16_t i = 0; i < SND_SLOTS; ++i) {
+        descriptors(SND_EVENT)[i] = (struct snd_desc){pa(snd_rings[SND_EVENT] + 3072 + i * 8), 8, VIRTQ_DESC_F_WRITE, 0};
+        post(SND_EVENT, i);
+    }
+    snd.tx_free = SND_SLOTS;
+    if (armcpu_spi_attach(snd.interrupt_id, false, snd_interrupt, NULL, NULL, NULL)) return "cannot attach level SPI";
+    thread_t worker;
+    if (kernel_thread_start(snd_worker, NULL, &worker) != KERN_SUCCESS) return "cannot start IRQ worker";
+    thread_deallocate(worker);
     snd_barrier();
     snd_write32(0x70, 15);         // DRIVER_OK
     if ((snd_read32(0x70) & 0x4f) != 15) return "device not ready";
@@ -353,6 +458,14 @@ void droidvm_snd_start(void) {
         SecureDTLookupEntry(NULL, "/arm-io/virtio-snd", &node) == kSuccess && snd_buffers()) {
         memcpy(ranges, value, sizeof(ranges));
         droidvm_snd_found = 1;
+        lck_grp_t *group = lck_grp_alloc_init("DroidVMSnd", LCK_GRP_ATTR_NULL);
+        snd.lock = lck_mtx_alloc_init(group, LCK_ATTR_NULL);
+        if (!snd.lock) return;
+        if (SecureDTGetProperty(node, "gic-spi", &value, &size) != kSuccess || size != sizeof snd.interrupt_id) {
+            strlcpy(droidvm_snd_status, "no GIC SPI", sizeof droidvm_snd_status);
+            return;
+        }
+        memcpy(&snd.interrupt_id, value, size);
         if (SecureDTGetProperty(node, "reg", &value, &size) == kSuccess && size == sizeof(reg)) {
             memcpy(reg, value, sizeof(reg));
             if (reg[0] >= ranges[0] && reg[1] >= 0x110 && reg[1] <= ranges[2] && reg[0] - ranges[0] <= ranges[2] - reg[1]) {

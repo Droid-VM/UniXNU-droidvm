@@ -270,12 +270,12 @@ IOReturn DroidVMAudioDevice::startIO() {
         while (stopping) IOLockSleep(lock, &stopping, THREAD_UNINT);
         bzero(ring->getBytesNoCopy(), ring->getLength());
         EngineStatus *s = status();
+        transportSet(!isInput, true);
         startTime = mach_absolute_time();
         s->sampleTime = 0; s->hostTime = startTime; s->seed = ++seed; s->writeEnd = 0;
         __asm__ volatile("dmb ish" ::: "memory");
         running = true;
         setProperty("is running", kOSBooleanTrue);
-        transportSet(!isInput, true);
         if (kernel_thread_start(engineMain, this, &engine) == KERN_SUCCESS) thread_deallocate(engine);
         else running = false;
     }
