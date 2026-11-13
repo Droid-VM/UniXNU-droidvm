@@ -3,6 +3,9 @@
 #   deploy27.sh [--build] [--allow-dirty] [--images] [--keep-plugin] [--new-seed] [--force-stop] [WAIT]
 #   deploy27.sh --rollback [WAIT]   the boot disk the last deploy replaced (out/previous27), boot it, and when that deploy
 #                                   changed the plugin in the guest's Data, put the replaced files back and boot again
+#   deploy27.sh --new-vm FROM_RIG NAME [--images] [--allow-dirty] [WAIT]
+#                                   a new VM beside the ones the phone has, from a release with a new Data seed (the build
+#                                   script without --generation): see "A new VM" below
 #     --build        build the release first, for this rig: its chip id (unique-chip-id.txt) and the Data seed its VM was made
 #                    from (BUILD_GENERATION, a directory on the Mac; see the build script)
 #     --allow-dirty  take a release built from checkouts with local changes (an experiment); --build passes it on
@@ -20,6 +23,14 @@
 #      release.json into the VM's directory on the phone; kernel symbols for the rig's tools
 #   5. vm.sh start, panic.py, health.py, and the plugin's hash as the booted guest holds it. Exits 1 when the guest did not
 #      come up; --rollback then puts the previous disk and plugin back
+# A new VM (--new-vm), run in a new rig directory (a copy of tools/rig with its own rig.env, VM_DIR a directory the phone
+# does not have yet and with UniXNU in its name, unique-chip-id.txt the id the release was built with): the VM's directory
+# gets the release's boot disk, release.json and an empty Data store; the VM is made over the daemon's IPC from the
+# configuration of an existing iPadOS 27 VM (FROM_RIG/unixnu-vm.config.json) with a new id, NAME, the new directory, its own
+# tap and MAC -- nothing of the other VMs changes, and the app's vms.json is not touched (the VM lives in the daemon;
+# daemon-recover.sh makes it again from this rig's unixnu-vm.config.json). The OS and SystemOS disks are read-only: with
+# --images the release's go into VM_DIR, without it the VM reads FROM_RIG's VM's, checked on the phone against release.json.
+# One UniXNU VM runs at a time: stop the other first. The rig's VM and GUEST_IP are written when it is up.
 # Needs PHONE, VM, DVMIPC, BUILD_HOST, BUILD_OUT (the board's output on the Mac: <UniXNU>/out/droidvm/<os profile>/
 # droidvm_ipados27), GUEST_IP for step 3; with --build also BUILD_REPO (the device repository checkout there) and
 # unique-chip-id.txt beside this script. VM_DIR is the VM's directory on the phone (default /storage/emulated/0/DroidVM/UniXNU27).
@@ -34,13 +45,17 @@ DIR=${VM_DIR:-/storage/emulated/0/DroidVM/UniXNU27}
 O=$RIG/out
 R=$O/release27
 P=$O/previous27
-BUILD=0; DIRTY=0; IMAGES=0; PLUGIN=1; NEWSEED=0; FORCE=0; ROLLBACK=0; WAIT=300
-for arg in "$@"; do
-  case "$arg" in
+BUILD=0; DIRTY=0; IMAGES=0; PLUGIN=1; NEWSEED=0; FORCE=0; ROLLBACK=0; WAIT=300; NEWVM=0; FROM=; NAME=
+while [ $# -gt 0 ]; do
+  case "$1" in
     --build) BUILD=1 ;; --allow-dirty) DIRTY=1 ;; --images) IMAGES=1 ;; --keep-plugin) PLUGIN=0 ;; --new-seed) NEWSEED=1 ;;
-    --force-stop) FORCE=1 ;; --rollback) ROLLBACK=1 ;; [0-9]*) WAIT=$arg ;; *) sed -n '2,29p' "$0"; exit 2 ;;
+    --force-stop) FORCE=1 ;; --rollback) ROLLBACK=1 ;; [0-9]*) WAIT=$1 ;;
+    --new-vm) NEWVM=1; FROM=${2:?--new-vm FROM_RIG NAME}; NAME=${3:?--new-vm FROM_RIG NAME}; shift 2 ;;
+    *) sed -n '2,40p' "$0"; exit 2 ;;
   esac
+  shift
 done
+if [ $NEWVM = 1 ]; then PLUGIN=0; NEWSEED=1; fi
 mkdir -p "$R"
 A="adb -s $PHONE"
 export MTOOLS_SKIP_CHECK=1
@@ -170,6 +185,87 @@ print(f'plugin: {len(files)} files fetched')
 PY
 rm -rf "$R/plugin" && mv "$R/plugin.new" "$R/plugin"
 
+symbols() {          # the release's kernel and its symbols where the rig's tools look for them
+  cp "$R/droidvm-disk.img" "$O/droidvm-disk.img"
+  cp "$R/kernel.macho" "$O/kernel.macho"
+  cp "$R/kernel.native.macho" "$O/kernel.native.macho"
+  mcopy -o -i "$O/droidvm-disk.img" ::/EFI/UniXNU/Payloads/kernel.macho.adt "$O/kernel.macho.adt"
+  mcopy -o -i "$O/droidvm-disk.img" ::/EFI/UniXNU/unixnu.toml "$O/unixnu.toml"
+  llvm-nm -n --defined-only "$O/kernel.native.macho" > "$O/kernel.native.nm"
+  # kernel.nm for the rig's tools: the native kernel's symbols at the addresses the collection gives them
+  python3 "$RIG/fileset-syms.py" "$O/kernel.macho" "$O/kernel.native.macho" "$O/kernel.native.nm" "$O/kernel.nm" >/dev/null
+}
+
+if [ $NEWVM = 1 ]; then
+  echo "== a new VM: $NAME in $DIR"
+  case "$DIR" in /storage/emulated/0/DroidVM/*UniXNU*) ;; *) echo "VM_DIR must be /storage/emulated/0/DroidVM/<a name with UniXNU>"; exit 1 ;; esac
+  MEDIA=/data/media/0/${DIR#/storage/emulated/0/}
+  [ -z "$($A shell "su -c 'ls -d $MEDIA 2>/dev/null'")" ] || { echo "$DIR exists on the phone: not touched (a new VM takes a new directory)"; exit 1; }
+  [ -f "$FROM/unixnu-vm.config.json" ] || { echo "no $FROM/unixnu-vm.config.json to copy the VM's configuration from"; exit 1; }
+  [ -z "$($A shell "su -c 'for p in \$(pidof crosvm); do tr \"\\0\" \" \" < /proc/\$p/cmdline | grep -q UniXNU && echo \$p; done'" | tr -dc 0-9)" ] ||
+    { echo "a UniXNU VM is running: stop it first (its rig's vm.sh stop)"; exit 1; }
+  # the directory of FROM's VM, from its configuration's boot disk
+  FROM_DIR=$(python3 -c "
+import json, sys
+config = json.load(open(sys.argv[1]))['config']
+print([d['path'] for d in config['disks'] if d['path'].endswith('/droidvm-disk.img')][0].rsplit('/', 1)[0])" "$FROM/unixnu-vm.config.json")
+  FROM_MEDIA=/data/media/0/${FROM_DIR#/storage/emulated/0/}
+  if [ $IMAGES = 0 ]; then
+    for name in os.img systemos.img; do
+      want=$(field "$R/release.json" "files.$name.sha256")
+      got=$($A shell "su -c 'sha256sum $FROM_MEDIA/$name'" | cut -c1-64)
+      [ "$want" = "$got" ] || { echo "$FROM_MEDIA/$name is not the release's ($got); --images pushes the release's"; exit 1; }
+      echo "$name: the VM reads $FROM_MEDIA/$name"
+    done
+  fi
+  $A shell "mkdir -p $DIR"               # through the shared storage, which gives it the owner the app's other VM directories have
+  FILE=$MEDIA/data-store.img "$RIG/make-data-store.sh" >/dev/null
+  symbols
+  $A push "$O/droidvm-disk.img" "$DIR/droidvm-disk.img" | tail -1
+  $A push "$R/release.json" "$DIR/release.json" | tail -1
+  if [ $IMAGES = 1 ]; then
+    for name in os.img systemos.img; do $A push "$R/$name" "$DIR/$name" | tail -1; done
+  fi
+  ID=$(python3 - "$FROM/unixnu-vm.config.json" "$RIG/unixnu-vm.config.json" "$NAME" "$FROM_DIR" "$DIR" "$IMAGES" <<'PY'
+import json, secrets, sys, time, uuid
+source, output, name, old, new, images = sys.argv[1:]
+old_media, new_media = (path.replace('/storage/emulated/0/', '/data/media/0/') for path in (old, new))
+config = json.load(open(source))['config']
+vm_id = str(uuid.uuid4())
+text = json.dumps(config)
+for mine in ('droidvm-disk.img', 'data-store.img') + (('os.img', 'systemos.img') if images == '1' else ()):
+    for a, b in ((old, new), (old_media, new_media)):
+        text = text.replace(f'{a}/{mine}', f'{b}/{mine}')
+config = json.loads(text)
+config.update(id=vm_id, name=name, created_at=int(time.time() * 1000), auto_up=False)
+for index, network in enumerate(config.get('networks', [])):
+    network['tap_name'] = f'vm{vm_id[:8]}-{index}'
+    network['mac_address'] = '02:00:00:' + ':'.join(f'{byte:02x}' for byte in secrets.token_bytes(3))
+# crosvm's dump of the device tree it builds, which each VM writes for itself
+options = config.get('extra_options', [])
+for index, option in enumerate(options):
+    if option == '--dump-device-tree-blob' and index + 1 < len(options):
+        options[index + 1] = f'/data/local/tmp/{new.rsplit("/", 1)[-1].lower()}-fdt.dtb'
+open(output, 'w').write(json.dumps({'config': config}, indent=1) + '\n')
+print(vm_id)
+PY
+)
+  if grep -q '^VM=' "$RIG/rig.env" 2>/dev/null; then sed -i "s/^VM=.*/VM=$ID/" "$RIG/rig.env"; else echo "VM=$ID" >> "$RIG/rig.env"; fi
+  export VM=$ID
+  cp "$R/release.json" "$R/deployed.json"
+  $A shell "su -c 'ls -la $MEDIA'"
+  echo "VM $ID; its configuration is $RIG/unixnu-vm.config.json"
+  echo "== boot"
+  boot_vm || { echo "the new VM did not come up"; exit 1; }
+  ip=$(timeout 200 python3 "$RIG/health.py" 2>/dev/null | sed -n 's/^network .*address //p' | tr ', ' '\n\n' | grep -E '^[0-9]+\.' | grep -v '^169\.254\.' | head -1 || true)
+  if [ -n "$ip" ]; then
+    if grep -q '^GUEST_IP=' "$RIG/rig.env"; then sed -i "s/^GUEST_IP=.*/GUEST_IP=$ip/" "$RIG/rig.env"; else echo "GUEST_IP=$ip" >> "$RIG/rig.env"; fi
+    echo "guest address $ip"
+  fi
+  timeout 60 "$RIG/guest-ssh.sh" --key >/dev/null 2>&1 && echo "guest ssh key put" || echo "guest ssh key NOT put (guest-ssh.sh --key)"
+  exit 0
+fi
+
 rm -rf "$R/plugin.replaced"
 if [ $PLUGIN = 1 ]; then
   echo "== plugin into the guest's Data"
@@ -195,14 +291,7 @@ if $A pull "$DIR/droidvm-disk.img" "$P.new/droidvm-disk.img" >/dev/null 2>&1; th
 else
   rm -rf "$P.new"; echo "the phone had no boot disk in $DIR to keep"
 fi
-cp "$R/droidvm-disk.img" "$O/droidvm-disk.img"
-cp "$R/kernel.macho" "$O/kernel.macho"
-cp "$R/kernel.native.macho" "$O/kernel.native.macho"
-mcopy -o -i "$O/droidvm-disk.img" ::/EFI/UniXNU/Payloads/kernel.macho.adt "$O/kernel.macho.adt"
-mcopy -o -i "$O/droidvm-disk.img" ::/EFI/UniXNU/unixnu.toml "$O/unixnu.toml"
-llvm-nm -n --defined-only "$O/kernel.native.macho" > "$O/kernel.native.nm"
-# kernel.nm for the rig's tools: the native kernel's symbols at the addresses the collection gives them
-python3 "$RIG/fileset-syms.py" "$O/kernel.macho" "$O/kernel.native.macho" "$O/kernel.native.nm" "$O/kernel.nm" >/dev/null
+symbols
 $A shell "mkdir -p $DIR"
 $A push "$O/droidvm-disk.img" "$DIR/droidvm-disk.img" | tail -1
 $A push "$R/release.json" "$DIR/release.json" | tail -1

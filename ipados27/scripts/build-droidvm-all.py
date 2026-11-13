@@ -17,7 +17,7 @@ the IPSW; a checkout with local changes is refused unless --allow-dirty (the rel
 A VM's Data lives in a store on the phone that holds the changes to the seed it first booted from, and the kernel mounts Data
 by the seed's volume UUID. So there are two kinds of build:
 
-  a new VM          (default) a new Data seed, with this build's plugin and tools in it. tools/rig/fresh-deploy27.sh
+  a new VM          (default) a new Data seed, with this build's plugin and tools in it. tools/rig/deploy27.sh --new-vm
   a VM that exists  --generation DIR: the seed that VM was made from, kept with its record (DIR/seed.json, DIR/<seed>.dbr)
                     and DIR/trust/*.json, the trust records of what its Data holds (the tools and the plugin as they were
                     built then, apps installed since); they stay trusted beside this build's. tools/rig/deploy27.sh puts
