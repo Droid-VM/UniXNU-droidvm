@@ -666,7 +666,7 @@ void emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
             e.s64(cc(",frm"), frame);
             e.s32(cc(",err"), 0);
             e.u32(cc(",inf"), 1 | 2);   // kVTDecodeInfo_Asynchronous | kVTDecodeInfo_FrameDropped
-            if (hostRequest(s, e, message, emit)) droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
+            if (sendToGuest(s->client, e, message)) droidvm_vthost_frames_dropped = droidvm_vthost_frames_dropped + 1;
             return;
         }
         s->lastShownUs = pts;
@@ -692,7 +692,10 @@ void emitFrame(Session *s, unsigned index, int64_t frame, uint32_t bytesused) {
     e.s32(cc(",err"), bytesused ? 0 : -12911);
     e.u32(cc(",inf"), 1);
     e.uuid(cc(",uui"), pixelBuffer);
-    if (hostRequest(s, e, message, emit)) droidvm_vthost_frames_out = droidvm_vthost_frames_out + 1;
+    // Not waited for: the guest's answer to a Demt carries nothing this side uses (an answer no one awaits is let go, see
+    // droidvm_vthost_message), and waiting for it was a round trip to the player's process for every frame -- 40 ms a frame
+    // for the lock screen's (a background process), the ceiling of the whole path (21 frames a second of 240).
+    if (sendToGuest(s->client, e, message)) droidvm_vthost_frames_out = droidvm_vthost_frames_out + 1;
 }
 
 void forgetFrame(Session *s, int64_t frame) {
