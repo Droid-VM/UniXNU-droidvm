@@ -10,6 +10,10 @@ scripts/build-sheng-source-storage.py, which does this for sheng's UFS host.
 Only the owner's public key (its 395-byte anchor) is compiled in. The signed OS and SystemOS policies go into the payload as
 build/droidvm-source-storage/root-policies.bin (board.toml [payload] root_policies) when build/verified-root-<build>/ holds
 them, verified for the OS profile's [root] images; the archive builds without them.
+
+When the disks are a kext of the collection (ipados27/kexts/DroidVMStorage.json, which lists DroidVMSourceStorage as builtin),
+the same objects with their static initializers, and DroidVMSourceStorage.cpp compiled with DROIDVM_NATIVE_KEXT, are listed in
+kext-objects.json for build-droidvm-kexts.py, and the archive holds the kernel's side alone (package/DroidVMStorageHooks.c).
 """
 import argparse
 import hashlib
@@ -20,8 +24,11 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import droidvm_kexts  # noqa: E402
 
 
 def helper(name, path):
@@ -157,10 +164,32 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
         inputs[str(source)] = compile_helper.sha(source)
     for patch in patches:
         inputs[str(patch)] = compile_helper.sha(patch)
+    storage_kext = 'DroidVMSourceStorage' in droidvm_kexts.builtin_left_out()
+    (out / 'kext-objects.json').unlink(missing_ok=True)
+    if storage_kext:
+        # The kext: every object with its static initializer (the .o beside each .late.o), the start in its kext form.
+        extra = {}
+        for source, stem, defines in ((package / 'DroidVMSourceStorage.cpp', 'DroidVMSourceStorage.kext', ['-DDROIDVM_NATIVE_KEXT=1']),
+                                      (package / 'DroidVMStorageHooks.c', 'DroidVMStorageHooks', [])):
+            output = out / (stem + '.o')
+            rec = c if source.suffix == '.c' else cpp
+            command = compile_helper.compile_command(rec, source, output, includes, [*flags, *defines])
+            result = subprocess.run(command, cwd=rec['directory'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            (out / (stem + '.log')).write_text(result.stdout)
+            if result.returncode:
+                raise SystemExit(result.stdout[-6000:])
+            target.check_object(output.read_bytes(), source.name)
+            extra[stem] = output
+            inputs[str(source)] = compile_helper.sha(source)
+        kext_objects = [extra['DroidVMSourceStorage.kext'] if o.name == 'DroidVMSourceStorage.o' else
+                        o.with_name(o.name.replace('.late.o', '.o')) for o in objects]
+        (out / 'kext-objects.json').write_text(json.dumps([str(o.relative_to(tree)) for o in kext_objects], indent=2) + '\n')
+        objects = [extra['DroidVMStorageHooks']]
     archive = out / 'libDroidVMSourceStorage.a'
     archive.unlink(missing_ok=True)
     subprocess.run(['xcrun', 'ar', 'rcs', archive, *objects], check=True)
-    report = dict(archive=str(archive), archive_sha256=compile_helper.sha(archive), sources=inputs, headers=header_report,
+    report = dict(archive=str(archive), archive_sha256=compile_helper.sha(archive), kext=storage_kext, sources=inputs,
+                  headers=header_report,
                   target=target.TRIPLE, trusted_key_sha256=hashlib.sha256(key).hexdigest(),
                   policy_bundle=str(bundle) if bundle else None, runtime_qualified=False)
     (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')

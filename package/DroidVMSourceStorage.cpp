@@ -11,6 +11,11 @@
 //
 // The bsd_init hook (ipados27/patches/xnu-12377/source-storage-start.patch) calls native_source_storage_start after vfsinit;
 // native-source-storage=1 (package/DroidVMBootArgs.c) enables it. Every failure panics: without its disks the guest has no root.
+//
+// As a kext of the collection (ipados27/kexts/DroidVMStorage.json, compiled with DROIDVM_NATIVE_KEXT=1): OSKext loads
+// IOStorageFamily first (a library of the kext) and registers the classes as the kext loads; the kext's starter calls
+// native_source_storage_start once IOBSD is published, and the root mount waits for the disks. It hands the kernel the functions
+// the XNU changes ask (DroidVMStorageHooks.c) before it adds the disk drivers.
 #include <IOKit/IOService.h>
 #include <IOKit/IOCatalogue.h>
 #include <IOKit/IOLib.h>
@@ -20,12 +25,26 @@
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 
+#if !DROIDVM_NATIVE_KEXT
 extern kmod_info_t g_kernel_kmod_info;
 // The static initializers of the source-built classes: their objects lose __mod_init_func when the archive is built, so the
 // classes register here, between preModLoad and postModLoad, and not at kernel start before the original family exists.
 extern "C" void source_storage_base_init(void) __asm__("__GLOBAL__sub_I_IOBlockStorageDevice.cpp");
 extern "C" void source_storage_virtio_init(void) __asm__("__GLOBAL__sub_I_NativeVirtioBlock.cpp");
 extern "C" void source_storage_ram_init(void) __asm__("__GLOBAL__sub_I_NativeRamBlock.cpp");
+#else
+#include "DroidVMStorageHooks.h"
+extern "C" int native_verified_block_root_authorized(dev_t);
+extern "C" int native_verified_block_volume_device(const char *, dev_t *, char *, size_t);
+extern "C" int native_verified_block_manifest_sha384(dev_t, const char *, uint8_t[48]);
+extern "C" int native_ram_block_volume_seed(const char *, dev_t *, char *, size_t, uint64_t *, uint64_t *, uint8_t *);
+extern "C" int native_ram_block_gpu_addon(const uint8_t **, uint64_t *);
+// The kext's own disks answer the kernel (these names resolve inside the kext first; the kernel's are DroidVMStorageHooks.c's).
+static const droidvm_storage_ops kStorageOps = {
+    native_verified_block_root_authorized, native_verified_block_volume_device, native_verified_block_manifest_sha384,
+    native_ram_block_volume_seed, native_ram_block_gpu_addon,
+};
+#endif
 extern "C" bool native_source_root_policies_load(void);
 
 // The arm64e kernel's static link leaves no weak import undefined (the iPadOS 17 arm64 link resolved them to 0), so the hooks of
@@ -47,17 +66,35 @@ static bool attempted;
 // Only the source IOBlockStorageDevice's metaclass constructor asks, while its class registers: the original class is its parent.
 extern "C" const OSMetaClass *native_source_storage_parent(void)
 {
+#if DROIDVM_NATIVE_KEXT
+    // As the kext loads, after its library IOStorageFamily: the original class is registered by now.
+    if (!storageParent) {
+        const OSSymbol *name = OSSymbol::withCString("IOBlockStorageDevice");
+        storageParent = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
+        OSSafeReleaseNULL(name);
+        if (storageParent && storageParent->getClassSize() != sizeof(IOBlockStorageDevice))
+            panic("DroidVMSourceStorage: original IOBlockStorageDevice is %u bytes, the source one %lu",
+                  storageParent->getClassSize(), sizeof(IOBlockStorageDevice));
+    }
+#endif
     if (!storageParent) panic("DroidVMSourceStorage: metaclass initialized before the original family");
     return storageParent;
 }
 
-// The built-in personalities of the iPadOS 17 kernel, in KernelConfigTables' syntax.
+// The built-in personalities of the iPadOS 17 kernel, in KernelConfigTables' syntax; as a kext, they name it, so matching
+// finds the classes' kext loaded.
+#if DROIDVM_NATIVE_KEXT
+#define STORAGE_BUNDLE "    'CFBundleIdentifier' = \"com.droidvm.driver.DroidVMStorage\";"
+#else
+#define STORAGE_BUNDLE
+#endif
 static const char kPersonalities[] =
     "("
     "  {"
     "    'IOClass'         = NativeVirtioBlock;"
     "    'IOProviderClass' = IOPlatformDevice;"
     "    'IOProbeScore'    = 1000:32;"
+    STORAGE_BUNDLE
     "  },"
     "  {"
     "    'IOClass'         = NativeRamBlock;"
@@ -65,6 +102,7 @@ static const char kPersonalities[] =
     "    'IOProviderClass' = IOResources;"
     "    'IOResourceMatch' = IOBSD;"
     "    'IOProbeScore'    = 1000:32;"
+    STORAGE_BUNDLE
     "  }"
     ")";
 
@@ -86,6 +124,7 @@ extern "C" void native_source_storage_start(void)
     status = OSKextLoadKextWithIdentifier("com.apple.filesystems.apfs");
     if (status != kOSReturnSuccess) panic("DroidVMSourceStorage: APFS load failed %x", status);
 
+#if !DROIDVM_NATIVE_KEXT
     void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!handle) panic("DroidVMSourceStorage: cannot begin class registration");
     source_storage_base_init();
@@ -93,6 +132,10 @@ extern "C" void native_source_storage_start(void)
     source_storage_ram_init();
     status = OSMetaClass::postModLoad(handle);
     if (status != kOSReturnSuccess) panic("DroidVMSourceStorage: class registration failed %x", status);
+#else
+    // The classes registered as the kext loaded; the kernel asks the kext's disks from now on.
+    if (!droidvm_storage_register(&kStorageOps)) panic("DroidVMSourceStorage: the kernel refused the storage functions");
+#endif
 
     OSString *error = nullptr;
     OSArray *personalities = OSDynamicCast(OSArray, OSUnserialize(kPersonalities, &error));
