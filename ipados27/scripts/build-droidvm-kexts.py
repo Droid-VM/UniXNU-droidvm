@@ -20,6 +20,7 @@ The board's drivers that ship as kexts of the kernel collection rather than insi
 A source is a file of package/ (kits/droidvm), or tree:PATH, a path in the build tree (.cache/sources/...).
   builtin                 the build-droidvm-devices.py objects this kext replaces (left out of the kernel)
   libraries               OSBundleLibraries
+  targets                 optional: the userspaces it serves, ["ios"] (the default), ["macosx"] or both (droidvm_kexts.py)
 Each is compiled with the kernel's own compile records, as the built-in drivers are (build-droidvm-devices.py), with the starter
 package/DroidVMKextStarter.cpp, into TREE/build/droidvm-kexts/NAME/; manifest.json there lists them for fileset-add-kexts.py,
 which links them into the collection after the prelink (build-droidvm-all.py, step kernel).
@@ -77,7 +78,9 @@ def command(rec, src, dst, tree, extra=(), warnings=True):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--tree', type=Path, required=True)
-    tree = p.parse_args().tree.resolve()
+    p.add_argument('--target', choices=('ios', 'macosx'), help='the userspace of the kernel (default: UNIXNU_XNU_TARGET, else ios)')
+    args = p.parse_args()
+    tree = args.tree.resolve()
     records = tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837'
 
     def record(name):
@@ -87,7 +90,7 @@ def main():
     out = tree / 'build/droidvm-kexts'
     out.mkdir(parents=True, exist_ok=True)
     manifest = []
-    for spec in droidvm_kexts.specs():
+    for spec in droidvm_kexts.specs(args.target):
         name = spec['name']
         work = out / name
         work.mkdir(exist_ok=True)

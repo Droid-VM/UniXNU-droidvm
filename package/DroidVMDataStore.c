@@ -44,8 +44,18 @@ struct droidvm_store_used { uint32_t id, length; };
 _Static_assert(sizeof(struct droidvm_store_desc) == 16 && sizeof(struct droidvm_store_request) == 16, "VirtIO wire layout");
 enum { VIRTIO_BLK_T_IN = 0, VIRTIO_BLK_T_OUT = 1, VIRTIO_BLK_T_FLUSH = 4 };
 
+#define DROIDVM_STORE_STAGE_BYTES (DROIDVM_STORE_STAGE_BLOCKS * DROIDVM_STORE_BLOCK)
+#if DROIDVM_DEVICE_DYNAMIC
+// DROIDVM_DEVICE_DYNAMIC: the ring page and the bounce buffer from one contiguous region allocated when the store opens
+// (DroidVMDmaRegion.h), not static arrays: the 132 KiB would not fit a kext's __DATA in the virtual Mac's collection (the holes of
+// dropped kexts there are small) or the native __DATA slot of a fileset.
+#include "DroidVMDmaRegion.h"
+static struct droidvm_dma droidvm_store_dma;
+static uint8_t *droidvm_store_queue, *droidvm_store_stage;
+#else
 static uint8_t droidvm_store_queue[4096] __attribute__((aligned(4096)));
-static uint8_t droidvm_store_stage[DROIDVM_STORE_STAGE_BLOCKS * DROIDVM_STORE_BLOCK] __attribute__((aligned(4096)));
+static uint8_t droidvm_store_stage[DROIDVM_STORE_STAGE_BYTES] __attribute__((aligned(4096)));
+#endif
 
 // For the host rig (peek.py): state 0 closed, 1 open read-only, 2 open read-write, 3 failed (an I/O error or a timeout: every
 // later request is refused); why: the reason of a refused open or of the failure.
@@ -182,10 +192,18 @@ static const char *store_attach(unsigned mode) {
     if (!droidvm_store_registers) return "cannot map the data-store registers";
     if (store_read32(0x00) != 0x74726976 || store_read32(0x04) != 2 || store_read32(0x08) != 2)
         return "data-store is no modern virtio-mmio block device";
+#if DROIDVM_DEVICE_DYNAMIC
+    if (!droidvm_dma_alloc(&droidvm_store_dma, 4096 + DROIDVM_STORE_STAGE_BYTES)) return "cannot allocate the ring and bounce buffer";
+    droidvm_store_queue = (uint8_t *)droidvm_store_dma.base;
+    droidvm_store_stage = droidvm_store_queue + 4096;
+    droidvm_store_queue_physical = droidvm_dma_pa(&droidvm_store_dma, droidvm_store_queue);
+    droidvm_store_stage_physical = droidvm_dma_pa(&droidvm_store_dma, droidvm_store_stage);
+#else
     droidvm_store_queue_physical = ml_static_vtop((vm_offset_t)droidvm_store_queue);
     droidvm_store_stage_physical = ml_static_vtop((vm_offset_t)droidvm_store_stage);
-    if (ml_static_vtop((vm_offset_t)droidvm_store_stage + sizeof(droidvm_store_stage) - 4096) !=
-        droidvm_store_stage_physical + sizeof(droidvm_store_stage) - 4096) return "bounce buffer not contiguous";
+    if (ml_static_vtop((vm_offset_t)droidvm_store_stage + DROIDVM_STORE_STAGE_BYTES - 4096) !=
+        droidvm_store_stage_physical + DROIDVM_STORE_STAGE_BYTES - 4096) return "bounce buffer not contiguous";
+#endif
     droidvm_store_device = true;
     if (!store_reset()) return "device reset failed";
     store_write32(0x70, 1);
@@ -206,7 +224,7 @@ static const char *store_attach(unsigned mode) {
     if (!(store_read32(0x70) & 8)) return "features refused";
     store_write32(0x30, 0);
     if (store_read32(0x44) || store_read32(0x34) < DROIDVM_STORE_QUEUE) return "no usable queue 0";
-    memset(droidvm_store_queue, 0, sizeof(droidvm_store_queue));
+    memset(droidvm_store_queue, 0, 4096);
     *(volatile uint16_t *)(droidvm_store_queue + 128) = 1;   // VIRTQ_AVAIL_F_NO_INTERRUPT: this driver polls
     droidvm_store_available = droidvm_store_used_index = 0;
     store_barrier();

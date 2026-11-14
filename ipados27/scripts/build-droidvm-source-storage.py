@@ -135,7 +135,10 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
     cpp, c = record('iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'), record('osfmk/DEVELOPMENT/startup.o.json')
     includes = ['-I', str(out / 'headers/include'), '-I', str(tree / 'kits/VerifiedRoot/include'),
                 '-I', str(tree / 'drivers/VirtioMmioBlock'), '-I', str(tree / '.cache/xnu-work/osfmk')]
-    flags = ['-DNATIVE_VERIFIED_BLOCK=1', '-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1', '-DNATIVE_VERIFIED_POLICY_HANDOFF=1']
+    # DROIDVM_DEVICE_DYNAMIC: the Data store's ring and bounce buffer allocated when it opens (package/DroidVMDataStore.c), not in the
+    # kernel's or the kext's __DATA.
+    flags = ['-DNATIVE_VERIFIED_BLOCK=1', '-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1', '-DNATIVE_VERIFIED_POLICY_HANDOFF=1',
+             '-DDROIDVM_DEVICE_DYNAMIC=1']
     late = {'IOBlockStorageDevice.cpp', 'NativeVirtioBlock.cpp', 'NativeRamBlock.cpp'}
     sources = [base, virtio, tree / 'drivers/RamBlock/NativeRamBlock.cpp',
                package / 'DroidVMSourceStorage.cpp', package / 'DroidVMSourceRootPolicies.cpp', package / 'DroidVMDataStore.c',

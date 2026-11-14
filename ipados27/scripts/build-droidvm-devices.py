@@ -21,6 +21,7 @@ Writes build/droidvm-devices/objects.json and sources.json (paths relative to th
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -123,6 +124,16 @@ def ionetworking():
 
 def main():
     cpp, c_mach = record('iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'), record('osfmk/DEVELOPMENT/startup.o.json')
+    if os.environ.get('UNIXNU_XNU_TARGET') == 'macosx':
+        # macOS: the devices are kexts of the macOS collection (ipados27/kexts, targets macosx); the kernel keeps the scheduler
+        # trace, a diagnostic of the board.
+        source = ROOT / 'kits/droidvm/DroidVMSchedTrace.c'
+        objects = [command(c_mach, source, OUT / 'DroidVMSchedTrace.o', ('-DDROIDVM_DEVICE_DYNAMIC=1',))]
+        rel = lambda p: str(p.relative_to(ROOT))  # noqa: E731
+        (OUT / 'objects.json').write_text(json.dumps([rel(p) for p in objects], indent=2) + '\n')
+        (OUT / 'sources.json').write_text(json.dumps([rel(source)], indent=2) + '\n')
+        print('devices (macOS): the scheduler trace')
+        return
     family, include = ionetworking()
     # Every compile here includes sys/systm.h first: the family includes it inside extern "C", where in this private-header
     # universe its zalloc/startup templates cannot be declared. The bsd source tree, last on the path, supplies private headers

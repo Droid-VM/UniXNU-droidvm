@@ -8,6 +8,11 @@
 # DroidVM guest needs to start (ArmDTPlatform, ArmCpu) and its disks with the owner chain; display and GPU follow.
 schema_version = 2
 
+# The defconfig of each OS profile this board builds (unixnu --os, the packaging command).
+[package.defconfig]
+"ipados-27.0.1-24A446" = "droidvm_ipados27_defconfig"
+"macos-27.0.1-26A434" = "droidvm_macos27_defconfig"
+
 [board]
 name = "droidvm"
 soc = "crosvm-gunyah"
@@ -56,6 +61,9 @@ archives = [
   # The network (IONetworkingFamily and the virtio-net controller), sound, battery and media devices (scripts/build-droidvm-devices.py),
   # in the display archive too.
   "build-droidvm-devices.py",
+  # The board's own part that is not a device driver (scripts/build-droidvm-board-core.py): monitor, clock, launch policy, built-in
+  # boot arguments, file mailbox, page description, support code; the display archive takes its objects.
+  "build-droidvm-board-core.py",
   "build-droidvm-legacy-display.py",
 ]
 
@@ -202,6 +210,50 @@ tool_args = ["--dynamic", "--boot-video-mib", "24", "--reclaim-memory", "--displ
 # macos-27.0.1-26A434 kernel` (profiles/os/macos-27.0.1-26A434 of the fork: target macosx). The kernel takes the board's
 # shared series and the macOS one instead of ipados.series; packaging (the kernel collection with the macOS and board kexts)
 # is macOS-DroidVM's k27 tooling for now, so only the kernel tables are overridden.
+[os_overrides."macos-27.0.1-26A434".components]
+include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "VirtioMmioBlock", "RamBlock", "VerifiedRoot"]
+
+# The macOS kernel (meta todo/macos-bringup.md): the board's platform, corecrypto and disks as on iPadOS, the rest as kexts of the
+# macOS collection: no display, GPU, HID or key store built in (those of this board bind iPadOS 24A446's classes);
+# build-droidvm-board-core.py makes the kernel's display archive for macOS.
 [os_overrides."macos-27.0.1-26A434".kernel]
+defconfig = "droidvm_macos27_defconfig"
 config_fragments = ["arch:configs/common.config", "os:configs/macos.config"]
 patch_series = ["arch:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu-12377/series", "device:patches/xnu-12377/macos.series"]
+archives = [
+  "build-corecrypto-14.py",
+  "build-corecrypto-14.py --namespace",
+  "component:ArmDTPlatform",
+  "component:ArmCpu",
+  "build-libpthread-kernel.py",
+  "component:VirtioMmioBlock",
+  "component:RamBlock",
+  "build-droidvm-source-storage.py",
+  "build-droidvm-devices.py",
+  "build-droidvm-board-core.py",
+]
+
+# The virtual Mac's kexts in the collection (kernelcache.release.vma2 of 26A434): the iPadOS roots that it has, macOS's security,
+# file system and disk image kexts (as macOS-DroidVM keeps them, configs/kc-keep.txt), the families the board's kexts derive from,
+# and the keyboard's event drivers.
+[os_overrides."macos-27.0.1-26A434".kernel.prelink]
+roots = [
+  "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib", "com.apple.AppleFSCompression.AppleFSCompressionTypeDataless",
+  "com.apple.driver.AppleARMPlatform", "com.apple.driver.AppleAudioClockLibs", "com.apple.driver.AppleEffaceableStorage",
+  "com.apple.driver.AppleIISController", "com.apple.driver.AppleM2ScalerCSCDriver", "com.apple.driver.AppleMobileFileIntegrity",
+  "com.apple.driver.IODARTFamily", "com.apple.filesystems.apfs", "com.apple.iokit.CoreAnalyticsFamily", "com.apple.iokit.IOAVFamily",
+  "com.apple.iokit.IOAudio2Family", "com.apple.iokit.IOCECFamily", "com.apple.iokit.IOCryptoAcceleratorFamily",
+  "com.apple.iokit.IOGPUFamily", "com.apple.iokit.IOHDCPFamily", "com.apple.iokit.IOMobileGraphicsFamily",
+  "com.apple.iokit.IOReportFamily", "com.apple.iokit.IOSlowAdaptiveClockingFamily", "com.apple.iokit.IOStorageFamily",
+  "com.apple.iokit.IOSurface", "com.apple.kec.Libm", "com.apple.kec.corecrypto", "com.apple.kext.AppleMatch",
+  "com.apple.kext.CoreTrust", "com.apple.security.AppleImage4", "com.apple.security.sandbox", "com.apple.security.quarantine",
+  "com.apple.AppleSystemPolicy", "com.apple.iokit.EndpointSecurity", "com.apple.filesystems.lifs", "com.apple.filesystems.hfs.kext",
+  "com.apple.driver.AppleDiskImages2", "com.apple.driver.DiskImages", "com.apple.driver.DiskImages.FileBackingStore",
+  "com.apple.driver.DiskImages.KernelBacked", "com.apple.driver.DiskImages.RAMBackingStore",
+  "com.apple.driver.DiskImages.ReadWriteDiskImage", "com.apple.driver.DiskImages.UDIFDiskImage", "com.apple.driver.AppleFDEKeyStore",
+  "com.apple.driver.AppleVPCredentialManager", "com.apple.iokit.IOTimeSyncFamily", "com.apple.plugin.IOgPTPPlugin",
+  "com.apple.iokit.IOBluetoothFamily", "com.apple.iokit.IONetworkingFamily", "com.apple.iokit.IOGraphicsFamily",
+  "com.apple.iokit.IOHIDFamily", "com.apple.iokit.IOHIDEventDriver", "com.apple.driver.AppleMultitouchDriver",
+  "com.apple.driver.AppleHIDKeyboard", "com.apple.driver.AppleInputDeviceSupport", "com.apple.driver.AppleTopCaseHIDEventDriver",
+  "com.apple.driver.driverkit.serial", "com.apple.UVCService"
+]

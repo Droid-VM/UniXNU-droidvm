@@ -1,0 +1,13 @@
+{
+ "inputs": {
+  "kernelcache_sha256": "ca55ea8c4c86170e870380ae5501b8b43adb2d2d3db28be4531b3040653be203",
+  "entry": "com.apple.kernel"
+ },
+ "sites": [
+  {
+   "site": "0xfffffe0007b439c8",
+   "native_symbol": "_unixnu_kernel_stack_shift",
+   "evidence": "macOS 27.0.1 (26A434) kernelcache.release.vma2: AppleMobileFileIntegrity's __DATA_CONST,__got slot whose chained target is the kernel's _PAGE_SHIFT_CONST (0xfffffe0007928138), its only GOT slot for it (checked 2026-11-14 from the collection's fixups and symbols). As in XnuPrelink's 24A446 and 26C5035r fixtures, its only reader is the CoreEntitlements DER iterator's stack check (sp & ((1 << *slot) - 1) < 0x80 takes the error exit): with the native 4 KiB page shift it fires inside a good stack, and macOS-DroidVM saw every spawn fail with 'failed to create OSDictionary copy: 14' until it rebound this slot (k27/kc-build27.py KEPT_POINTER_REBINDS, 0xfffffe0007b439c8 for 27.0.1). Bound to unixnu_kernel_stack_shift, the stack allocation alignment shift, for which sp & mask stays at least 8 KiB inside any stack."
+  }
+ ]
+}

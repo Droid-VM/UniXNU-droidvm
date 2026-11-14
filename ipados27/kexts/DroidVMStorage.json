@@ -1,11 +1,25 @@
 {
-  "_comment": "The disks: the public IOBlockStorageDevice from IOStorageFamily's source under the original class, NativeVirtioBlock on the verified OS and SystemOS images with the root policies the firmware hands over (VerifiedRoot and the owner key compiled in), NativeRamBlock with the Data seed and the Data store, all built by build-droidvm-source-storage.py (kext-objects.json), as one kext of the kernel collection. Its starter runs native_source_storage_start once IOBSD is published (the root mount waits for the disks); it registers the answers the XNU changes ask with the kernel (package/DroidVMStorageHooks.c, which the storage archive keeps). Depends on IOStorageFamily. See scripts/build-droidvm-kexts.py.",
+  "_comment": "The disks: the public IOBlockStorageDevice from IOStorageFamily's source under the original class, NativeVirtioBlock on the verified OS and SystemOS images with the root policies the firmware hands over (VerifiedRoot and the owner key compiled in), NativeRamBlock with the Data seed and the Data store, all built by build-droidvm-source-storage.py (kext-objects.json), as one kext of the kernel collection. Its starter runs native_source_storage_start once IOBSD is published (the root mount waits for the disks); it registers the answers the XNU changes ask with the kernel (package/DroidVMStorageHooks.c, which the storage archive keeps). Depends on IOStorageFamily. See scripts/build-droidvm-kexts.py. Both OSes: on macOS the same disks and owner chain (meta todo/macos-bringup.md); its data leaves the macOS kernel's __DATA slot of the virtual Mac's collection room.",
   "name": "DroidVMStorage",
   "bundle": "com.droidvm.driver.DroidVMStorage",
   "version": "1.0.0",
-  "object_lists": ["tree:build/droidvm-source-storage/kext-objects.json"],
+  "object_lists": [
+    "tree:build/droidvm-source-storage/kext-objects.json"
+  ],
   "attach": "native_source_storage_start",
-  "builtin": ["DroidVMSourceStorage"],
-  "libraries": {"com.apple.iokit.IOStorageFamily": "1.0", "com.apple.kpi.bsd": "18.0.0", "com.apple.kpi.iokit": "18.0.0",
-                "com.apple.kpi.libkern": "18.0.0", "com.apple.kpi.mach": "18.0.0", "com.apple.kpi.unsupported": "18.0.0"}
+  "builtin": [
+    "DroidVMSourceStorage"
+  ],
+  "libraries": {
+    "com.apple.iokit.IOStorageFamily": "1.0",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "targets": [
+    "ios",
+    "macosx"
+  ]
 }

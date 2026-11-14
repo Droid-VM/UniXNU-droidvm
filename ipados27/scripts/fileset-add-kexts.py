@@ -231,6 +231,12 @@ def main():
     p.add_argument('--manifest', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--report', type=Path)
+    p.add_argument('--sites', type=Path, action='append', default=[],
+                   help='reviewed per-site bindings in XnuPrelink\'s fixture format (fixtures/fileset-*-symbols.json): one original '
+                        'pointer site of the collection bound to a native symbol, applied when the fixture names this '
+                        'collection\'s kernelcache')
+    p.add_argument('--record', type=Path, help='XnuPrelink\'s record of the collection (default: the fileset\'s .json): its '
+                   'kernelcache and slide')
     args = p.parse_args()
     sys.path.insert(0, str(args.tree / 'kits/XnuPrelink'))
     from kc_image import Image
@@ -256,6 +262,34 @@ def main():
         found = linked_exports.get(name, [])
         return found[0] if len(found) == 1 else None
 
+    # Reviewed site bindings for a kernelcache XnuPrelink has no fixture of (as its fixtures/, kept by the board): an original
+    # component's pointer slot that must name another native object than the one its target pairs with (AMFI's PAGE_SHIFT_CONST
+    # GOT slot, bound to unixnu_kernel_stack_shift as in XnuPrelink's 24A446 and 26C5035r fixtures). The chained pointer keeps its
+    # next and signing fields; its target becomes the symbol's.
+    bound = []
+    if args.sites:
+        record = json.loads((args.record or args.fileset.with_suffix('.json')).read_text())
+        slide = int(record['collection_slide'], 16)
+        for path in args.sites:
+            fixture = json.loads(path.read_text())
+            if fixture['inputs']['kernelcache_sha256'] != record['inputs']['kernelcache_sha256']:
+                continue
+            for entry in fixture['sites']:
+                if not entry.get('evidence'):
+                    raise SystemExit(f'{path}: a reviewed site needs its evidence')
+                site = (int(entry['site'], 16) + slide) & MASK64
+                found = kernel_symbols.get(entry['native_symbol'], [])
+                if len(found) != 1:
+                    raise SystemExit(f'{path}: {entry["native_symbol"]} is not one native symbol')
+                at = collection.offset(site, 8)
+                word, = struct.unpack_from('<Q', collection.data, at)
+                target = found[0] - collection.base
+                if not 0 <= target < 1 << 30:
+                    raise SystemExit(f'{entry["native_symbol"]} lies outside the collection')
+                struct.pack_into('<Q', collection.data, at, (word & ~0x3fffffff) | target)
+                bound.append({'site': hex(site), 'native_symbol': entry['native_symbol'], 'was': hex(word & 0x3fffffff),
+                              'fixture': path.name})
+                print(f'site {site:#x}: {entry["native_symbol"]}')
     key, diversity, address_diversity = collection.function_auth()
     linkedit = collection.segments['__LINKEDIT']
     _, info = collection.prelink_info()
@@ -321,7 +355,7 @@ def main():
     collection.set_prelink_info(info)
     args.output.write_bytes(bytes(collection.data))
     if args.report:
-        args.report.write_text(json.dumps({'kexts': report, 'kmod_start_signing': {
+        args.report.write_text(json.dumps({'kexts': report, 'sites': bound, 'kmod_start_signing': {
             'key': key, 'diversity': hex(diversity), 'address_diversity': address_diversity}}, indent=2) + '\n')
 
 

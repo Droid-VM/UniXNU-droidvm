@@ -1,0 +1,48 @@
+# Kernel configuration of the DroidVM macOS 27.0.1 image (VirtualMac2,1 26A434, arm64e, xnu-12377 with XNU_TARGET_OS_OSX):
+# board.toml [package.defconfig] and [os_overrides."macos-27.0.1-26A434"] select it. The iPadOS 27 defconfig beside it with
+# what macOS changes (meta todo/macos-bringup.md): no RELEASE reference build (a macOS collection keeps its symbols: XnuPrelink
+# pairs by name), the macOS Data seed's volume UUID. The disks, the owner chain over the OS image and the SystemOS cryptex, and the board's display
+# archive (build-droidvm-board-core.py: monitor, launch policy, boot arguments; no display of its own) as on iPadOS.
+
+CONFIG_XNU_BUILD_ARCHIVES=y
+CONFIG_XNU_SOURCE_PTHREAD=y
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+CONFIG_XNU_NATIVE_PAN=y
+CONFIG_XNU_DT_PANIC_REGION=y
+# corecrypto as on iPadOS: the source corecrypto 14 (the arch profile's common.config) linked in, OSKext starting the collection's
+# corecrypto through the source provider's entry; the OS profile's prelinked bootstrap leaves an xnu-12377 kernel unlinked.
+CONFIG_XNU_CRYPTO_BOOTSTRAP="source"
+CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
+# The virtual Mac's kernel collection is an MH_FILESET; XnuPrelink's fileset emitter links this kernel into it.
+CONFIG_XNU_KERNEL_CHAINED_FIXUPS=y
+# The disks: build/droidvm-source-storage (scripts/build-droidvm-source-storage.py) instead of the iPadOS 17 board's
+# NativeVirtioBlock personality and verified-root bundle. Their root policies come from the firmware (RootPolicies).
+CONFIG_XNU_SOURCE_STORAGE=y
+# and the kernel's __TEXT,__cstring linked into __TEXT_EXEC (macOS-DroidVM's k27/kc27-layout.py MOVE): the virtual Mac's collection
+# keeps Libm and AppleARMPlatform right after Apple's 0x11c000-byte kernel __TEXT, where this DEVELOPMENT kernel's 0x1a3b48 bytes do
+# not fit, with 1.07 MiB of strings; no kernel code looks strings up by section (os_log formats stay in __TEXT,__os_log).
+CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/droidvm-source-storage/libDroidVMSourceStorage.a -Wl,-rename_section,__TEXT,__cstring,__TEXT_EXEC,__cstring"
+CONFIG_XNU_OWNER_ROOT_AUDIT=y
+CONFIG_XNU_OWNER_ROOT_TRUST=y
+# SystemOS cryptex, boot manifest and the writable Data volume from the Data seed's RAM disk, as on iPadOS 17.
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+# APFS volume UUID of the macOS Data seed (none yet: no volume matches until the seed exists).
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="00000000-0000-0000-0000-000000000000"
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+CONFIG_XNU_NATIVE_UFS=n
+CONFIG_XNU_SHENG_PMGR=n
+CONFIG_XNU_NATIVE_ADRENO=n
+CONFIG_XNU_BOOT_PROGRESS=n
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+# The board's display archive: on macOS build-droidvm-board-core.py's alone (late probe, monitor, launch policy, boot arguments),
+# no display of the board's own.
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
+# The board launch policy hook before launchd (package/DroidVMLaunchPolicy.c: launchd overrides, GPU clients, App cryptex, ownervisor).
+CONFIG_XNU_BOARD_LAUNCH_POLICY=y
