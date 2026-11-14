@@ -38,7 +38,11 @@ volatile int native_hid_input_results[8]={-1,-1,-1,-1,-1,-1,-1,-1};
 volatile uint32_t native_hid_input_command;
 char native_hid_input_registry[2048];
 char native_hid_input_props[1024];
+#if DROIDVM_NO_LEGACY_DISPLAY   // macOS: no iPadOS display whose frames gate the unattended Home presses below; none are sent
+static const volatile uint32_t native_legacy_transfer_calls = 0;
+#else
 extern volatile uint32_t native_legacy_transfer_calls;
+#endif
 // Optional unattended Home presses for hardware, which has no external harness writing the mailbox:
 // offline-hid-auto-home=<seconds after the second presented frame>, offline-hid-auto-home-count (default 1)
 // and offline-hid-auto-home-interval (default 20 s). Disabled unless the first argument is set.

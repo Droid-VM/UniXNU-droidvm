@@ -8,3 +8,4 @@ droidvm-macos-owner-cache-media-visibility.patch
 droidvm-macos-jetsam-floors.patch
 droidvm-macos-rootauth.patch
 droidvm-macos-owner-root-unverified.patch
+droidvm-macos-console-switch.patch

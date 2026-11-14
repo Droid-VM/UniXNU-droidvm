@@ -61,8 +61,13 @@ def main():
         print(f'a CPU is in the kernel debugger, operation {operation} (not a panic)')
         return 1
     base, end = word('debug_buf_base', 8), word('debug_buf_ptr', 8)
-    _, data = peek.read(f'{panic_region() + (base & 0x3fff):#x}', max(0, min(end - base, PANIC_REGION_SIZE - (base & 0x3fff))))
-    text = data.split(b'\0', 1)[0].decode(errors='replace')
+    # The log's offset in the region: the buffer's offset in its 16 KiB page (iPadOS), or in its 4 KiB page where the region's
+    # mapping starts at a 4 KiB boundary (the macOS kernel's: there the 16 KiB offset read from the middle of the backtrace).
+    for page in (0x3fff, 0xfff):
+        _, data = peek.read(f'{panic_region() + (base & page):#x}', max(0, min(end - base, PANIC_REGION_SIZE - (base & page))))
+        text = data.split(b'\0', 1)[0].decode(errors='replace')
+        if text.lstrip().startswith('panic('):
+            break
     if '--raw' in sys.argv:
         print(text)
         return 1

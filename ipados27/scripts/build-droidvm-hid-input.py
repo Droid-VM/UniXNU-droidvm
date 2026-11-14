@@ -18,9 +18,14 @@ board's display and accelerator stubs); the metaclass and the vtable are data, a
 
 Writes build/droidvm-hid-input/objects.json and sources.json (paths relative to the tree), which the display archive takes, and
 report.json.
+
+macOS (UNIXNU_XNU_TARGET=macosx; ipados27/kexts/DroidVMInput.macos.json): the macOS collection keeps its kexts' symbols, so the same
+objects link against IOHIDFamily's IOHIDDevice by name, as any kext, with no fixture and no bindings (fileset-add-kexts.py checks the
+owned vtables against the family's); kext objects only.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -37,6 +42,7 @@ HERE = Path(__file__).resolve().parent
 HID_REPOSITORY = 'https://github.com/UniXNU/ShengHidInput.git'
 HID_COMMIT = '24f1f3fbed6feff42e1ca02e2ce386a5c3c36da8'
 RECORDS = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837'
+MACOS = os.environ.get('UNIXNU_XNU_TARGET') == 'macosx'
 
 
 def run(cmd, **kw):
@@ -341,7 +347,53 @@ def object_vtable(data, found, name, count):
     return [entries.get(va + 16 + i * 8) for i in range(count)]
 
 
+def headers():
+    """The public IOHIDFamily headers of the pinned source, after the kernel's own; the macOS SDK's Kernel.framework supplies the
+    generated HIDDriverKit declarations the source checkout lacks."""
+    family = ROOT / 'refer/IOHIDFamily'
+    include = OUT / 'headers/include'
+    if include.exists():
+        shutil.rmtree(include)
+    for source_dir, relative in ((family / 'IOHIDFamily', 'IOKit/hid'), (family / 'IOHIDSystem/IOKit/hidsystem', 'IOKit/hidsystem')):
+        destination = include / relative
+        destination.mkdir(parents=True, exist_ok=True)
+        for path in sorted(source_dir.glob('*.h')):
+            shutil.copyfile(path, destination / path.name)
+    sdk = Path(run(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip())
+    return family, ('-I', str(include), '-idirafter', str(sdk / 'System/Library/Frameworks/Kernel.framework/Versions/A/Headers'))
+
+
+def main_macos():
+    family, hid_includes = headers()
+    cpp, c_mach, c_bsd = record('iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'), record('osfmk/DEVELOPMENT/startup.o.json'), \
+        record('bsd/DEVELOPMENT/kern_exec.o.json')
+    original = hid_source()
+    staged = stage_hid(original)
+    kext = ('-DDROIDVM_NATIVE_KEXT=1', '-UTARGET_OS_OSX', '-DTARGET_OS_OSX=1', '-DDROIDVM_NO_LEGACY_DISPLAY=1')
+    hid_obj = OUT / 'NativeHidInput.o'
+    command(cpp, staged, hid_obj, (*hid_includes, '-DNATIVE_HID_SOURCE_API=1', *kext))
+    probe = ROOT / 'kits/droidvm/HidInputProbe.cpp'
+    command(cpp, probe, OUT / 'HidInputProbe.kext.o', kext)
+    transport = ROOT / 'kits/droidvm/DroidVMVirtioInput.c'
+    command(c_mach, transport, OUT / 'DroidVMVirtioInput.o', ('-DDROIDVM_INPUT_DYNAMIC=1',))
+    motion = ROOT / 'kits/droidvm/DroidVMMotion.c'
+    command(c_bsd, motion, OUT / 'DroidVMMotion.o')
+    kext_objects = [hid_obj, OUT / 'HidInputProbe.kext.o', OUT / 'DroidVMVirtioInput.o', OUT / 'DroidVMMotion.o']
+    (OUT / 'objects.json').write_text('[]\n')   # nothing in the macOS kernel
+    (OUT / 'kext-objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in kext_objects], indent=2) + '\n')
+    sources = [original, ROOT / 'kits/droidvm/DroidVMMotionHid.inc', ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc', probe, transport, motion]
+    (OUT / 'sources.json').write_text(json.dumps([str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p) for p in sources],
+                                                 indent=2) + '\n')
+    (OUT / 'report.json').write_text(json.dumps(dict(
+        hid_source=dict(repository=HID_REPOSITORY, commit=HID_COMMIT, sha256=sha(original)),
+        iohidfamily_commit=run(['git', '-C', family, 'rev-parse', 'HEAD'], text=True).strip(), target='macosx',
+        objects={str(p.relative_to(ROOT)): sha(p) for p in kext_objects}), indent=2) + '\n')
+    print(f'HID (macOS): {len(kext_objects)} kext objects, IOHIDDevice by name')
+
+
 def main():
+    if MACOS:
+        return main_macos()
     discriminator = load_discriminator()
     abi = json.loads((HERE / 'hid-device-24A446.json').read_text())
     legacy = json.loads((HERE / 'legacy-display-24A446.json').read_text())

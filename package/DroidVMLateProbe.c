@@ -12,6 +12,7 @@ void native_legacy_display_probe(void);
 void native_legacy_display_late_probe(void);
 extern void native_touch_probe(void);
 extern void sheng_cpufreq_probe(void);
+extern void droidvm_reset_install(void);
 #if !DROIDVM_KEXT_KEYSTORE
 extern void native_keystore_probe(void);
 #endif
@@ -25,6 +26,7 @@ void native_legacy_display_probe(void)
 
 void native_legacy_display_late_probe(void)
 {
+    droidvm_reset_install();   // reboot and shutdown reach the VMM (DroidVMReset.c)
 #if !DROIDVM_KEXT_KEYSTORE
     native_keystore_probe();
 #endif

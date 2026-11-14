@@ -236,6 +236,8 @@ archives = [
   # NativeAdreno's user client, surface, execbuf and memory with DroidVMGpu.cpp and the macOS accelerator, for the graphics kext
   # (its objects only: the macOS kernel links none of them)
   "build-droidvm-gpu.py",
+  # NativeHidInput and the virtio-input transport, for the input kext (its objects only)
+  "build-droidvm-hid-input.py",
   "build-droidvm-devices.py",
   "build-droidvm-board-core.py",
 ]

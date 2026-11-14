@@ -1,0 +1,20 @@
+{
+  "_comment": "macOS: the input devices (keyboard, touch, pen, trackpad, motion) as on iPadOS -- NativeHidInput (build-droidvm-hid-input.py's staged ShengHidInput with the board's sinks) fed by the virtio-input transport -- linked by name against the collection's IOHIDFamily (no fixture: the macOS collection keeps its symbols); the linker checks the owned IOHIDDevice vtables against the family's.",
+  "name": "DroidVMInput",
+  "bundle": "com.droidvm.driver.DroidVMInput",
+  "version": "1.0.0",
+  "targets": ["macosx"],
+  "sources": ["DroidVMSensorProcessor.cpp"],
+  "object_lists": ["tree:build/droidvm-hid-input/kext-objects.json"],
+  "attach": ["droidvm_input_start", "native_hid_input_probe"],
+  "builtin": ["DroidVMSensorProcessor", "NativeHidInput"],
+  "libraries": {
+    "com.apple.iokit.IOHIDFamily": "2.0.0",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "vtables": {"NativeHidInput": "IOHIDDevice", "DroidVMTrackpadHIDDevice": "IOHIDDevice", "AppleSPUHIDDevice": "IOHIDDevice"}
+}

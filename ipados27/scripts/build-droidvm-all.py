@@ -499,6 +499,7 @@ class Build:
             # server and every client take the native device), no probe daemon
             addon_file = self.work / 'payload/gpu-addon.bin'
             addon_file.parent.mkdir(parents=True, exist_ok=True)
+            addon_file.unlink(missing_ok=True)   # make-gpu-addon.py does not overwrite
             self.script('make-gpu-addon.py', '--publish', '--no-daemon', '--prefix', 'GPUBundles', addon_file,
                         logfile=self.logs / 'gpu-addon.log', env=dict(self.env, ADRENO_PLUGIN_DIR=str(self.plugin)))
             addon = ['--gpu-addon', addon_file]

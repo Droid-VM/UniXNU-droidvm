@@ -2,7 +2,7 @@
 """The board's own part of the iPadOS 27 / macOS 27 kernel that is not a device driver: the droidvm-monitor worker and the
 board's late probe hook (native_touch_probe, generated as DroidVMMonitor27.c), the calendar clock (DroidVMClock.c), the launch
 policy (DroidVMLaunchPolicy.c), the built-in boot arguments (DroidVMBootArgs27.c), the host's file mailbox (DroidVMFileExport.c),
-the page description (DroidVMPageInfo.c), the board support code the drivers and the monitor share (DroidVMBoardSupport27.cpp,
+the page description (DroidVMPageInfo.c), the guest's restart and shutdown through PSCI (DroidVMReset.c), the board support code the drivers and the monitor share (DroidVMBoardSupport27.cpp,
 generated) and the kernel's side of the late probe when the display is a kext (DroidVMLateProbe.c).
 
 iPadOS: build-droidvm-legacy-display.py archives these with the display (objects.json here). macOS, whose display, GPU, input
@@ -226,9 +226,11 @@ page_info_source = ROOT / 'kits/droidvm/DroidVMPageInfo.c'
 compile_c(page_info_source, OUT / 'DroidVMPageInfo.o', 'osfmk/DEVELOPMENT/vm_dyld_pager.o.json')
 late_probe_source = ROOT / 'kits/droidvm/DroidVMLateProbe.c'
 compile_c(late_probe_source, OUT / 'DroidVMLateProbe.o', extra=kext_flags)
+reset_source = ROOT / 'kits/droidvm/DroidVMReset.c'
+compile_c(reset_source, OUT / 'DroidVMReset.o')
 objects = [OUT / name for name in ('DroidVMBoardSupport27.o', 'DroidVMMonitor27.o', 'DroidVMClock.o', 'DroidVMLaunchPolicy.o',
-                                   'DroidVMBootArgs27.o', 'DroidVMFileExport.o', 'DroidVMPageInfo.o')]
-sources = [clock_source, policy_source, bootargs_source, export_source, page_info_source, late_probe_source]
+                                   'DroidVMBootArgs27.o', 'DroidVMFileExport.o', 'DroidVMPageInfo.o', 'DroidVMReset.o')]
+sources = [clock_source, policy_source, bootargs_source, export_source, page_info_source, late_probe_source, reset_source]
 (OUT / 'objects.json').write_text(json.dumps(dict(objects=[str(p.relative_to(ROOT)) for p in objects],
                                                   late_probe=str((OUT / 'DroidVMLateProbe.o').relative_to(ROOT)),
                                                   sources=[str(p.relative_to(ROOT)) for p in sources]), indent=2) + '\n')

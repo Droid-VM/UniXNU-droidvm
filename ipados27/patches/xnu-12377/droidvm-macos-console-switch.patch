@@ -1,0 +1,18 @@
+macOS: the console selector stays writable after lockdown, as on x86, so a display driver may hand the console to serial.
+
+With the board's serial console (serial=3, droidvm-serial-uarts.patch), IOMobileFramebufferLegacy, as WindowServer takes the
+display, gives the console up (PE_initialize_console kPEDisableScreen -> switch_to_serial_console), which writes cons_ops_index;
+arm64 keeps it SECURITY_READ_ONLY_LATE, and the write after lockdown panicked the macOS guest ("Unexpected fault in kernel static
+region", esr 0x9600004f at switch_to_serial_console, far = cons_ops_index) right after its first frame. iPadOS's display never
+switches the console. The x86 kernel keeps the variable writable for the same reason.
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -131,7 +131,7 @@
+ 
+ SECURITY_READ_ONLY_EARLY(uint32_t) nconsops = (sizeof cons_ops / sizeof cons_ops[0]);
+ 
+-#if __x86_64__
++#if __x86_64__ || XNU_TARGET_OS_OSX
+ uint32_t cons_ops_index = VC_CONS_OPS;
+ #else
+ SECURITY_READ_ONLY_LATE(uint32_t) cons_ops_index = VC_CONS_OPS;

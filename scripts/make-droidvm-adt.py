@@ -404,6 +404,10 @@ def main():
     parser.add_argument('--data-ramdisk', action='store_true',
                         help='/chosen/memory-map RAMDisk placeholder; the loader fills in the real range')
     parser.add_argument('--trust-cache', action='store_true', help='Zeroed TrustCache sidecar handoff placeholder')
+    parser.add_argument('--gpu-addon', action='store_true',
+                        help='Zeroed GpuAddon placeholder: DarwinBoot hands the payload\'s GPU addon (make-gpu-addon.py) over there, '
+                             'which the kernel writes into Data (macOS: the Metal plugin to /Library/GPUBundles), as UniXNU\'s '
+                             'devicetree.py places it')
     parser.add_argument('--root-policies', action='store_true',
                         help='Zeroed RootPolicies placeholder: DarwinBoot hands kernel.macho.vroot (the disks\' signed root policies) '
                              'over there')
@@ -614,6 +618,7 @@ def main():
              [node('memory-map', ([('PackedRAMDisk' if args.packed_data_ramdisk else 'RAMDisk', bytes(16))]
                                   if (args.data_ramdisk or args.packed_data_ramdisk) else []) +
                                  ([('TrustCache', bytes(16))] if args.trust_cache else []) +
+                                 ([('GpuAddon', bytes(16))] if args.gpu_addon else []) +
                                  ([('RootPolicies', bytes(16))] if args.root_policies else [])),
               node('manifest-properties'), *chosen_children]),
         node('cpus', children=cpus),
