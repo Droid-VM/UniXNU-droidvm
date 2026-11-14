@@ -232,7 +232,8 @@ print([d['path'] for d in config['disks'] if d['path'].endswith('/droidvm-disk.i
     done
   fi
   $A shell "mkdir -p $DIR"               # through the shared storage, which gives it the owner the app's other VM directories have
-  FILE=$MEDIA/data-store.img "$RIG/make-data-store.sh" >/dev/null
+  # STORE_GIB (rig.env): the store holds the seed's container, which a macOS seed makes 24 GiB (make-droidvm-macos-seed.py)
+  FILE=$MEDIA/data-store.img "$RIG/make-data-store.sh" ${STORE_GIB:-} >/dev/null
   symbols
   $A push "$O/droidvm-disk.img" "$DIR/droidvm-disk.img" | tail -1
   $A push "$R/release.json" "$DIR/release.json" | tail -1

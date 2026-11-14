@@ -63,6 +63,18 @@ def os_image(ipsw):
     raise SystemExit(f'{ipsw}: no OS member (unixnu ipsw fetch OS)')
 
 
+def ensure_vm(lima):
+    """The lima VM, made (Ubuntu 24.04 on the Virtualization framework, /Volumes/DATA/UniXNU read-write at the same path) or
+    started when it is not running. Its disk lives where lima keeps its instances (on the build Mac ~/.lima, a link into the DATA
+    volume's VMs directory)."""
+    status = subprocess.run(['limactl', 'list', '--format', '{{.Status}}', lima], capture_output=True, text=True).stdout.strip()
+    if not status:
+        subprocess.run(['limactl', 'start', f'--name={lima}', '--vm-type=vz', '--mount-type=virtiofs', '--cpus=4', '--memory=8',
+                        '--disk=40', '--mount=/Volumes/DATA/UniXNU:w', '--tty=false', 'template:ubuntu-24.04'], check=True)
+    elif status != 'Running':
+        subprocess.run(['limactl', 'start', '--tty=false', lima], check=True)
+
+
 def in_vm(lima, *command):
     """A command as root in the lima VM (the Mac's /Volumes/DATA/UniXNU at the same path there)."""
     return subprocess.run(['limactl', 'shell', lima, 'sudo', *[str(part) for part in command]], check=True)
@@ -116,6 +128,7 @@ def main():
             shared[name] = output / f'{name}.cdr'          # where the VM sees it
             shutil.copyfile(made, shared[name])
             made.unlink()
+        ensure_vm(args.lima)
         if subprocess.run(['limactl', 'shell', args.lima, 'grep', '-qw', 'apfs', '/proc/filesystems']).returncode:
             in_vm(args.lima, 'bash', tree / 'scripts/setup-lima-apfs.sh')
         in_vm(args.lima, 'python3', tree / 'scripts/make-macos-data-linux.py', '--os-image',

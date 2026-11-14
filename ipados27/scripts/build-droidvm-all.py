@@ -395,9 +395,9 @@ class Build:
             shutil.copyfile(source / 'seed.json', self.data / 'seed.json')
             origin = str(source)
         elif self.macos:
-            sys.exit('macOS: the Data seed keeps root and service accounts as owners, so it is made as root on the Mac: '
-                     'sudo python3 ipados27/scripts/make-droidvm-macos-seed.py --tree ' + str(self.tree) + ' --ipsw ' + str(self.ipsw)
-                     + ' --output GENERATION_DIR, then --generation GENERATION_DIR')
+            sys.exit('macOS: the Data seed keeps root and service accounts as owners; make it once (as root in a lima VM, no sudo): '
+                     'python3 ' + str(self.tree / 'scripts/make-droidvm-macos-seed.py') + ' --tree ' + str(self.tree) + ' --ipsw '
+                     + str(self.ipsw) + ' --output /Volumes/DATA/UniXNU/generations/<name> [--user NAME:PASSWORD], then --generation')
         else:
             self.link_sources()
             run(['python3', BOARD / 'scripts/build-droidvm-data-seed.py', '--tree', self.tree, '--profile', self.profile_path,
@@ -473,6 +473,10 @@ class Build:
             records += sorted((self.args.generation.resolve() / 'trust').glob('*.json'))
         return records
 
+    def trust_bundle(self):
+        """The bundle with the owner's module, or the IPSW's own modules alone when no owner record exists (macOS, for now)."""
+        return self.trust / ('owner.bundle' if self.trust_records() else 'original.bundle')
+
     def step_trust(self):
         owners = [part for record in self.trust_records() for part in ('--owner', record)]
         self.script('build-droidvm-trust.py', '--tree', self.tree, '--ipsw', self.ipsw, *owners, '--name', 'owner',
@@ -483,8 +487,7 @@ class Build:
         chip = self.args.unique_chip_id
         if not chip:
             sys.exit('the payload needs --unique-chip-id (or UNIXNU_UNIQUE_CHIP_ID): the platform seed, 16 hex digits')
-        # the bundle with the owner's module, or the IPSW's own modules alone when no owner record exists (macOS, for now)
-        bundle = self.trust / ('owner.bundle' if self.trust_records() else 'original.bundle')
+        bundle = self.trust_bundle()
         self.unixnu_cmd('build', 'payload', '--unique-chip-id', chip, '--data-ramdisk', self.data / self.seed()['seed'],
                         '--trust-cache', bundle, logfile=self.logs / 'payload.log')
         run(['bash', REPO / 'scripts/make-droidvm-disk.sh', self.work / 'payload/payload.img', self.efi_dir(),
@@ -529,7 +532,7 @@ class Build:
             'gpu_sources': self.record('gpu-sources'),
             'seed': self.seed(),
             'unique_chip_id': (self.record('payload') or {}).get('unique_chip_id'),
-            'trust_sha256': sha256(self.trust / 'owner.bundle'),
+            'trust_sha256': sha256(self.trust_bundle()),
             'trust_records': [str(path) for path in self.trust_records()],
             'plugin': {'cdhashes': {k: trust[k] for k in ('cdhash', 'daemon_cdhash', 'turnip_cdhash') if k in trust},
                        'files': plugin_files},
