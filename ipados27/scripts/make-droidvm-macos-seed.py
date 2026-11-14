@@ -89,6 +89,8 @@ def main():
     parser.add_argument('--user', help='NAME:PASSWORD of a local administrator, logged in at the login window')
     parser.add_argument('--auto-login', action='store_true', help='log that user in at boot (a test seed only)')
     parser.add_argument('--lima', default='droidvm-apfs', help='the lima VM that sets the owners (without root; default droidvm-apfs)')
+    parser.add_argument('--shims', type=Path, help='the owner boot shims (default TREE/build/droidvm-macos-shims/bootshim, '
+                        'build-droidvm-macos-shims.py) for /private/var/ngpu/bootshim')
     args = parser.parse_args()
     if args.auto_login and not args.user:
         parser.error('--auto-login needs --user')
@@ -131,9 +133,11 @@ def main():
         ensure_vm(args.lima)
         if subprocess.run(['limactl', 'shell', args.lima, 'grep', '-qw', 'apfs', '/proc/filesystems']).returncode:
             in_vm(args.lima, 'bash', tree / 'scripts/setup-lima-apfs.sh')
+        shims = (args.shims or tree / 'build/droidvm-macos-shims/bootshim').resolve()
+        installs = ['--install', f'{shims}:private/var/ngpu/bootshim'] if shims.is_dir() else []
         in_vm(args.lima, 'python3', tree / 'scripts/make-macos-data-linux.py', '--os-image',
               tree / 'build/droidvm-root-images/os.img', '--scratch', shared['scratch'], '--data', shared['data'],
-              *[o for o in options if o not in ('--volume-uuid', volume)])
+              *[o for o in options if o not in ('--volume-uuid', volume)], *installs)
         upstream.set_volume_uuid(shared['data'], uuid.UUID(volume))
         base = output / 'base.dbr'
         packed_ramdisk.pack(shared['data'], base)

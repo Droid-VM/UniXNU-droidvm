@@ -283,11 +283,19 @@ kernel_args = [
   "owner-debug=1",
   # the kernel console as text on the boot framebuffer and mirrored to the serial console (macos-verbose-text-console.patch)
   "vc-text=1",
+  # launchd's mount-phase-1/2 run the owner apfs_boot_util of the Data seed (/private/var/ngpu/bootshim, shown over
+  # apfs.fs/Contents/Resources: macos-apfs-boot-shim.patch): the original aborts on the read-only root container (EROFS)
+  "apfs-boot-shim=1",
   "-v",
 ]
 
 [os_overrides."macos-27.0.1-26A434".payload.adt]
 chip_id = "FE00"                     # VirtualMac2,1 (the OS profile's [ipsw] chip_id 65024)
+# The root by its IOMedia's UUID (the System volume of the OS image, the profile's [root] os_volume_uuid): IOFindBSDRoot takes
+# /chosen root-matching before boot-uuid, which alone made it wait for APFS's boot-uuid-media, never published for a system
+# volume without the iBoot-forwarded root hash (apfs: "could not retrieve system-volume-auth-blob"); boot-uuid stays for
+# kern.bootuuid and kern.apfsprebootuuid.
+root_match_volume_uuid = "C73696D4-CAC4-40A0-90CB-7D0463E4E3E6"
 tool_args = ["--dynamic", "--boot-video-mib", "24", "--reclaim-memory", "--display-gamut", "sRGB",
              "--identity-tree", ".cache/firmware/DeviceTree.vma2macosap.im4p", "--kernel-ctrr-to-be-enabled", "0",
              "--adt-table", "kits/droidvm/../ipados27/adt/macos-27.0.1-26A434.json"]

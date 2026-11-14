@@ -146,6 +146,9 @@ def main():
     parser.add_argument('--skip-setup', action='store_true')
     parser.add_argument('--user', help='NAME:PASSWORD of a local administrator to add')
     parser.add_argument('--auto-login', action='store_true')
+    parser.add_argument('--install', action='append', default=[], metavar='SRC:DEST',
+                        help='a directory tree put at DEST of the volume (below private/: kept as real files), owned by root:wheel '
+                             '(the owner boot shims at private/var/ngpu/bootshim)')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('run as root (the APFS driver, the template\'s owners)')
@@ -161,6 +164,12 @@ def main():
                 raise SystemExit(f'{args.os_image}: not a macOS system volume')
             with Mounted(args.scratch.resolve(), work / 'scratch', True) as scratch:
                 copy_tree(template, scratch)
+                for entry in args.install:
+                    source, _, destination = entry.partition(':')
+                    target = scratch / destination
+                    target.mkdir(parents=True, exist_ok=True)
+                    run('cp', '-dR', '--preserve=mode,timestamps', f'{source}/.', target)
+                    run('chown', '-R', '0:0', target)   # its parents made here are root's already (the VM's root makes them)
                 if args.skip_setup:
                     seed.write_root(scratch / 'private/var/db/.AppleSetupDone', b'', 0o644)
                 if args.user:

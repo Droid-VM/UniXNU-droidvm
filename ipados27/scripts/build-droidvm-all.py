@@ -279,8 +279,8 @@ class Build:
 
     # tools ---------------------------------------------------------------------------------------------------------------
     def step_tools(self):
-        if self.macos:
-            log('tools: none for macOS yet (the iPadOS tools are arm64e-apple-ios)')
+        if self.macos:   # the owner boot shims the macOS Data seed carries (build-droidvm-macos-shims.py)
+            self.script('build-droidvm-macos-shims.py', '--tree', self.tree)
             return
         self.link_sources()            # gfxprobe takes NativeAdreno's headers from the tree
         # feeds.toml's pins (reference sources: a schema 2 tree takes kits only from the catalog); applebox's over the one in
@@ -468,7 +468,7 @@ class Build:
     # trust ---------------------------------------------------------------------------------------------------------------
     def trust_records(self):
         records = [*([self.plugin / 'trust.json'] if (self.plugin / 'trust.json').is_file() or not self.macos else []),
-                   *([] if self.macos else sorted((self.tree / 'build/owner-trust-extra').glob('*.json')))]
+                   *sorted((self.tree / 'build/owner-trust-extra').glob('macos-*.json' if self.macos else '*.json'))]
         if self.args.generation:
             records += sorted((self.args.generation.resolve() / 'trust').glob('*.json'))
         return records
