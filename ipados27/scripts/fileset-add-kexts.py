@@ -200,13 +200,14 @@ class Collection:
         struct.pack_into('<II', self.data, 16, count + 1, size + len(command))
 
 
-def apple_symbols(collection):
-    """The defined symbols of the collection's own kexts (a macOS collection keeps them, at their addresses in it; an iPadOS one
-    has none): name -> address, and the sorted addresses."""
-    found, data = {}, collection.data
-    for name, (_, offset) in collection.root.entries.items():
-        if name == 'com.apple.kernel':
+def kext_symbol_tables(collection):
+    """The defined symbols of each of the collection's own kexts (a macOS collection keeps them, at their addresses in it; an
+    iPadOS one has none): {bundle: {name: (address, external)}}."""
+    tables, data = {}, collection.data
+    for bundle, (_, offset) in collection.root.entries.items():
+        if bundle == 'com.apple.kernel':
             continue
+        table = tables.setdefault(bundle, {})
         ncmds, = struct.unpack_from('<I', data, offset + 16)
         at = offset + 32
         for _ in range(ncmds):
@@ -218,27 +219,50 @@ def apple_symbols(collection):
                     if ntype & 0xe0 or ntype & 0x0e != 0x0e or not value:
                         continue
                     end = data.index(b'\0', stroff + strx)
-                    found.setdefault(bytes(data[stroff + strx:end]).decode(errors='replace'), value)
+                    table.setdefault(bytes(data[stroff + strx:end]).decode(errors='replace'), (value, bool(ntype & 0x01)))
             at += length
+    return tables
+
+
+def apple_symbols(tables):
+    """All of the kexts' defined symbols, local ones too (the vtables): name -> address, and the sorted addresses."""
+    found = {}
+    for table in tables.values():
+        for name, (value, _) in table.items():
+            found.setdefault(name, value)
     return found, sorted(set(found.values()))
 
 
-def check_vtables(collection, checks, linked, symbols, addresses):
+def check_vtables(collection, checks, linked, symbols, addresses, pure=None):
     """Each of a kext's classes against the vtable of the original class it derives from ({class: parent}, the spec's
     "vtables"): the parent's slots must keep their pointer authentication diversity in the kext's vtable, which a slot moved by
     a header difference changes (macOS IOStorageFamily's TARGET_OS_OSX slots: IOBlockStorageDriver's call to reportRemovability
     then failed authentication on another method's entry). Checked where the collection names the parent (macOS's); returns
-    the mismatches."""
+    the mismatches. The original may be given with its ancestors, [original, its superclass, ...]: a slot the original leaves pure
+    (its entry is PURE, __cxa_pure_virtual) and redeclares is signed in the original's own vtable with the redeclaring name, in a
+    derived class's with the introducing class's (IOMobileFramebufferLegacy's pure redeclarations of IOMobileFramebuffer's
+    methods), so such a slot also passes with an ancestor's diversity there."""
     def entries(vtable, count):
-        result = []
+        result, targets = [], []
         for index in range(count):
             word, = struct.unpack_from('<Q', collection.data, collection.offset(vtable + 0x10 + 8 * index, 8))
             if not word:            # past the last slot (the padding before the next symbol)
                 break
             result.append(((word >> 32) & 0xffff) if word >> 63 else None)
-        return result
+            targets.append(collection.base + (word & 0x3fffffff))
+        return result, targets
     problems, checked = [], 0
-    for ours, parent in checks.items():
+    def vtable(name):
+        symbol = f'__ZTV{len(name)}{name}'
+        if symbol not in symbols:
+            return None
+        start = symbols[symbol]
+        following = addresses[addresses.index(start) + 1] if addresses.index(start) + 1 < len(addresses) else start + 0x10
+        return start, (following - start - 0x10) // 8
+
+    for ours, chain in checks.items():
+        chain = [chain] if isinstance(chain, str) else list(chain)
+        parent, ancestors = chain[0], chain[1:]
         mine, theirs = f'__ZTV{len(ours)}{ours}', f'__ZTV{len(parent)}{parent}'
         if theirs not in symbols:
             if symbols:
@@ -247,19 +271,32 @@ def check_vtables(collection, checks, linked, symbols, addresses):
         if mine not in linked:
             problems.append(f'{ours}: the kext has no {mine}')
             continue
-        start = symbols[theirs]
-        following = addresses[addresses.index(start) + 1] if addresses.index(start) + 1 < len(addresses) else start + 0x10
-        count = (following - start - 0x10) // 8
-        expected = entries(start, count)
+        start, count = vtable(parent)
+        expected, targets = entries(start, count)
         count = len(expected)
-        got = entries(linked[mine], count)
-        wrong = [index for index in range(count) if index >= len(got) or expected[index] != got[index]]
+        got, _ = entries(linked[mine], count)
+        above = []
+        for ancestor in ancestors:
+            found = vtable(ancestor)
+            if found is None:
+                problems.append(f'{ours}: the collection has no __ZTV{len(ancestor)}{ancestor}')
+                continue
+            above.append(entries(*found)[0])
+        wrong, redeclared = [], []
+        for index in range(count):
+            if index < len(got) and expected[index] == got[index]:
+                continue
+            if index < len(got) and targets[index] == pure and any(index < len(a) and a[index] == got[index] for a in above):
+                redeclared.append(index)
+                continue
+            wrong.append(index)
         if wrong:
-            first = wrong[0]
-            problems.append(f'{ours}: {len(wrong)} of {parent}\'s {count} slots differ, first at {8 * first:#x} (diversity '
-                            f'{got[first] if first < len(got) else "none"} for {expected[first]})')
+            listed = ', '.join(f'{8 * i:#x} ({got[i] if i < len(got) else "none"} for {expected[i]})' for i in wrong[:8])
+            problems.append(f'{ours}: {len(wrong)} of {parent}\'s {count} slots differ (offset, diversity for the original\'s): '
+                            f'{listed}')
             continue
-        print(f'  {ours}: {parent}\'s {count} slots match')
+        print(f'  {ours}: {parent}\'s {count} slots match' + (f' ({len(redeclared)} pure redeclarations by an ancestor\'s: '
+                                                              f'{", ".join(hex(8 * i) for i in redeclared)})' if redeclared else ''))
         checked += 1
     return problems, checked
 
@@ -318,13 +355,24 @@ def main():
         for name in names:
             kernel_symbols.setdefault(name, []).append(address + moved[segment['name']])
     linked_exports = {}
+    # The collection's own kexts' symbols (macOS keeps them): a kext resolves the external ones of the kexts it names among its
+    # libraries (the macOS network kext calls IONetworkingFamily's IONetworkController and derives from its IOEthernetController).
+    tables = kext_symbol_tables(collection)
+    libraries = {}
 
     def resolve(name):
         found = kernel_symbols.get(name, [])
         if len(found) == 1:
             return found[0]
         found = linked_exports.get(name, [])
-        return found[0] if len(found) == 1 else None
+        if len(found) == 1:
+            return found[0]
+        found = {table[name][0] for table in libraries.values() if name in table and table[name][1]}
+        if not found:
+            # a method the original class's vtable names but the family does not export (macOS IOMobileGraphicsFamily's
+            # IOMobileFramebufferLegacy::trigger_pswap_dependent_thread): its local symbol, when only one library has it
+            found = {table[name][0] for table in libraries.values() if name in table}
+        return found.pop() if len(found) == 1 else None
 
     # Reviewed site bindings for a kernelcache XnuPrelink has no fixture of (as its fixtures/, kept by the board): an original
     # component's pointer slot that must name another native object than the one its target pairs with (AMFI's PAGE_SHIFT_CONST
@@ -367,6 +415,8 @@ def main():
         if missing:
             raise SystemExit(f'{spec["bundle"]}: libraries not in the collection: {missing}')
         objects = [str(args.manifest.parent / o) for o in spec['objects']]
+        libraries.clear()
+        libraries.update({bundle: tables[bundle] for bundle in spec['libraries'] if tables.get(bundle)})
         try:
             linked = kc_native.link(objects, resolve, collection.allocate, 0x1000, KMOD_INFO_SIZE + 4,
                                     spec['start'], spec['stop'])
@@ -416,14 +466,28 @@ def main():
                        'segments': {n: [hex(s['va']), hex(len(s['data']))] for n, s in segs.items()},
                        'symbols': {n: hex(va) for n, va in sorted(linked['symbols'].items())}})
         print(f'{spec["bundle"]}: header {text_va:#x}, kmod_info {data_va:#x}, {len(sites)} pointers')
+    # Keys a kext sets in the personalities of the collection's own kexts (its spec's patch_personalities).
+    by_bundle = {entry.get('CFBundleIdentifier'): entry for entry in info['_PrelinkInfoDictionary']}
+    for spec in manifest['kexts']:
+        for bundle, personalities in spec.get('patch_personalities', {}).items():
+            entry = by_bundle.get(bundle)
+            if entry is None:
+                raise SystemExit(f'{spec["bundle"]}: patch_personalities: the collection has no {bundle}')
+            for name, keys in personalities.items():
+                personality = entry.get('IOKitPersonalities', {}).get(name)
+                if personality is None:
+                    raise SystemExit(f'{spec["bundle"]}: patch_personalities: {bundle} has no personality {name}')
+                personality.update(keys)
+                print(f'{spec["bundle"]}: {bundle} {name}: {", ".join(f"{k}={v}" for k, v in keys.items())}')
     collection.set_prelink_info(info)
     # The kexts' classes against the original classes they derive from, where the collection names those (macOS).
     checks = [(spec, item) for spec, item in zip(manifest['kexts'], report) if spec.get('vtables')]
     if checks:
-        symbols, addresses = apple_symbols(collection)
+        symbols, addresses = apple_symbols(tables)
         for spec, item in checks:
             linked = {n: int(v, 16) for n, v in item['symbols'].items()}
-            problems, checked = check_vtables(collection, spec['vtables'], linked, symbols, addresses)
+            pure = kernel_symbols.get('___cxa_pure_virtual', [None])[0]
+            problems, checked = check_vtables(collection, spec['vtables'], linked, symbols, addresses, pure)
             if problems:
                 raise SystemExit(f'{spec["bundle"]}: ' + '; '.join(problems))
             if checked:

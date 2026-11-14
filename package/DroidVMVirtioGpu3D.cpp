@@ -864,12 +864,25 @@ IOReturn hold(Client *c, uint64_t ticket, uint64_t &answer) {
 // ticket once the command buffer has completed. The IOSurface user client's lock trap (XNU calls droidvm_user_client_trap_hook)
 // waits for the tickets begun before it: a read lock for those writing the surface, a write lock for every one using it.
 struct SurfaceUse { uint32_t surface; bool write; Client *client; uint64_t ticket; };
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+// 96 KiB: in a kext of the collection, whose __DATA has little room (macOS's graphics kext with the GPU did not fit), from the heap
+// with the lock (surfaceLock); none yet, a use is counted as one the full table refused
+SurfaceUse *gSurfaceUses;
+#else
 SurfaceUse gSurfaceUses[MaxSurfaceUses];
+#endif
 uint32_t gSurfaceUseCount, gSurfaceWaiters;
 uint64_t gSurfaceTickets;                // tickets given, the latest
 IOLock *gSurfaceLock;
 const OSMetaClass *gSurfaceClientMeta;   // IOSurfaceRootUserClient's, once seen
 IOLock *surfaceLock() {
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+    if (!gSurfaceUses) {
+        auto *made = static_cast<SurfaceUse *>(IOMallocZero(sizeof(SurfaceUse) * MaxSurfaceUses));
+        if (made && !OSCompareAndSwapPtr(nullptr, made, reinterpret_cast<void *volatile *>(&gSurfaceUses)))
+            IOFree(made, sizeof(SurfaceUse) * MaxSurfaceUses);
+    }
+#endif
     if (!gSurfaceLock) {
         IOLock *made = IOLockAlloc();
         if (made && !OSCompareAndSwapPtr(nullptr, made, reinterpret_cast<void *volatile *>(&gSurfaceLock))) IOLockFree(made);
@@ -1014,7 +1027,7 @@ IOReturn surfaceAccess(Client *c, const void *in, size_t inSize, uint64_t &answe
         for (uint32_t i = 0; i < head.count; ++i) {
             Record record;
             memcpy(&record, records + i * sizeof record, sizeof record);
-            if (gSurfaceUseCount == MaxSurfaceUses) { droidvm_surface_stats[3] = droidvm_surface_stats[3] + 1; continue; }
+            if (!gSurfaceUses || gSurfaceUseCount == MaxSurfaceUses) { droidvm_surface_stats[3] = droidvm_surface_stats[3] + 1; continue; }
             gSurfaceUses[gSurfaceUseCount++] = {record.surface, record.written != 0, c, answer};
         }
     }

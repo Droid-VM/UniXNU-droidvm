@@ -6,7 +6,9 @@ The board's drivers that ship as kexts of the kernel collection rather than insi
   sources                 the driver's files in package/ (kits/droidvm in the tree), compiled with DROIDVM_NATIVE_KEXT=1
   attach                  the driver's attach function, or a list of them called in order, which the kext's starter calls
                           once IOResources matches it (the board's late probe calls them when the driver is built in;
-                          build-droidvm-legacy-display.py leaves them out of the probe for a driver listed here)
+                          build-droidvm-legacy-display.py leaves them out of the probe for a driver listed here); without it
+                          the kext has no starter and its own personalities start it
+  personalities           optional: IOKitPersonalities of the driver's own classes (CFBundleIdentifier: the kext's)
   records                 optional {source: the kernel compile record to compile it with}, for a source that needs another
                           object's flags (a BSD file's, bsd/DEVELOPMENT/kern_exec.o.json); C++ takes
                           iokit/DEVELOPMENT/IOPlatformExpert.cpo.json and C osfmk/DEVELOPMENT/startup.o.json otherwise
@@ -21,8 +23,11 @@ A source is a file of package/ (kits/droidvm), or tree:PATH, a path in the build
   builtin                 the build-droidvm-devices.py objects this kext replaces (left out of the kernel)
   libraries               OSBundleLibraries
   targets                 optional: the userspaces it serves, ["ios"] (the default), ["macosx"] or both (droidvm_kexts.py)
-  vtables                 optional: {class: the original class it derives from}; fileset-add-kexts.py checks that the
-                          original's slots keep their diversity, where the collection names the original (macOS)
+  vtables                 optional: {class: the original class it derives from, or [it, its ancestors...]};
+                          fileset-add-kexts.py checks that the original's slots keep their diversity, where the collection names
+                          the original (macOS); an ancestor's diversity passes in a slot the original redeclares pure
+  patch_personalities     optional: {bundle: {personality: {key: value}}}, keys set in personalities of the collection's own
+                          kexts (macOS: IOTimeSyncRootService waits for the network driver's resource)
 Each is compiled with the kernel's own compile records, as the built-in drivers are (build-droidvm-devices.py), with the starter
 package/DroidVMKextStarter.cpp, into TREE/build/droidvm-kexts/NAME/; manifest.json there lists them for fileset-add-kexts.py,
 which links them into the collection after the prelink (build-droidvm-all.py, step kernel).
@@ -97,6 +102,10 @@ def main():
         work = out / name
         work.mkdir(exist_ok=True)
         defines = ('-DDROIDVM_NATIVE_KEXT=1', '-DDROIDVM_DEVICE_DYNAMIC=1')
+        if droidvm_kexts.target(args.target) == 'macosx':
+            # The macOS kernel compiles for arm64e-apple-ios and tells its own sources apart by XNU_TARGET_OS_OSX; Apple's family
+            # headers ask TARGET_OS_OSX (macOS IOStorageFamily's IOBlockStorageDevice has three more slots under it).
+            defines += ('-UTARGET_OS_OSX', '-DTARGET_OS_OSX=1')
         objects = []
         groups = [{'sources': spec.get('sources', []), 'flags': [], 'warnings': True}, *spec.get('groups', [])]
         for group in groups:
@@ -120,7 +129,7 @@ def main():
                 raise SystemExit(f'{name}: {path} was not built')
             objects.append(path)
         starter = f'{name}Starter'
-        attach = spec['attach']
+        attach = spec.get('attach')
         if isinstance(attach, list):
             # several attach functions: one that calls them in order, for the starter to call
             caller = work / f'{name}Attach.c'
@@ -130,16 +139,22 @@ def main():
             objects.append(command(c, caller, work / f'{name}Attach.o', tree, (*LIB,)))
             attach = f'droidvm_kext_attach_{name}'
         objects.append(command(cpp, tree / 'kits/droidvm/DroidVMKextStarter.cpp', work / f'{starter}.o', tree,
-                               (*LIB, f'-DDROIDVM_KEXT_STARTER={starter}', f'-DDROIDVM_KEXT_ATTACH={attach}')))
+                               (*LIB, f'-DDROIDVM_KEXT_STARTER={starter}', f'-DDROIDVM_KEXT_ATTACH={attach}') if attach else
+                               (*LIB, '-DDROIDVM_KEXT_NO_STARTER=1')))
+        # The starter matches IOResources once BSD is up (IOBSD), where the board's late probe would have called the attach; a
+        # spec's own personalities (CFBundleIdentifier its bundle unless given) beside it.
+        personalities = {name: {'CFBundleIdentifier': spec['bundle'], 'IOClass': starter, 'IOProviderClass': 'IOResources',
+                                'IOResourceMatch': 'IOBSD', 'IOMatchCategory': name}} if attach else {}
+        for key, personality in spec.get('personalities', {}).items():
+            personalities[key] = {'CFBundleIdentifier': spec['bundle'], **personality}
         manifest.append({
             'name': name, 'bundle': spec['bundle'], 'version': spec['version'],
             'objects': [str(o.relative_to(out)) if o.is_relative_to(out) else str(o) for o in objects],
             'start': '_droidvm_kext_start', 'stop': '_droidvm_kext_stop',
             'libraries': spec['libraries'],
             'vtables': spec.get('vtables', {}),
-            # The starter matches IOResources once BSD is up (IOBSD), where the board's late probe would have called the attach.
-            'personalities': {name: {'CFBundleIdentifier': spec['bundle'], 'IOClass': starter, 'IOProviderClass': 'IOResources',
-                                     'IOResourceMatch': 'IOBSD', 'IOMatchCategory': name}},
+            'patch_personalities': spec.get('patch_personalities', {}),
+            'personalities': personalities,
             'sha256': {str(o): hashlib.sha256(o.read_bytes()).hexdigest() for o in objects},
         })
         print(f'{spec["bundle"]}: {len(objects)} objects')

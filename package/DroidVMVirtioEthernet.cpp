@@ -172,4 +172,6 @@ void droidvm_ethernet_input(IOService *controller, const void *frame, unsigned l
     static_cast<DroidVMVirtioEthernet *>(controller)->input(frame, length);
 }
 
+#if !DROIDVM_NET_APPLE_FAMILY   // macOS: Ethernet only (DroidVMVirtioNetIf.cpp)
 #include "DroidVMWifi.inc"
+#endif

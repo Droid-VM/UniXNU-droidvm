@@ -15,6 +15,12 @@
 // As a kext of the kernel collection (DROIDVM_NATIVE_KEXT, ipados27/kexts/DroidVMNetwork.json: the family's sources, this file,
 // the controller and the transport in one kext) OSKext registers the family's classes and the controller's as the kext loads,
 // so attach starts IONetworkStack and the controllers without a module load of its own.
+//
+// On macOS (DROIDVM_NET_APPLE_FAMILY, ipados27/kexts/DroidVMNetwork.macos.json) the collection has Apple's IONetworkingFamily, whose
+// personality starts IONetworkStack: the kext holds the controller and the transport only, there is no Wi-Fi interface, and once
+// en0 is registered the driver publishes the resource DroidVMNetwork, which the kext's spec makes IOTimeSyncRootService wait for
+// (IOTimeSyncClockManager takes its clock identifier from a network interface's address once, as it starts; without one
+// clocksyncd waits for it and WindowServer for clocksyncd).
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOService.h>
 #include <libkern/c++/OSMetaClass.h>
@@ -60,7 +66,10 @@ int droidvm_net_if_attach(const uint8_t mac[6]);
 void droidvm_net_if_input(const void *frame, unsigned length);
 }
 
-static IOService *droidvm_net_nic, *droidvm_net_wifi;
+static IOService *droidvm_net_nic;
+#if !DROIDVM_NET_APPLE_FAMILY
+static IOService *droidvm_net_wifi;
+#endif
 
 // A built-in nub for a controller: IONetworkInterface turns its "built-in" into IOBuiltin.
 static IOService *droidvm_net_nub(const char *name, IOService *resources) {
@@ -78,6 +87,7 @@ static IOService *droidvm_net_nub(const char *name, IOService *resources) {
     return nub;
 }
 
+#if !DROIDVM_NET_APPLE_FAMILY
 static IOService *droidvm_net_start_service(const char *class_name, IOService *provider) {
     const OSSymbol *name = OSSymbol::withCString(class_name);
     OSObject *object = name ? OSMetaClass::allocClassWithName(name) : nullptr;
@@ -98,6 +108,7 @@ static IOService *droidvm_net_start_service(const char *class_name, IOService *p
     }
     return service;
 }
+#endif
 
 int droidvm_net_if_attach(const uint8_t mac[6]) {
     IOService *resources = IOService::getResourceService();
@@ -113,7 +124,9 @@ int droidvm_net_if_attach(const uint8_t mac[6]) {
     droidvm_net_family_status = 0;   // registered as the kext loaded
 #endif
     droidvm_net_if_stage = 2;
+#if !DROIDVM_NET_APPLE_FAMILY
     if (!droidvm_net_start_service("IONetworkStack", resources)) return -1;
+#endif
     droidvm_net_if_stage = 3;
     IOService *nub = droidvm_net_nub("droidvm-net", resources);
     if (!nub) return -1;
@@ -122,6 +135,16 @@ int droidvm_net_if_attach(const uint8_t mac[6]) {
     if (!droidvm_net_nic) return -1;
     droidvm_net_controller = (uintptr_t)droidvm_net_nic;
     droidvm_net_if_stage = 5;
+#if DROIDVM_NET_APPLE_FAMILY
+    // attachInterface registers the interface asynchronously: registered before IOTimeSync looks for it
+    if (OSDictionary *match = IOService::serviceMatching("IOEthernetInterface")) {
+        IOService *found = IOService::waitForMatchingService(match, 5000ULL * 1000 * 1000);
+        OSSafeReleaseNULL(found);
+        match->release();
+    }
+    IOService::publishResource("DroidVMNetwork");
+    return 0;
+#else
     // the Wi-Fi interface (DroidVMWifi.inc), after the Ethernet one so the Ethernet keeps the first unit; its address is the device
     // tree's /chosen/mac-address-wifi0, as an iPad's is (else the virtio one with the top bit of the last byte flipped).
     // droidvm-wifi=0 leaves it out.
@@ -140,6 +163,7 @@ int droidvm_net_if_attach(const uint8_t mac[6]) {
         droidvm_net_if_stage = droidvm_net_wifi ? 6 : 7;
     }
     return 0;
+#endif
 }
 
 void droidvm_net_if_input(const void *frame, unsigned length) {

@@ -1,0 +1,32 @@
+{
+  "_comment": "macOS: the display and the GPU, as on iPadOS one kext (meta todo/macos-bringup.md). The display, as a virtual Mac's: package/macos/DroidVMDisplay.cpp (macOS-DroidVM's, 9db2f6f) is an IOMobileFramebufferLegacy of the collection's IOMobileGraphicsFamily published as AppleParavirtDisplay on an AppleParavirtGPU nub of /arm-io/display (compatible paravirtualizedgraphics,gpu: IOMobileFramebuffer.framework waits for DisplayPortCount framebuffers of such services; the collection has no Apple AppleParavirtGPU); swaps go to the virtio GPU's scanout (DroidVMVirtioGpu.cpp, heap slots) or, without it, are copied to the boot framebuffer; package/macos/IOMobileFramebufferABI.h is the 26A434 classes' ABI. The GPU: build-droidvm-gpu.py's NativeAdreno parts and DroidVMGpu.cpp (DROIDVM_GPU_MACOS), whose attach publishes NativeAdreno and the Metal accelerator, package/macos/DroidVMAccelerator.cpp's AGXAccelerator, an IOGraphicsFamily IOAccelerator; DroidVMVirtioGpu3D.cpp serves its 3D. The linker checks the display's and the accelerator's vtables against the family classes.",
+  "name": "DroidVMGraphics",
+  "bundle": "com.droidvm.driver.DroidVMGraphics",
+  "version": "1.0.0",
+  "targets": ["macosx"],
+  "groups": [
+    {"sources": ["macos/DroidVMDisplay.cpp", "DroidVMVirtioGpu.cpp", "DroidVMVirtioGpu3D.cpp"],
+     "flags": ["-I", "{tree}/kits/droidvm", "-I", "{tree}/drivers/Adreno740", "-DDROIDVM_VIRTIO_GPU_DYNAMIC=1"]}
+  ],
+  "object_lists": ["tree:build/droidvm-gpu/kext-objects.json"],
+  "attach": "sheng_gpu_power_probe",
+  "builtin": ["DroidVMGpu"],
+  "personalities": {
+    "AppleParavirtGPU": {"IOClass": "AppleParavirtGPU", "IOProviderClass": "IOPlatformDevice",
+                         "IONameMatch": "paravirtualizedgraphics,gpu", "IOProbeScore": 1000},
+    "DroidVMDisplay": {"IOClass": "AppleParavirtDisplay", "IOProviderClass": "AppleParavirtGPU"}
+  },
+  "libraries": {
+    "com.apple.iokit.IOAVFamily": "1.0.0",
+    "com.apple.iokit.IOGraphicsFamily": "1.0.0b1",
+    "com.apple.iokit.IOMobileGraphicsFamily": "1.0.0",
+    "com.apple.iokit.IOSurface": "1.0",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.private": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "vtables": {"DroidVMDisplay": ["IOMobileFramebufferLegacy", "IOMobileFramebuffer"], "AGXAccelerator": "IOAccelerator"}
+}

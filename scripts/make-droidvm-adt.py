@@ -103,6 +103,12 @@ def chosen_from_table(properties, table):
     return [p for p in properties if p[0] not in names] + added, children
 
 
+def nodes_from_table(table, parent):
+    """An --adt-table's [<parent>] beside [chosen]: {child: typed properties}, nodes below /<parent> (macOS's /arm-io/display,
+    the node IOMobileFramebuffer.framework looks for)."""
+    return [node(child, typed_properties(value, f'{parent}/{child}')) for child, value in table.get(parent, {}).items()]
+
+
 def wifi_address(unique_chip_id):
     """The Wi-Fi interface's address: locally administered (0x02 in the first byte) and stable for one unique chip ID."""
     seed = (unique_chip_id or 0x4456).to_bytes(8, 'little')
@@ -662,6 +668,7 @@ def main():
               # MobileGestalt answers wifi (Settings' Wi-Fi item) by IODeviceTree:/arm-io/wlan. No driver matches it: the Wi-Fi
               # interface is DroidVMWifi.inc's, on a nub of its own.
               *([node('wlan', [('device_type', b'wlan\0')])] if args.ipad_identity else []),
+              *nodes_from_table(adt_table, 'arm-io'),
               *([] if args.dynamic else [
                 *[node('virtio-mmio-%d' % index, [('compatible', b'virtio,mmio\0'),
                                                    ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),

@@ -98,7 +98,7 @@ def stage_late(obj, stem):
     return late
 
 
-def ionetworking():
+def ionetworking(sdk_name='iphoneos'):
     source = ROOT / '.cache/sources/IONetworkingFamily'
     if not (source / '.git').is_dir():
         source.parent.mkdir(parents=True, exist_ok=True)
@@ -108,7 +108,7 @@ def ionetworking():
     # The sources include their headers as <IOKit/network/...>; IONetworkInterface.cpp also wants the SDK's TargetConditionals.h.
     include = OUT / 'ionetworking-include'
     (include / 'IOKit/network').mkdir(parents=True, exist_ok=True)
-    sdk = Path(run(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip())
+    sdk = Path(run(['xcrun', '--sdk', sdk_name, '--show-sdk-path'], text=True).strip())
     for link, target in [*((include / 'IOKit/network' / h.name, h) for h in source.glob('*.h')),
                          (include / 'TargetConditionals.h', sdk / 'usr/include/TargetConditionals.h')]:
         link.unlink(missing_ok=True)
@@ -132,7 +132,9 @@ def main():
         rel = lambda p: str(p.relative_to(ROOT))  # noqa: E731
         (OUT / 'objects.json').write_text(json.dumps([rel(p) for p in objects], indent=2) + '\n')
         (OUT / 'sources.json').write_text(json.dumps([rel(source)], indent=2) + '\n')
-        print('devices (macOS): the scheduler trace')
+        # The network kext (DroidVMNetwork.macos.json) builds on the collection's own IONetworkingFamily: its headers.
+        ionetworking('macosx')
+        print('devices (macOS): the scheduler trace; the IONetworkingFamily headers for the network kext')
         return
     family, include = ionetworking()
     # Every compile here includes sys/systm.h first: the family includes it inside extern "C", where in this private-header

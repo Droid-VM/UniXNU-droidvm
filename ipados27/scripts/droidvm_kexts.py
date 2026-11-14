@@ -41,6 +41,6 @@ def attach_left_out(given=None):
     """The attach functions the board's late probe no longer calls."""
     found = set()
     for spec in specs(given):
-        attach = spec['attach']
+        attach = spec.get('attach') or []
         found.update(attach if isinstance(attach, list) else [attach])
     return found

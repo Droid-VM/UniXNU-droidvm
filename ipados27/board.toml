@@ -230,6 +230,12 @@ archives = [
   "component:VirtioMmioBlock",
   "component:RamBlock",
   "build-droidvm-source-storage.py",
+  # the GPU sources' checkouts linked into the tree (Adreno740's DroidVMVirtgpuABI.h: the 3D methods the display kext's
+  # DroidVMVirtioGpu3D.cpp serves; NativeAdreno for the GPU kext)
+  "link-droidvm-gpu-sources.py",
+  # NativeAdreno's user client, surface, execbuf and memory with DroidVMGpu.cpp and the macOS accelerator, for the graphics kext
+  # (its objects only: the macOS kernel links none of them)
+  "build-droidvm-gpu.py",
   "build-droidvm-devices.py",
   "build-droidvm-board-core.py",
 ]
@@ -286,6 +292,12 @@ kernel_args = [
   # launchd's mount-phase-1/2 run the owner apfs_boot_util of the Data seed (/private/var/ngpu/bootshim, shown over
   # apfs.fs/Contents/Resources: macos-apfs-boot-shim.patch): the original aborts on the read-only root container (EROFS)
   "apfs-boot-shim=1",
+  # Metal's 3D through the virtio GPU's DRM context and the accelerator for Metal's discovery (DroidVMGpu.cpp), as on iPadOS
+  "vgpu-3d=1",
+  "droidvm-gpu-metal=1",
+  # the payload's GPU addon (build-droidvm-all.py step payload): its Metal plugin written to Data's /Library/GPUBundles and protected
+  # for IOGPU's trust check (macos-gpu-bundles.patch)
+  "gpu-addon=1",
   "-v",
 ]
 

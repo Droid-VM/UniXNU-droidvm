@@ -145,7 +145,7 @@ class Build:
         self.release = self.work / 'release'
         self.ipsw = self.out / 'ipsw' / self.build_id
         self.data = self.tree / f'build/droidvm-data-{self.build_id}'
-        self.plugin = self.tree / 'build/adreno-metal-plugin27'
+        self.plugin = self.tree / ('build/adreno-metal-plugin-macos27' if self.macos else 'build/adreno-metal-plugin27')
         self.trust = self.tree / f'build/droidvm-trust-{self.build_id}'
         # PYTHONHASHSEED: Mesa's generators (the ir3 instruction encoder) emit statements in a set's iteration order, which
         # follows the interpreter's hash seed: with a fixed one, two builds of the same source give the same code.
@@ -368,17 +368,18 @@ class Build:
                                            'mesa_edited_in_place': edited, 'metal2vulkan': translator['commit']})
 
     def step_plugin(self):
-        if self.macos:
-            log('plugin: the macOS Metal plugin is not built yet')
-            return
+        # macOS: the same plugin for arm64e-apple-macos27.0 in the macOS bundle layout (Contents/MacOS), its device class an
+        # IOGPUMetalDevice (NativeMetal's IOGPUMetalDeviceShim.h); the payload's GPU addon carries it to /Library/GPUBundles
+        # (step payload, gpu-addon=1)
+        target = 'macos27' if self.macos else 'ios27'
         self.link_sources()
         self.prepare_mesa()
-        self.script('build-turnip-darwin.py', '--target', 'ios27', logfile=self.logs / 'turnip-ios27.log')
+        self.script('build-turnip-darwin.py', '--target', target, logfile=self.logs / f'turnip-{target}.log')
         # Without the prefix replay of Turnip's first submission (ADRENO_METAL_REPLAY=0): it tests NativeAdreno's own command
         # processor, which this guest does not run (its GPU is the virtio GPU), and recording it needs the host simulation of
         # that kernel stack, which does not compile at this fork's pins (Adreno740 stays at the commit the board's kernel
         # patches fit, older than the SMMU kit's on-demand tables).
-        self.script('build-adreno-metal-plugin.py', '--target', 'ios27', logfile=self.logs / 'plugin.log',
+        self.script('build-adreno-metal-plugin.py', '--target', target, logfile=self.logs / 'plugin.log',
                     env=dict(self.env, ADRENO_METAL_REPLAY='0'))
 
     # data ----------------------------------------------------------------------------------------------------------------
@@ -453,6 +454,9 @@ class Build:
         by every prelink): compiled against this kernel, then linked and added to the fileset (scripts/fileset-add-kexts.py)."""
         if not sorted((BOARD / 'kexts').glob('*.json')):
             return
+        # the prelink's tree step dropped the GPU sources' links the kernel step made: a kext compiling them (the macOS display's
+        # DroidVMVirtioGpu3D.cpp includes Adreno740's DroidVMVirtgpuABI.h) needs them again
+        self.script('link-droidvm-gpu-sources.py', logfile=self.logs / 'link-gpu-sources.log')
         self.script('build-droidvm-kexts.py', '--tree', self.tree, '--target', 'macosx' if self.macos else 'ios')
         # reviewed per-site bindings for the kernelcaches XnuPrelink has no fixture of (applied only to their own collection)
         sites = [part for path in sorted((BOARD / 'fileset-sites').glob('fileset-*-symbols.json')) for part in ('--sites', path)]
@@ -488,8 +492,18 @@ class Build:
         if not chip:
             sys.exit('the payload needs --unique-chip-id (or UNIXNU_UNIQUE_CHIP_ID): the platform seed, 16 hex digits')
         bundle = self.trust_bundle()
+        addon = []
+        if self.macos and (self.plugin / 'trust.json').is_file():
+            # macOS: the Metal plugin in the payload's GPU addon, below GPUBundles/, which the kernel writes to Data's
+            # /Library/GPUBundles and protects for IOGPU's trust check (gpu-addon=1, macos-gpu-bundles.patch); published (the render
+            # server and every client take the native device), no probe daemon
+            addon_file = self.work / 'payload/gpu-addon.bin'
+            addon_file.parent.mkdir(parents=True, exist_ok=True)
+            self.script('make-gpu-addon.py', '--publish', '--no-daemon', '--prefix', 'GPUBundles', addon_file,
+                        logfile=self.logs / 'gpu-addon.log', env=dict(self.env, ADRENO_PLUGIN_DIR=str(self.plugin)))
+            addon = ['--gpu-addon', addon_file]
         self.unixnu_cmd('build', 'payload', '--unique-chip-id', chip, '--data-ramdisk', self.data / self.seed()['seed'],
-                        '--trust-cache', bundle, logfile=self.logs / 'payload.log')
+                        '--trust-cache', bundle, *addon, logfile=self.logs / 'payload.log')
         run(['bash', REPO / 'scripts/make-droidvm-disk.sh', self.work / 'payload/payload.img', self.efi_dir(),
              self.work / 'payload/droidvm-disk.img'], env=self.env, logfile=self.logs / 'disk.log')
         self.record('payload', {'unique_chip_id': chip})

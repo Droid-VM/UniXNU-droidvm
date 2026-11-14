@@ -252,9 +252,20 @@ OSString *grantedProcesses()
 
 // sheng's publishMetal (UniXNU-sheng GpuPowerProbe.cpp): the staged AGXAccelerator class registered after the original IOGPUFamily
 // loaded, with the two keys the original Metal discovery reads and the sandbox grant (grantedProcesses).
+//
+// macOS (DROIDVM_GPU_MACOS): the accelerator is package/macos/DroidVMAccelerator.cpp's, an IOGraphicsFamily IOAccelerator, which the
+// kext registered as it loaded after its library IOGraphicsFamily; no class chain to adopt (macOS-DroidVM's WindowServer opened it
+// as it is) and no OpenGL ES renderer.
 void publishMetal()
 {
     droidvm_metal_publish[1] = 1;
+#if DROIDVM_GPU_MACOS
+    const OSSymbol *name = OSSymbol::withCString("IOAccelerator");
+    const OSMetaClass *parent = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
+    OSSafeReleaseNULL(name);
+    if (!parent || parent->getClassSize() != 136) {droidvm_metal_publish[2] = uint32_t(kIOReturnNotFound); return;}
+    droidvm_metal_publish[1] = 2;
+#else
     kern_return_t status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
     if (status) {droidvm_metal_publish[2] = uint32_t(status); return;}
     // The user client's class chain as Apple's, before the accelerator is published (no user client exists yet): the original
@@ -277,13 +288,14 @@ void publishMetal()
     status = OSMetaClass::postModLoad(handle);
     if (status) {droidvm_metal_publish[2] = uint32_t(status); return;}
 #endif   // as a kext (ipados27/kexts/DroidVMGraphics.json), AGXAccelerator registered as the kext loaded, after IOGPUFamily
-    if (native_adreno_accelerator_instance_size() != 136) {droidvm_metal_publish[2] = uint32_t(kIOReturnInvalid); return;}
-    droidvm_metal_publish[1] = 3;
     // The accelerator's chain as Apple's too, before its first instance: Apple's AGXAccelerator derives from the family's IOGPU
     // (an IOAcceleratorES), and WebKit's GPU process opens it under the sandbox extension its UI process issues for IOGPU: an
     // IOAcceleratorES alone was refused it ("deny(1) iokit-open-service AGXAccelerator"). No personality the guest loads
     // matches an IOGPU provider, so the class chain changes no matching.
     droidvm_gpu_chain = droidvm_gpu_chain | (OSMetaClassAdoptSuperclass("AGXAccelerator", "IOGPU") ? 4 : 8);
+#endif
+    if (native_adreno_accelerator_instance_size() != 136) {droidvm_metal_publish[2] = uint32_t(kIOReturnInvalid); return;}
+    droidvm_metal_publish[1] = 3;
     IOService *accelerator = native_adreno_accelerator_allocate();
     if (!accelerator) {droidvm_metal_publish[2] = uint32_t(kIOReturnNoMemory); return;}
     if (!accelerator->init()) {accelerator->release(); droidvm_metal_publish[2] = uint32_t(kIOReturnError); return;}
@@ -295,10 +307,12 @@ void publishMetal()
         accelerator->setProperty("NativeSandboxGrantProcess", "backboardd");
     }
     accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
+#if !DROIDVM_GPU_MACOS
     // OpenGL ES finds its renderer the same way: GLEngine loads the bundle this names. The stock accelerator
     // (AGXAcceleratorG9G) names AppleMetalGLRenderer, Apple's GL on Metal, which then runs on the process's Metal device.
     // Without it every EAGL context fails, and CoreImage's GL path calls through an empty dispatch table.
     accelerator->setProperty("IOGLESBundleName", "AppleMetalGLRenderer");
+#endif
     droidvm_metal_publish[1] = 4;
     if (!accelerator->attach(IOService::getPlatform())) {accelerator->release(); droidvm_metal_publish[2] = uint32_t(kIOReturnNotAttached); return;}
     accelerator->registerService();

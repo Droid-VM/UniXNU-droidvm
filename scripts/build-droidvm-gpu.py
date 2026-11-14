@@ -15,8 +15,13 @@ kernel force-loads (this board does not select CONFIG_XNU_NATIVE_ADRENO, the she
 
 When the GPU and the display are a kext of the collection (ipados27/kexts/DroidVMGraphics.json, which lists DroidVMGpu as
 builtin), kext-objects.json lists the same objects for it: the accelerator with its static initializer and DroidVMGpu.cpp
-compiled with DROIDVM_NATIVE_KEXT (build-droidvm-legacy-display.py adds them to the display's)."""
+compiled with DROIDVM_NATIVE_KEXT (build-droidvm-legacy-display.py adds them to the display's).
+
+macOS (UNIXNU_XNU_TARGET=macosx; ipados27/kexts/DroidVMGraphics.macos.json): the same NativeAdreno parts, DroidVMGpu.cpp with
+DROIDVM_GPU_MACOS, and for the accelerator package/macos/DroidVMAccelerator.cpp, an IOAccelerator of the collection's
+IOGraphicsFamily linked by name (macOS's collection keeps its symbols) instead of the staged iPadOS one; kext objects only."""
 import json
+import os
 import re
 import subprocess
 import sys
@@ -29,6 +34,7 @@ try:   # the iPadOS 27 board's kexts (ipados27/scripts/droidvm_kexts.py); the iP
     GPU_KEXT = 'DroidVMGpu' in droidvm_kexts.builtin_left_out()
 except ImportError:
     GPU_KEXT = False
+MACOS = os.environ.get('UNIXNU_XNU_TARGET') == 'macosx'
 OUT = ROOT / 'build/droidvm-gpu'
 OUT.mkdir(parents=True, exist_ok=True)
 ADRENO = ROOT / 'drivers/Adreno740'
@@ -290,17 +296,23 @@ pm4 = OUT / 'AdrenoPM4.kit.o'
 compile_with(c, ROOT / 'kits/AdrenoPM4/AdrenoPM4.c', pm4, includes + warnings)
 objects.append(pm4)
 
-print(subprocess.run(['python3', ROOT / 'scripts/build-adreno740-accelerator.py'], check=True, capture_output=True,
-                     text=True).stdout, end='')
 accelerator = ROOT / 'build/adreno740-accelerator'
-objects += [accelerator / 'NativeAdrenoAccelerator.late.o', accelerator / 'original-bindings.o']
-# An arm64e fileset (iPadOS 27) reaches the original base through owned stubs, whose absolute targets are a separate object.
-if (accelerator / 'original-addresses.o').is_file():
-    objects.append(accelerator / 'original-addresses.o')
+if MACOS:
+    macos_accelerator = OUT / 'DroidVMAccelerator.o'
+    compile_with(cxx, ROOT / 'kits/droidvm/macos/DroidVMAccelerator.cpp', macos_accelerator,
+                 includes + warnings + ['-DDROIDVM_NATIVE_KEXT=1'])
+    objects.append(macos_accelerator)
+else:
+    print(subprocess.run(['python3', ROOT / 'scripts/build-adreno740-accelerator.py'], check=True, capture_output=True,
+                         text=True).stdout, end='')
+    objects += [accelerator / 'NativeAdrenoAccelerator.late.o', accelerator / 'original-bindings.o']
+    # An arm64e fileset (iPadOS 27) reaches the original base through owned stubs, whose absolute targets are a separate object.
+    if (accelerator / 'original-addresses.o').is_file():
+        objects.append(accelerator / 'original-addresses.o')
 
 defined = subprocess.run(['xcrun', 'nm', '-g', '-U', *objects], capture_output=True, text=True, check=True).stdout
 required = ['_native_adreno_publish', '_sheng_gpu_power_probe', '_droidvm_gpu_window_base', '_AdrenoPM4Type7',
-            '_native_adreno_accelerator_allocate', '__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp',
+            '_native_adreno_accelerator_allocate', *([] if MACOS else ['__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp']),
             '__ZN14NativeAdrenoVm3mapEP18NativeAdrenoMemoryjyjjjPy', '__ZN16NativeAdrenoRing12submitFramedEPKjmPj']
 missing = [name for name in required if not any(line.endswith(' ' + name) for line in defined.splitlines())]
 if missing:
@@ -309,7 +321,8 @@ if missing:
 (OUT / 'kext-objects.json').unlink(missing_ok=True)
 if GPU_KEXT:
     hook = OUT / 'DroidVMGpu.kext.o'
-    compile_with(cxx, ROOT / 'kits/droidvm/DroidVMGpu.cpp', hook, includes + warnings + ['-DDROIDVM_NATIVE_KEXT=1'])
+    compile_with(cxx, ROOT / 'kits/droidvm/DroidVMGpu.cpp', hook,
+                 includes + warnings + ['-DDROIDVM_NATIVE_KEXT=1', *(['-DDROIDVM_GPU_MACOS=1'] if MACOS else [])])
     kext_objects = [hook if p.name == 'DroidVMGpu.o' else
                     accelerator / 'NativeAdrenoAccelerator.o' if p.name == 'NativeAdrenoAccelerator.late.o' else p for p in objects]
     (OUT / 'kext-objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in kext_objects], indent=2) + '\n')
@@ -317,5 +330,6 @@ if GPU_KEXT:
                                               sources[:-3] + [ADRENO / 'NativeAdrenoUserClient.cpp',
                                                               ADRENO / 'NativeAdrenoPublish.cpp', sources[-1],
                                                               ROOT / 'kits/AdrenoPM4/AdrenoPM4.c',
+                                                              ROOT / 'kits/droidvm/macos/DroidVMAccelerator.cpp' if MACOS else
                                                               ADRENO / 'NativeAdrenoAccelerator.cpp']], indent=2) + '\n')
 print(f'droidvm-gpu: {len(objects)} objects (NativeAdreno user client, IOKit surface, execbuf and memory; Metal over the virtio GPU)')

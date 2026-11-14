@@ -15,5 +15,7 @@ char PE_builtin_boot_args[] =
     "ml-timeout-debug-ack-scale=100 "
     // the console on the VM's UART and the serial keyboard (droidvm-serial-uarts.patch), as on iPadOS
     "serial=3 "
+    // every process may open the GPU's accelerator, the sandbox deciding (DroidVMGpu.cpp grantedProcesses), as on iPadOS
+    "droidvm-gpu-clients=* "
     // verbose boot: the console shows the kernel log until WindowServer takes the display
     "-v";

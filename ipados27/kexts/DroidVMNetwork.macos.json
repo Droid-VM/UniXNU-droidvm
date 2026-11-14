@@ -1,0 +1,28 @@
+{
+  "_comment": "macOS: the network kext on the collection's own IONetworkingFamily (its headers: build-droidvm-devices.py, IONetworkingFamily-188; __PRIVATE_SPI__ as the shipped family has the reserved slots). The controller and the transport only; no Wi-Fi interface (DroidVMVirtioNetIf.cpp). IOTimeSyncRootService waits for the resource the driver publishes once en0 is registered.",
+  "name": "DroidVMNetwork",
+  "bundle": "com.droidvm.driver.DroidVMNetwork",
+  "version": "1.0.0",
+  "targets": ["macosx"],
+  "sources": ["DroidVMVirtioNet.c"],
+  "groups": [
+    {"sources": ["DroidVMVirtioEthernet.cpp", "DroidVMVirtioNetIf.cpp"],
+     "flags": ["-include", "sys/systm.h", "-include", "{tree}/build/droidvm-devices/ionetworking-include/droidvm-mbuf-crumbs.h",
+               "-I", "{tree}/.cache/xnu-work/bsd", "-D__PRIVATE_SPI__", "-DDROIDVM_NET_APPLE_FAMILY=1",
+               "-isystem", "{tree}/build/droidvm-devices/ionetworking-include"]}
+  ],
+  "attach": "droidvm_net_start",
+  "builtin": ["DroidVMVirtioEthernet", "DroidVMVirtioNetIf", "DroidVMVirtioNet"],
+  "libraries": {
+    "com.apple.iokit.IONetworkingFamily": "1.0.0b1",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "vtables": {"DroidVMVirtioEthernet": "IOEthernetController"},
+  "patch_personalities": {
+    "com.apple.iokit.IOTimeSyncFamily": {"IOTimeSyncRootService": {"IOResourceMatch": "DroidVMNetwork"}}
+  }
+}

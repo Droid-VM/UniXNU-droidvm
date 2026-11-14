@@ -14,7 +14,8 @@
 #include <kern/thread.h>
 #include <mach/kmod.h>
 
-#if !defined(DROIDVM_KEXT_STARTER) || !defined(DROIDVM_KEXT_ATTACH)
+// DROIDVM_KEXT_NO_STARTER: the module start and stop alone, for a driver whose own personalities start it (a spec without attach).
+#if !DROIDVM_KEXT_NO_STARTER && (!defined(DROIDVM_KEXT_STARTER) || !defined(DROIDVM_KEXT_ATTACH))
 #error DROIDVM_KEXT_STARTER and DROIDVM_KEXT_ATTACH name the starter class and the driver's attach function
 #endif
 
@@ -22,6 +23,10 @@ extern "C" {
 // OSKext::start runs the kext's C++ constructors (OSRuntimeInitializeCPP) around these; the driver itself starts through IOKit.
 kern_return_t droidvm_kext_start(kmod_info_t *, void *) { return KERN_SUCCESS; }
 kern_return_t droidvm_kext_stop(kmod_info_t *, void *) { return KERN_SUCCESS; }
+}
+
+#if !DROIDVM_KEXT_NO_STARTER
+extern "C" {
 // The driver's attach function; its return value, if it has one, is not looked at here (the driver reports its own stage).
 void DROIDVM_KEXT_ATTACH(void);
 }
@@ -43,3 +48,4 @@ public:
     }
 };
 OSDefineMetaClassAndStructors(DROIDVM_KEXT_STARTER, IOService)
+#endif
