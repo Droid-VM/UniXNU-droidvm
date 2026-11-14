@@ -11,7 +11,11 @@ their own sources. The staged AGXAccelerator (build-adreno740-accelerator.py) ri
 user client is the accelerator's, which DroidVMVirtioGpu3D.cpp serves.
 
 The objects land in build/droidvm-gpu; build-native-legacy-display.py archives them into the late display archive, which the
-kernel force-loads (this board does not select CONFIG_XNU_NATIVE_ADRENO, the sheng GPU)."""
+kernel force-loads (this board does not select CONFIG_XNU_NATIVE_ADRENO, the sheng GPU).
+
+When the GPU and the display are a kext of the collection (ipados27/kexts/DroidVMGraphics.json, which lists DroidVMGpu as
+builtin), kext-objects.json lists the same objects for it: the accelerator with its static initializer and DroidVMGpu.cpp
+compiled with DROIDVM_NATIVE_KEXT (build-droidvm-legacy-display.py adds them to the display's)."""
 import json
 import re
 import subprocess
@@ -19,6 +23,12 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:   # the iPadOS 27 board's kexts (ipados27/scripts/droidvm_kexts.py); the iPadOS 17 board has none
+    import droidvm_kexts  # noqa: E402
+    GPU_KEXT = 'DroidVMGpu' in droidvm_kexts.builtin_left_out()
+except ImportError:
+    GPU_KEXT = False
 OUT = ROOT / 'build/droidvm-gpu'
 OUT.mkdir(parents=True, exist_ok=True)
 ADRENO = ROOT / 'drivers/Adreno740'
@@ -296,6 +306,13 @@ missing = [name for name in required if not any(line.endswith(' ' + name) for li
 if missing:
     sys.exit('Definitions absent: ' + ', '.join(missing))
 (OUT / 'objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in objects], indent=2) + '\n')
+(OUT / 'kext-objects.json').unlink(missing_ok=True)
+if GPU_KEXT:
+    hook = OUT / 'DroidVMGpu.kext.o'
+    compile_with(cxx, ROOT / 'kits/droidvm/DroidVMGpu.cpp', hook, includes + warnings + ['-DDROIDVM_NATIVE_KEXT=1'])
+    kext_objects = [hook if p.name == 'DroidVMGpu.o' else
+                    accelerator / 'NativeAdrenoAccelerator.o' if p.name == 'NativeAdrenoAccelerator.late.o' else p for p in objects]
+    (OUT / 'kext-objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in kext_objects], indent=2) + '\n')
 (OUT / 'sources.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in
                                               sources[:-3] + [ADRENO / 'NativeAdrenoUserClient.cpp',
                                                               ADRENO / 'NativeAdrenoPublish.cpp', sources[-1],
