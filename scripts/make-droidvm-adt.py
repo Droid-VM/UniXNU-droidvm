@@ -49,6 +49,7 @@ the hypervisor); --timebase supplies it, 19.2 MHz on every Qualcomm host seen so
 """
 from pathlib import Path
 import argparse
+import json
 import os
 import re
 import struct
@@ -68,6 +69,38 @@ def node(name, properties=(), children=()):
         result += struct.pack('<32sI', key.encode(), len(data))
         result += data + bytes(-len(data) % 4)
     return result + b''.join(children)
+
+
+ADT_TYPES = ('string', 'u32', 'u64')
+
+
+def typed_properties(table, where):
+    """[adt] properties by type, as an OS profile writes them (UniXNU's devicetree.py): string, u32, u64."""
+    result = []
+    for kind, values in table.items():
+        if kind not in ADT_TYPES:
+            raise SystemExit(f'{where}: {kind} is no property type')
+        for key, value in values.items():
+            data = (str(value).encode() + b'\0' if kind == 'string' else
+                    struct.pack('<I' if kind == 'u32' else '<Q', int(value, 0) if isinstance(value, str) else int(value)))
+            result.append((key, data))
+    return result
+
+
+def chosen_from_table(properties, table):
+    """/chosen with an --adt-table's [chosen]: its typed properties replace the tool's of the same name; any other key is a
+    child node of /chosen (macOS's asmb, the local boot policy), as UniXNU's devicetree.py (c9f4109) takes them."""
+    given = table.get('chosen', {})
+    added = typed_properties({k: v for k, v in given.items() if k in ADT_TYPES}, 'chosen')
+    names = {key for key, _ in added}
+    children = []
+    for child, value in given.items():
+        if child in ADT_TYPES:
+            continue
+        if not isinstance(value, dict):
+            raise SystemExit(f'chosen: {child} is neither a property type nor a child node')
+        children.append(node(child, typed_properties(value, f'chosen/{child}')))
+    return [p for p in properties if p[0] not in names] + added, children
 
 
 def wifi_address(unique_chip_id):
@@ -394,6 +427,9 @@ def main():
     parser.add_argument('--kernel-ctrr-to-be-enabled', type=int, choices=[0, 1], default=None,
                         help='/chosen/kernel-ctrr-to-be-enabled, which iBoot writes: 0 when nothing locks the kernel text (xnu-12377 '
                              'asserts it was given before DTrace\'s SDT probes ask ml_unsafe_kernel_text)')
+    parser.add_argument('--adt-table', type=Path, default=None,
+                        help='a JSON of the OS\'s [adt] values for /chosen ({"chosen": {"string": {...}, "u32": {...}, "asmb": '
+                             '{"u64": {...}}}}): the macOS boot volume, board id and local boot policy')
     parser.add_argument('--text-fixup', action='append', default=[], metavar='FILE,OFFSET,ORIGINAL,REPLACEMENT',
                         help="A fixup of signed text for the kernel's native-text-fixup (/chosen/text-fixups, as UniXNU's "
                              "[payload] text_fixups): the file's name, the offset in it and the bytes, in hex; repeatable")
@@ -524,6 +560,8 @@ def main():
                                    ('cluster-type', vm['cluster_types'][reg].encode() + b'\0')])
             for index, reg in enumerate(cpu_regs[:1] if args.dynamic else cpu_regs)]
     identity = identity_of(args.identity_tree) if args.identity_tree else None
+    adt_table = json.loads(args.adt_table.read_text()) if args.adt_table else {}
+    chosen_children = chosen_from_table([], adt_table)[1]
     tree = node('device-tree', [
         ('model', (identity['model'] if identity else b'iPad7,1\0') if args.ipad_identity else b'droidvm-first-boot\0'),
         *([('target-type', identity['target-type'] if identity else b'J120\0')] if args.ipad_identity else []),
@@ -537,7 +575,7 @@ def main():
     ], [
         # xnu-12377 takes 4 x 64 seed bytes on ARM and panics with fewer ("Expected 256 seed bytes from bootloader"); older
         # kernels read the first 64.
-        node('chosen', [('random-seed', os.urandom(256)),
+        node('chosen', *chosen_from_table([('random-seed', os.urandom(256)),
                         *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]
                           if args.unique_chip_id is not None else []),
                         ('osenvironment', b'main\0'),
@@ -566,12 +604,12 @@ def main():
                         # signed text the kernel changes after validating its page (native-text-fixup.patch), only where the
                         # original bytes match: NUL-separated entries, as UniXNU's devicetree.py writes [payload] text_fixups
                         *([('text-fixups', b''.join(value.encode() + b'\0' for value in args.text_fixup))] if args.text_fixup else []),
-                        *empty_nvram_proxy()],
+                        *empty_nvram_proxy()], adt_table)[:1],
              [node('memory-map', ([('PackedRAMDisk' if args.packed_data_ramdisk else 'RAMDisk', bytes(16))]
                                   if (args.data_ramdisk or args.packed_data_ramdisk) else []) +
                                  ([('TrustCache', bytes(16))] if args.trust_cache else []) +
                                  ([('RootPolicies', bytes(16))] if args.root_policies else [])),
-              node('manifest-properties')]),
+              node('manifest-properties'), *chosen_children]),
         node('cpus', children=cpus),
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', psci_method.encode() + b'\0')])]
           if len(cpus) > 1 or args.dynamic else []),

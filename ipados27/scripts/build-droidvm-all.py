@@ -126,12 +126,19 @@ class Build:
         self.args = args
         self.unixnu = args.unixnu.resolve()
         self.board = tomllib.loads((BOARD / 'board.toml').read_text())
-        self.profile_path = self.unixnu / 'profiles/os' / self.board['board']['os_profile'] / 'profile.toml'
+        # The OS profile (--os; the board's by default) and its defconfig ([package.defconfig], as unixnu --os takes it).
+        self.os_name = args.os_name or self.board['board']['os_profile']
+        override = self.board.get('os_overrides', {}).get(self.os_name, {})
+        self.defconfig = (self.board.get('package', {}).get('defconfig', {}).get(self.os_name)
+                          or override.get('kernel', {}).get('defconfig') or self.board['kernel']['defconfig'])
+        self.profile_path = self.unixnu / 'profiles/os' / self.os_name / 'profile.toml'
         self.profile = tomllib.loads(self.profile_path.read_text())
+        # macOS 27 (meta todo/macos-bringup.md): no iPadOS tools, its Metal plugin not yet, its Data seed made as root
+        # (scripts/make-droidvm-macos-seed.py, run with sudo; --generation takes it), the kexts and reviewed sites of macOS.
+        self.macos = self.profile['os'].get('target') == 'macosx'
         self.build_id = self.profile['ipsw']['build']
         self.out = Path(os.environ.get('UNIXNU_OUT', self.unixnu / 'out')).resolve()
-        self.work = (self.out / self.board['board']['name'] / self.board['board']['os_profile']
-                     / self.board['kernel']['defconfig'].removesuffix('_defconfig'))
+        self.work = self.out / self.board['board']['name'] / self.os_name / self.defconfig.removesuffix('_defconfig')
         self.tree = self.work / 'tree'
         self.stamps = self.work / 'build-all'
         self.logs = self.work / 'build-all/logs'
@@ -149,7 +156,8 @@ class Build:
 
     def unixnu_cmd(self, *arguments, logfile=None):
         env = dict(self.env, UNIXNU_OUT=str(self.out))
-        return run([self.unixnu / 'unixnu', arguments[0], '-D', BOARD, *arguments[1:]], cwd=self.unixnu, env=env, logfile=logfile)
+        return run([self.unixnu / 'unixnu', arguments[0], '-D', BOARD, '--os', self.os_name, *arguments[1:]], cwd=self.unixnu,
+                   env=env, logfile=logfile)
 
     def script(self, name, *arguments, logfile=None, check=True, env=None):
         """A script of the assembled tree (UniXNU's scripts with this board's on top), run from the tree."""
@@ -208,7 +216,7 @@ class Build:
             for source in sorted(self.args.ipsw_cache.resolve().iterdir()):
                 if source.is_file() and not source.name.endswith('.partial') and not (self.ipsw / source.name).exists():
                     clone(source, self.ipsw / source.name)
-        self.unixnu_cmd('defconfig', self.board['kernel']['defconfig'])
+        self.unixnu_cmd('defconfig', self.defconfig)
         self.unixnu_cmd('fetch', '--update', logfile=self.logs / 'fetch.log')
         self.unixnu_cmd('ipsw', 'fetch', logfile=self.logs / 'ipsw-fetch.log')
         self.unixnu_cmd('ipsw', 'fetch', *IPSW_COMPONENTS, logfile=self.logs / 'ipsw-fetch-members.log')
@@ -271,6 +279,9 @@ class Build:
 
     # tools ---------------------------------------------------------------------------------------------------------------
     def step_tools(self):
+        if self.macos:
+            log('tools: none for macOS yet (the iPadOS tools are arm64e-apple-ios)')
+            return
         self.link_sources()            # gfxprobe takes NativeAdreno's headers from the tree
         # feeds.toml's pins (reference sources: a schema 2 tree takes kits only from the catalog); applebox's over the one in
         # ownervisor's build.py
@@ -357,6 +368,9 @@ class Build:
                                            'mesa_edited_in_place': edited, 'metal2vulkan': translator['commit']})
 
     def step_plugin(self):
+        if self.macos:
+            log('plugin: the macOS Metal plugin is not built yet')
+            return
         self.link_sources()
         self.prepare_mesa()
         self.script('build-turnip-darwin.py', '--target', 'ios27', logfile=self.logs / 'turnip-ios27.log')
@@ -380,6 +394,10 @@ class Build:
             clone(source / record['seed'], self.data / record['seed'])
             shutil.copyfile(source / 'seed.json', self.data / 'seed.json')
             origin = str(source)
+        elif self.macos:
+            sys.exit('macOS: the Data seed keeps root and service accounts as owners, so it is made as root on the Mac: '
+                     'sudo python3 ipados27/scripts/make-droidvm-macos-seed.py --tree ' + str(self.tree) + ' --ipsw ' + str(self.ipsw)
+                     + ' --output GENERATION_DIR, then --generation GENERATION_DIR')
         else:
             self.link_sources()
             run(['python3', BOARD / 'scripts/build-droidvm-data-seed.py', '--tree', self.tree, '--profile', self.profile_path,
@@ -422,9 +440,11 @@ class Build:
         self.apply_data_uuid()
         self.unixnu_cmd('build', 'kernel', logfile=self.logs / 'kernel.log')
         self.record('kernel-data-uuid', {'volume_uuid': self.seed()['volume_uuid']})
-        # What the matcher leaves unpaired and this kernel's boot reaches (fileset-reviewed.json), then the collection again.
-        self.script('apply-fileset-reviewed.py', '--tree', self.tree, '--map', self.work / 'kernel/kernel.map.json',
-                    '--reviewed', BOARD / 'fileset-reviewed.json')
+        # What the matcher leaves unpaired and this kernel's boot reaches (fileset-reviewed.json, 24A446's), then the collection
+        # again. A macOS collection keeps its symbols and pairs by name.
+        if not self.macos:
+            self.script('apply-fileset-reviewed.py', '--tree', self.tree, '--map', self.work / 'kernel/kernel.map.json',
+                        '--reviewed', BOARD / 'fileset-reviewed.json')
         self.unixnu_cmd('build', 'prelink', logfile=self.logs / 'prelink.log')
         self.add_kexts()
 
@@ -433,19 +453,22 @@ class Build:
         by every prelink): compiled against this kernel, then linked and added to the fileset (scripts/fileset-add-kexts.py)."""
         if not sorted((BOARD / 'kexts').glob('*.json')):
             return
-        self.script('build-droidvm-kexts.py', '--tree', self.tree)
+        self.script('build-droidvm-kexts.py', '--tree', self.tree, '--target', 'macosx' if self.macos else 'ios')
+        # reviewed per-site bindings for the kernelcaches XnuPrelink has no fixture of (applied only to their own collection)
+        sites = [part for path in sorted((BOARD / 'fileset-sites').glob('fileset-*-symbols.json')) for part in ('--sites', path)]
         kernel = self.work / 'kernel'
         native = json.loads((kernel / 'kernel.json').read_text())['native']
         staged = kernel / 'kernel.kexts.macho'
         staged.unlink(missing_ok=True)
         self.script('fileset-add-kexts.py', '--tree', self.tree, '--fileset', kernel / 'kernel.macho', '--native', native,
                     '--manifest', self.tree / 'build/droidvm-kexts/manifest.json', '--output', staged,
-                    '--report', kernel / 'kexts.json')
+                    '--report', kernel / 'kexts.json', *sites)
         staged.replace(kernel / 'kernel.macho')
 
     # trust ---------------------------------------------------------------------------------------------------------------
     def trust_records(self):
-        records = [self.plugin / 'trust.json', *sorted((self.tree / 'build/owner-trust-extra').glob('*.json'))]
+        records = [*([self.plugin / 'trust.json'] if (self.plugin / 'trust.json').is_file() or not self.macos else []),
+                   *([] if self.macos else sorted((self.tree / 'build/owner-trust-extra').glob('*.json')))]
         if self.args.generation:
             records += sorted((self.args.generation.resolve() / 'trust').glob('*.json'))
         return records
@@ -460,8 +483,10 @@ class Build:
         chip = self.args.unique_chip_id
         if not chip:
             sys.exit('the payload needs --unique-chip-id (or UNIXNU_UNIQUE_CHIP_ID): the platform seed, 16 hex digits')
+        # the bundle with the owner's module, or the IPSW's own modules alone when no owner record exists (macOS, for now)
+        bundle = self.trust / ('owner.bundle' if self.trust_records() else 'original.bundle')
         self.unixnu_cmd('build', 'payload', '--unique-chip-id', chip, '--data-ramdisk', self.data / self.seed()['seed'],
-                        '--trust-cache', self.trust / 'owner.bundle', logfile=self.logs / 'payload.log')
+                        '--trust-cache', bundle, logfile=self.logs / 'payload.log')
         run(['bash', REPO / 'scripts/make-droidvm-disk.sh', self.work / 'payload/payload.img', self.efi_dir(),
              self.work / 'payload/droidvm-disk.img'], env=self.env, logfile=self.logs / 'disk.log')
         self.record('payload', {'unique_chip_id': chip})
@@ -484,10 +509,12 @@ class Build:
         if plugin.exists():
             shutil.rmtree(plugin)
         plugin.mkdir()
-        shutil.copytree(self.plugin / 'NativeAdrenoMetal.bundle', plugin / 'NativeAdrenoMetal.bundle', symlinks=True)
-        shutil.copyfile(self.plugin / 'adrenoprobed', plugin / 'adrenoprobed')
+        trust = {}
+        if (self.plugin / 'trust.json').is_file():   # none for macOS yet
+            shutil.copytree(self.plugin / 'NativeAdrenoMetal.bundle', plugin / 'NativeAdrenoMetal.bundle', symlinks=True)
+            shutil.copyfile(self.plugin / 'adrenoprobed', plugin / 'adrenoprobed')
+            trust = json.loads((self.plugin / 'trust.json').read_text())
         plugin_files = {str(path.relative_to(plugin)): sha256(path) for path in sorted(plugin.rglob('*')) if path.is_file()}
-        trust = json.loads((self.plugin / 'trust.json').read_text())
         tools = {path.stem: json.loads(path.read_text()).get('cdhashes')
                  for path in sorted((self.tree / 'build/owner-trust-extra').glob('*.json'))}
         checkouts = self.checkouts()
@@ -585,6 +612,8 @@ class Build:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--unixnu', type=Path, default=REPO.parent / 'UniXNU', help='the UniXNU checkout')
+    parser.add_argument('--os', dest='os_name', help='the OS profile (default: the board\'s); macos-27.0.1-26A434 builds macOS 27 '
+                        '(meta todo/macos-bringup.md)')
     parser.add_argument('--unique-chip-id', default=os.environ.get('UNIXNU_UNIQUE_CHIP_ID'),
                         help='the platform seed of the payload (16 hex digits; or UNIXNU_UNIQUE_CHIP_ID)')
     parser.add_argument('--generation', type=Path,

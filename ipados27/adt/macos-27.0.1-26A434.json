@@ -1,0 +1,25 @@
+{
+  "_comment": "/chosen of the macOS 27.0.1 guest (make-droidvm-adt.py --adt-table; board.toml [os_overrides.\"macos-27.0.1-26A434\".payload.adt]), as upstream UniXNU's macOS profile writes its [adt.chosen] (14236be). boot-uuid and apfs-preboot-uuid: the booted System volume, the OS image's (the OS profile's [root] os_volume_uuid), which kern.bootuuid and kern.apfsprebootuuid answer and launchd, logd and dyld look /System/Volumes/Preboot/<uuid> up by. board-id: VirtualMac2,1's ApBoardID (0x20; chip-id 0xFE00 is [payload.adt] chip_id). asmb: the local boot policy csr_bootstrap reads, lp-sip0 = 0 keeping every SIP protection and lp-sip1 = 1 adding CSR_ALLOW_UNAUTHENTICATED_ROOT, as `csrutil authenticated-root disable` does: the system volume carries no Apple seal manifest here, the owner-signed root policies verify every block of it.",
+  "chosen": {
+    "string": {
+      "osenvironment": "main",
+      "crypto-hash-method": "sha2-384",
+      "cryptex1-certificate-format": "x509",
+      "boot-uuid": "C73696D4-CAC4-40A0-90CB-7D0463E4E3E6",
+      "apfs-preboot-uuid": "C73696D4-CAC4-40A0-90CB-7D0463E4E3E6"
+    },
+    "u32": {
+      "board-id": 32,
+      "security-domain": 1,
+      "certificate-production-status": 0,
+      "effective-production-status-ap": 0,
+      "certificate-security-mode": 1,
+      "effective-security-mode-sep": 1,
+      "amfi-only-platform-code": 1
+    },
+    "asmb": {
+      "u64": {"lp-sip0": 0},
+      "u32": {"lp-sip1": 1}
+    }
+  }
+}

@@ -206,10 +206,11 @@ tool_args = ["--dynamic", "--boot-video-mib", "24", "--reclaim-memory", "--displ
              "--text-fixup", "dyld_shared_cache_arm64e.01,40b17b8,1fe110f1,1f011ef1"]   # cmp x8,#1080 -> cmp x8,#1920
 
 
-# macOS 27.0.1 (macOS-DroidVM's system) on this board, from the same XNU source: `unixnu build -D ipados27 --os
-# macos-27.0.1-26A434 kernel` (profiles/os/macos-27.0.1-26A434 of the fork: target macosx). The kernel takes the board's
-# shared series and the macOS one instead of ipados.series; packaging (the kernel collection with the macOS and board kexts)
-# is macOS-DroidVM's k27 tooling for now, so only the kernel tables are overridden.
+# macOS 27.0.1 (VirtualMac2,1 26A434, the system macOS-DroidVM runs) on this board, from the same XNU source and through the same
+# pipeline: `build-droidvm-all.py --os macos-27.0.1-26A434` (unixnu --os; profiles/os/macos-27.0.1-26A434 of the fork: target macosx).
+# The kernel takes the board's shared series and the macOS one instead of ipados.series; the collection is the virtual Mac's with
+# the board's macOS kexts; the disks are laid out as iPadOS's (the OS image with the SystemOS cryptex over it, Data apart, the owner
+# chain verifying them), as upstream's macOS profile boots. Plan and state: meta todo/macos-bringup.md.
 [os_overrides."macos-27.0.1-26A434".components]
 include = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "VirtioMmioBlock", "RamBlock", "VerifiedRoot"]
 
@@ -257,3 +258,36 @@ roots = [
   "com.apple.driver.AppleHIDKeyboard", "com.apple.driver.AppleInputDeviceSupport", "com.apple.driver.AppleTopCaseHIDEventDriver",
   "com.apple.driver.driverkit.serial", "com.apple.UVCService"
 ]
+
+# The macOS payload: its kernel arguments (no iPadOS display, HID, key store or GPU switches: those drivers are iPadOS's), the
+# collection, root policies (14 GiB OS image: about 133 MiB of block hashes) and seed in a larger volume, and its device tree with
+# the virtual Mac's identity (the IPSW's DeviceTree.vma2macosap) and macOS's /chosen (ipados27/adt/macos-27.0.1-26A434.json).
+[os_overrides."macos-27.0.1-26A434".payload]
+title = "DroidVM: macOS 27.0.1"
+size_mib = 640
+kernel_args = [
+  "debug=0x14e",
+  "kt_fixed_zones=120",
+  "-no_slto_panic",
+  "ml-timeout-lock-panic-scale=40",
+  "tlto_us=0",
+  "sheng-smp=1",
+  "armcpu-self-ipi=1",
+  "armcpu-spi-ipi=1",
+  "native-source-storage=1",
+  "droidvm-data-persist=2",
+  "use_contiguous_hint=0",
+  "interrupt-masked-debug-mode=0",
+  "sched_preemption_disable_debug_mode=0",
+  "droidvm-monitor=1000",
+  "owner-debug=1",
+  # the kernel console as text on the boot framebuffer and mirrored to the serial console (macos-verbose-text-console.patch)
+  "vc-text=1",
+  "-v",
+]
+
+[os_overrides."macos-27.0.1-26A434".payload.adt]
+chip_id = "FE00"                     # VirtualMac2,1 (the OS profile's [ipsw] chip_id 65024)
+tool_args = ["--dynamic", "--boot-video-mib", "24", "--reclaim-memory", "--display-gamut", "sRGB",
+             "--identity-tree", ".cache/firmware/DeviceTree.vma2macosap.im4p", "--kernel-ctrr-to-be-enabled", "0",
+             "--adt-table", "kits/droidvm/../ipados27/adt/macos-27.0.1-26A434.json"]
