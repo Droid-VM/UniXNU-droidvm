@@ -4,6 +4,12 @@ frame-pointer backtrace from every interrupt frame on the thread's kernel stack.
 import bisect, struct, sys
 sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
 import peek
+import os
+# assym.s of the kernel (the build's osfmk/.../assym.s): CPU_ACTIVE_THREAD, CPU_INT_STATE, TH_UPCB, TH_THREAD_ID
+CPU_ACTIVE_THREAD = int(os.environ.get('CPU_ACTIVE_THREAD', '48'))
+CPU_INT_STATE = int(os.environ.get('CPU_INT_STATE', '208'))
+TH_UPCB = int(os.environ.get('TH_UPCB', '280'))
+TH_THREAD_ID = int(os.environ.get('TH_THREAD_ID', '1520'))   # 1520 iPadOS 27, 1528 macOS 27
 pid, maps = peek.crosvm_maps()
 cache = {}
 def rpa(pa, n):
@@ -15,16 +21,30 @@ def page(pa):
 def q(pa): return struct.unpack_from('<Q', page(pa), pa & 0xfff)[0]
 def kva(sym): return peek.symbol(sym) - peek.KERNEL_VA + peek.KERNEL_PA
 root = q(kva('cpu_ttep'))
-def walk(va):
+T1SZ = None
+def walk(va, t1sz=None):
+    """A kernel VA through the kernel's translation table (4 KiB granule); T1SZ 26 (38-bit, iPadOS) or 25 (39-bit), found by
+    walking the address of cpu_ttep itself and comparing with the linear map of the kernel image."""
+    t1sz = t1sz or T1SZ
+    width = 64 - t1sz
+    shifts = [s for s in (39, 30, 21, 12) if s < width]
     table = root
-    for level, shift in enumerate((30, 21, 12)):
-        bits = 8 if level == 0 else 9          # T1SZ 26
+    for shift in shifts:
+        bits = min(9, width - shift)
         d = q(table + ((va >> shift) & ((1 << bits) - 1)) * 8)
         if d & 1 == 0: return None
         out = d & 0x0000fffffffff000
         if shift == 12: return out + (va & 0xfff)
         if d & 2 == 0: return out + (va & ((1 << shift) - 1))
         table = out
+for candidate in (26, 25, 17):
+    try:
+        if walk(peek.symbol('cpu_ttep'), candidate) == kva('cpu_ttep'):
+            T1SZ = candidate
+            break
+    except Exception:
+        pass
+print(f'T1SZ {T1SZ}')
 def vq(va):
     pa = walk(va); return None if pa is None else q(pa)
 def vbytes(va, n):
@@ -44,7 +64,7 @@ def sym(pc):
 
 proc_size = struct.unpack('<Q', rpa(0xfffffff00c07d188 - peek.KERNEL_VA + peek.KERNEL_PA, 8))[0]
 def describe(thread):
-    tid = vq(thread + 0x508); tro = vq(thread + 0x438); task = vq(tro + 0x28) if tro else None
+    tid = vq(thread + TH_THREAD_ID); tro = vq(thread + 0x438); task = vq(tro + 0x28) if tro else None
     name = '?'
     if task:
         proc = task - proc_size
@@ -64,9 +84,9 @@ entries = rpa(kva('CpuDataEntries'), 16 * 4)
 for cpu in range(4):
     paddr = struct.unpack_from('<Q', entries, cpu * 16)[0]
     cd = rpa(paddr, 600)
-    active, int_state = struct.unpack_from('<Q', cd, 40)[0], struct.unpack_from('<Q', cd, 192)[0]
+    active, int_state = struct.unpack_from('<Q', cd, CPU_ACTIVE_THREAD)[0], struct.unpack_from('<Q', cd, CPU_INT_STATE)[0]
     tid, name = describe(active)
-    upcb = vq(active + 272); x16 = vq(upcb + 8 + 16 * 8) if upcb else None
+    upcb = vq(active + TH_UPCB); x16 = vq(upcb + 8 + 16 * 8) if upcb else None
     print(f'== cpu{cpu}: {name} tid {tid} thread {active:#x} syscall x16 {x16 if x16 is None else hex(x16)} int_state {int_state:#x}')
     top = vq(active + 344); base = (top & ~0xfff) - 0x4000
     data = vbytes(base, (top & ~0xfff) + 0x1000 - base)

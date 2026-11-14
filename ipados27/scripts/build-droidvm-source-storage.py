@@ -139,6 +139,13 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
     # kernel's or the kext's __DATA.
     flags = ['-DNATIVE_VERIFIED_BLOCK=1', '-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1', '-DNATIVE_VERIFIED_POLICY_HANDOFF=1',
              '-DDROIDVM_DEVICE_DYNAMIC=1']
+    if os.environ.get('UNIXNU_XNU_TARGET') == 'macosx':
+        # macOS's IOStorageFamily has the vtable of its TARGET_OS_OSX headers (doLockUnlockMedia, getWriteCacheState and
+        # setWriteCacheState, doDiscard, ...), which the kernel's iOS-platform target leaves out: without TARGET_OS_OSX the
+        # source IOBlockStorageDevice's slots after doGetFormatCapacities are three short, and IOBlockStorageDriver::handleStart's
+        # call to reportRemovability (macOS slot 0x8f8) failed authentication on reportMediaState's entry (macOS-DroidVM
+        # build-native-ram-block.py: 35 slots differ without it).
+        flags += ['-UTARGET_OS_OSX', '-DTARGET_OS_OSX=1']
     late = {'IOBlockStorageDevice.cpp', 'NativeVirtioBlock.cpp', 'NativeRamBlock.cpp'}
     sources = [base, virtio, tree / 'drivers/RamBlock/NativeRamBlock.cpp',
                package / 'DroidVMSourceStorage.cpp', package / 'DroidVMSourceRootPolicies.cpp', package / 'DroidVMDataStore.c',
