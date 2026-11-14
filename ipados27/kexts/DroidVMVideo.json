@@ -3,6 +3,7 @@
   "name": "DroidVMVideo",
   "bundle": "com.droidvm.driver.DroidVMVideo",
   "version": "1.0.0",
+  "targets": ["ios", "macosx"],
   "sources": [
     "DroidVMVirtioMedia.c",
     "DroidVMVTHost.cpp",

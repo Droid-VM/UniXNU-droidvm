@@ -9,6 +9,9 @@
 #include <libkern/c++/OSKext.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
+#if DROIDVM_INPUT_MOUSE
+#include <kern/thread.h>
+#endif
 #if !DROIDVM_NATIVE_KEXT
 extern kmod_info_t g_kernel_kmod_info;
 #endif
@@ -174,6 +177,71 @@ void native_hid_input_observed(unsigned event,int result) {
     if(event<8){native_hid_input_events[event]=native_hid_input_events[event]+1;native_hid_input_results[event]=result;}
 }
 __attribute__((noinline)) void native_hid_checkpoint(void) { __asm__ volatile("" ::: "memory"); }
+#if DROIDVM_INPUT_MOUSE
+// macOS: the HID event drivers are DriverKit's (AppleUserHIDDrivers), and they can be replaced in place. kernelmanagerd, relaunched
+// after jetsam killed it as idle, activates the platform dexts again; IOKit then matches a new AppleUserHIDEventDriver to an
+// interface whose old one still holds it, the new one's open fails (an IOHIDInterface takes one client), the old one closes after,
+// and the interface is left open by nobody: IOHIDInterface::handleReport drops every report from then on. 11-15 on 5566: keyboard
+// and pointer dead from 22:12:22 on, while the motion sensors, replaced in the other order, kept working; restarting the dext process
+// brought them back. Every 2 s this looks at each device published here: an interface with a live driver that does not hold it, three
+// looks in a row, has that driver terminated and is matched afresh, and the new driver opens it.
+// droidvm_hid_watch: [0] looks, [1] interfaces found unheld, [2] drivers terminated, [3] devices watched; droidvm_hid_watch_test (poke)
+// = index + 1 closes that device's interface for its driver once, as the race leaves it, to test the repair.
+extern "C" {volatile uint32_t droidvm_hid_watch[4], droidvm_hid_watch_test;}
+static IOService *hidWatched[16];
+static uint8_t hidStrikes[16];
+static void hidWatchAdd(IOService *device) {
+    if(!device || droidvm_hid_watch[3]>=16)return;
+    device->retain();
+    hidWatched[droidvm_hid_watch[3]]=device;
+    droidvm_hid_watch[3]=droidvm_hid_watch[3]+1;
+}
+// The first live child of a service (of the class, when one is given), retained.
+static IOService *hidLiveChild(IORegistryEntry *parent,const char *className) {
+    OSIterator *it=parent->getChildIterator(gIOServicePlane);
+    if(!it)return nullptr;
+    IOService *found=nullptr;
+    while(OSObject *object=it->getNextObject()) {
+        IOService *child=OSDynamicCast(IOService,object);
+        if(child && !child->isInactive() && (!className || child->metaCast(className))){found=child;found->retain();break;}
+    }
+    it->release();
+    return found;
+}
+static void hidWatchMain(void *,wait_result_t) {
+    for(;;) {
+        IOSleep(2000);
+        droidvm_hid_watch[0]=droidvm_hid_watch[0]+1;
+        for(unsigned i=0;i<droidvm_hid_watch[3];++i) {
+            IOService *device=hidWatched[i];
+            IOService *interface=device->isInactive()?nullptr:hidLiveChild(device,"IOHIDInterface");
+            IOService *driver=interface?hidLiveChild(interface,nullptr):nullptr;
+            if(driver && droidvm_hid_watch_test==i+1) {
+                droidvm_hid_watch_test=0;
+                interface->close(driver);
+            }
+            const bool unheld=driver && !interface->isOpen(driver);
+            hidStrikes[i]=unheld?(uint8_t)(hidStrikes[i]+1):0;
+            if(hidStrikes[i]==1)droidvm_hid_watch[1]=droidvm_hid_watch[1]+1;
+            if(hidStrikes[i]>=3) {
+                hidStrikes[i]=0;
+                IOLog("DroidVMInput: %s's interface is held by no driver; rematching it\n",device->getName());
+                driver->terminate();
+                interface->registerService();
+                droidvm_hid_watch[2]=droidvm_hid_watch[2]+1;
+            }
+            OSSafeReleaseNULL(driver);OSSafeReleaseNULL(interface);
+        }
+    }
+}
+static void hidWatchStart(void) {
+    thread_t thread;
+    if(droidvm_hid_watch[3] && kernel_thread_start(&hidWatchMain,nullptr,&thread)==KERN_SUCCESS)thread_deallocate(thread);
+}
+#define HID_WATCH(device) hidWatchAdd(device)
+#else
+#define HID_WATCH(device) ((void)0)
+#endif
 void native_hid_input_probe(void) {
     unsigned enabled=0;
     if(!PE_parse_boot_argn("offline-hid-input",&enabled,sizeof(enabled)) || enabled!=1)return;
@@ -217,7 +285,7 @@ void native_hid_input_probe(void) {
                         native_hid_input_observed(7,kIOReturnError);
                         if(attached)device->detach(resource);
                         OSSafeReleaseNULL(device);native_hid_input_object=0;
-                    }
+                    } else HID_WATCH(device);
 #if DROIDVM_INPUT_MOUSE
                     // DroidVM (macOS): no digitizer. macOS makes no pointer of a touch screen, so the touch screen is an absolute pointer of
                     // its own (DroidVMPointerHid.inc), and the device above stays a plain keyboard (no sheng-touch-hid: with the touch
@@ -227,6 +295,7 @@ void native_hid_input_probe(void) {
                         IOService *touch=droidvm_pointer_hid_allocate(true);
                         bool touchStarted=touch && touch->metaCast("IOHIDDevice") && touch->init() && touch->attach(resource) && touch->start(resource);
                         if(!touchStarted && touch){touch->detach(resource);OSSafeReleaseNULL(touch);}
+                        if(touchStarted)HID_WATCH(touch);
                     }
 #else
                     unsigned touchHid=0;
@@ -245,6 +314,7 @@ void native_hid_input_probe(void) {
                         IOService *pen=native_hid_pen_allocate();
                         bool penStarted=pen && pen->metaCast("IOHIDDevice") && pen->init() && pen->attach(resource) && pen->start(resource);
                         if(!penStarted && pen){pen->detach(resource);OSSafeReleaseNULL(pen);}
+                        if(penStarted)HID_WATCH(pen);
                     }
 #if DROIDVM_INPUT_MOUSE
                     // DroidVM (macOS): the mouse (DroidVMPointerHid.inc), when the VM has one (the app's mouse mode).
@@ -252,6 +322,7 @@ void native_hid_input_probe(void) {
                         IOService *mouse=droidvm_pointer_hid_allocate(false);
                         bool mouseStarted=mouse && mouse->metaCast("IOHIDDevice") && mouse->init() && mouse->attach(resource) && mouse->start(resource);
                         if(!mouseStarted && mouse){mouse->detach(resource);OSSafeReleaseNULL(mouse);}
+                        if(mouseStarted)HID_WATCH(mouse);
                     }
 #endif
                     // DroidVM: the trackpad as a Magic Trackpad 2 (DroidVMTrackpadHid.inc), when the VM has one (DroidVMVirtioInput.c).
@@ -265,6 +336,7 @@ void native_hid_input_probe(void) {
                         IOService *trackpad=droidvm_trackpad_hid_allocate();
                         bool trackpadStarted=trackpad && trackpad->metaCast("IOHIDDevice") && trackpad->init() && trackpad->attach(resource) && trackpad->start(resource);
                         if(!trackpadStarted && trackpad){trackpad->detach(resource);OSSafeReleaseNULL(trackpad);}
+                        if(trackpadStarted)HID_WATCH(trackpad);
                     }
                     // DroidVM: the accelerometer, the gyroscope and the device orientation, as the services locationd and
                     // backboardd look for (DroidVMMotionHid.inc), when the VM has motion sensors (DroidVMVirtioInput.c).
@@ -273,6 +345,7 @@ void native_hid_input_probe(void) {
                         IOService *motion=droidvm_motion_hid_allocate(kind);
                         bool motionStarted=motion && motion->metaCast("IOHIDDevice") && motion->init() && motion->attach(resource) && motion->start(resource);
                         if(!motionStarted && motion){motion->detach(resource);OSSafeReleaseNULL(motion);}
+                        if(motionStarted)HID_WATCH(motion);
                     }
                     // The offline devices live for this bounded boot. Its
                     // service attachment and timer remain genuine live objects.
@@ -281,6 +354,9 @@ void native_hid_input_probe(void) {
         }
         OSSafeReleaseNULL(resource);OSSafeReleaseNULL(match);
     }
+#if DROIDVM_INPUT_MOUSE
+    hidWatchStart();
+#endif
     native_hid_stage=3;native_hid_checkpoint();
 }
 }

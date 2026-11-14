@@ -13,6 +13,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
 #include <IOKit/pwr_mgt/IOPM.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSSymbol.h>
 #include <libkern/c++/OSMetaClass.h>
@@ -44,6 +45,8 @@ enum : uint32_t {
     STATUS_CHARGING = 1,
     PollMs = 2000,
 };
+// IOPMPrivate.h's receivePowerNotification messages: the AC adaptor's state, kIOPMSetValue when connected.
+enum : uint32_t { SetValue = 1u << 16, SetACAdaptorConnected = 1u << 18 };
 const OSSymbol *gFullyCharged, *gRawExternal;
 }
 
@@ -53,6 +56,7 @@ class DroidVMBattery : public IOPMPowerSource {
     uintptr_t regs;
     thread_t poller;
     bool stop;
+    int rootAC = -1;   // the AC state last told to the root domain (macOS)
 public:
     bool startAt(uintptr_t registers);
     void free() override;
@@ -101,6 +105,15 @@ void DroidVMBattery::sample() {
     setCurrentCapacity(percent);
     setVoltage(volt / 1000);                                    // microvolts -> millivolts
     setAmperage((int)((int32_t)cur / 1000));                    // microamps -> milliamps (signed)
+#if defined(TARGET_OS_OSX) && TARGET_OS_OSX
+    // macOS: the root domain keeps an AC state of its own, which a Mac's battery driver sets (AppleSmartBatteryManager); powerd's
+    // "AC Power" from this source is not enough. Untold, the kernel ran on battery (IOTimeSync "Battery Powered: true", a 60 s PMRD
+    // idle timer) and the VM's display slept and locked a minute or two after every boot.
+    if (rootAC != (ac != 0)) {
+        rootAC = ac != 0;
+        if (IOPMrootDomain *root = getPMRootDomain()) root->receivePowerNotification(SetACAdaptorConnected | (ac ? SetValue : 0));
+    }
+#endif
     setAtWarnLevel(!ac && percent <= 10);
     setAtCriticalLevel(!ac && percent <= 2);
     if (gFullyCharged) setPSProperty(gFullyCharged, full ? kOSBooleanTrue : kOSBooleanFalse);

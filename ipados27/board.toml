@@ -306,6 +306,9 @@ kernel_args = [
   # iPadOS's touch collection on the keyboard device, whose service then gets the Digitizer/Touch Screen usage backboardd wants.
   "offline-hid-input=1",
   "offline-hid-home=1",
+  # WindowServer renders a frame ahead (CA_FORCE_TRIPLE_BUFFERED_LATENCY, set by the Metal plugin in the render server), as on iPadOS
+  # and as Droid-VM/macOS-DroidVM's GPU arguments: its window drags went from 60 to about 118 frames a second with it
+  "ca-triple-buffer=1",
   "-v",
 ]
 
