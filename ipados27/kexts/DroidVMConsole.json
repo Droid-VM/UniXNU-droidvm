@@ -3,6 +3,7 @@
   "name": "DroidVMConsole",
   "bundle": "com.droidvm.driver.DroidVMConsole",
   "version": "1.0.0",
+  "targets": ["ios", "macosx"],
   "sources": [
     "DroidVMVirtioConsole.c"
   ],

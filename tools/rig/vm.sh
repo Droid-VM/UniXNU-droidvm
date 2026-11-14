@@ -188,16 +188,17 @@ PY
 
 # Put the VM's display on the phone and make sure a touch reaches the guest: the first display after a restart often gets no
 # input (the earlier activity, torn down after the new one binds, seems to take the VM's input with it), a second one does.
-# The unlock swipe is the test: it must raise the guest's input event count.
+# The unlock swipe is the test: it must raise the count of finger sets the guest published (droidvm_input_published), not merely
+# of input events, which the motion sensors raise all the time.
 attach() {
   local before after
   for attempt in 1 2 3; do
     "$RIG/show-vm.sh" >/dev/null 2>&1
     sleep 5
-    before=$(python3 "$RIG/peek.py" droidvm_input_events 8 --q 2>/dev/null | awk '{print $2}')
+    before=$(python3 "$RIG/peek.py" droidvm_input_published 8 --q 2>/dev/null | awk '{print $2}')
     python3 "$RIG/input.py" unlock
     sleep 3
-    after=$(python3 "$RIG/peek.py" droidvm_input_events 8 --q 2>/dev/null | awk '{print $2}')
+    after=$(python3 "$RIG/peek.py" droidvm_input_published 8 --q 2>/dev/null | awk '{print $2}')
     [ -n "$after" ] && [ "$after" != "$before" ] && { echo "display on the phone, input reaches the guest"; return 0; }
   done
   echo "display on the phone, but no input reaches the guest"

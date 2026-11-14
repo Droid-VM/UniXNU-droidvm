@@ -24,6 +24,10 @@
 // reported up. A finger that lifts while one published after it stays down is therefore first moved to the end of
 // the list (still down, where it was) and the list is shortened only once the digitizer has reported that order.
 //
+// A relative mouse (the app's mouse mode: REL_X/REL_Y with BTN_LEFT) is read too where the kernel is built with DROIDVM_INPUT_MOUSE (the
+// macOS input kext, whose pointer is a mouse's): each of its frames -- the buttons held and the motion and wheel turns since the last --
+// goes to the mouse sink, which DroidVMPointerHid.inc publishes as a mouse's report. iPadOS leaves it alone, as before.
+//
 // droidvm-input=0 leaves the devices alone.
 #include <stdint.h>
 #include <stdbool.h>
@@ -68,14 +72,15 @@ extern int armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *),
 // unit off (1/30480 of the panel, about 0.07 px) and back the next time, as a digitizer's noise.
 #define DROIDVM_TOUCH_STILL_MS 8
 
-enum { EV_SYN = 0, EV_KEY = 1, EV_ABS = 3 };
+enum { EV_SYN = 0, EV_KEY = 1, EV_REL = 2, EV_ABS = 3 };
 enum { SYN_REPORT = 0, ABS_X = 0, ABS_Y = 1, ABS_Z = 2, ABS_RZ = 5, ABS_PRESSURE = 0x18, ABS_DISTANCE = 0x19, ABS_TILT_X = 0x1a,
        ABS_TILT_Y = 0x1b, ABS_MT_SLOT = 0x2f, ABS_MT_TOUCH_MAJOR = 0x30, ABS_MT_TOUCH_MINOR = 0x31, ABS_MT_POSITION_X = 0x35,
        ABS_MT_POSITION_Y = 0x36, ABS_MT_TOOL_TYPE = 0x37, ABS_MT_TRACKING_ID = 0x39, MT_TOOL_PALM = 2,
        BTN_LEFT = 0x110, BTN_TOOL_PEN = 0x140, BTN_TOOL_RUBBER = 0x141, BTN_TOUCH = 0x14a, BTN_STYLUS = 0x14b, BTN_STYLUS2 = 0x14c,
-       INPUT_PROP_POINTER = 0, INPUT_PROP_DIRECT = 1, INPUT_PROP_ACCELEROMETER = 6, KEY_ENTER = 28, KEY_A = 30 };
+       INPUT_PROP_POINTER = 0, INPUT_PROP_DIRECT = 1, INPUT_PROP_ACCELEROMETER = 6, KEY_ENTER = 28, KEY_A = 30,
+       REL_X = 0, REL_Y = 1, REL_HWHEEL = 6, REL_WHEEL = 8, BTN_EXTRA = 0x114 };
 enum { CFG_ID_NAME = 1, CFG_PROP_BITS = 0x10, CFG_EV_BITS = 0x11, CFG_ABS_INFO = 0x12 };
-enum { KIND_NONE, KIND_TOUCH, KIND_POINTER, KIND_KEYBOARD, KIND_MOTION, KIND_PEN, KIND_TRACKPAD };
+enum { KIND_NONE, KIND_TOUCH, KIND_POINTER, KIND_KEYBOARD, KIND_MOTION, KIND_PEN, KIND_TRACKPAD, KIND_MOUSE };
 // The pen's axes past ABS_X/Y, in its state and axis arrays.
 enum { PEN_PRESSURE, PEN_DISTANCE, PEN_TILT_X, PEN_TILT_Y, PEN_AXES };
 // What the pen sink gets (NativeHidInput's report 4 and its dispatch wrapper): flags (1 in range, 2 the tip touches, 4 the barrel
@@ -147,16 +152,19 @@ struct droidvm_input {
     int32_t res_x, res_y, major_min, major_span;
     struct droidvm_trackpad_contact trackpad_last[DROIDVM_INPUT_SLOTS];
     unsigned trackpad_last_count;
+    // A mouse: its buttons held (bit 0 left, 1 right, 2 middle, 3 side, 4 extra) and the motion and wheel turns since its last frame.
+    uint8_t mouse_buttons;
+    int32_t mouse_motion[4];           // x, y, wheel, horizontal wheel
 };
 static struct droidvm_input droidvm_inputs[DROIDVM_INPUT_DEVICES];
 static unsigned droidvm_input_count;
 
-// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 4 motion, 5 pen, 6 trackpad, 0 left
-// alone), events and frames seen, keyboard, pen and trackpad reports sent.
+// For the host rig (peek.py): devices found, recognised (kinds: 1 touch, 2 pointer, 3 keyboard, 4 motion, 5 pen, 6 trackpad, 7 mouse,
+// 0 left alone), events and frames seen, keyboard, pen, trackpad and mouse reports sent.
 volatile uint32_t droidvm_input_found, droidvm_input_started, droidvm_input_kinds[DROIDVM_INPUT_DEVICES];
 volatile uint64_t droidvm_input_events, droidvm_input_frames, droidvm_input_published, droidvm_input_key_reports,
     droidvm_input_still,   // publications of a held finger set (touch_still)
-    droidvm_input_pen_reports, droidvm_input_trackpad_reports;
+    droidvm_input_pen_reports, droidvm_input_trackpad_reports, droidvm_input_mouse_reports;
 // The devices' interrupts: [0] taken (each wakes the worker), [1] the worker's sleeps, [2] of those ended by their guard or the
 // held-finger step, [3] guard ends whose look found a frame (an interrupt that never came), [4] devices attached. The worker
 // polled every 4 ms before: 250 wakes a second of a vCPU with nothing to read on a still screen. droidvm_input_irq 0: poll so
@@ -344,6 +352,11 @@ static unsigned input_identify(struct droidvm_input *d) {
         (input_bit(keys, nkeys, BTN_LEFT) || input_bit(keys, nkeys, BTN_TOUCH)) &&
         input_axis(d, ABS_X, &d->min_x, &d->span_x) && input_axis(d, ABS_Y, &d->min_y, &d->span_y))
         return KIND_POINTER;
+#if DROIDVM_INPUT_MOUSE
+    uint8_t rel[2] = {0};
+    unsigned nrel = input_config(d, CFG_EV_BITS, EV_REL, rel, sizeof(rel));
+    if (input_bit(rel, nrel, REL_X) && input_bit(rel, nrel, REL_Y) && input_bit(keys, nkeys, BTN_LEFT)) return KIND_MOUSE;
+#endif
     if (input_bit(keys, nkeys, KEY_A) && input_bit(keys, nkeys, KEY_ENTER)) return KIND_KEYBOARD;
     if (input_bit(props, nprops, INPUT_PROP_ACCELEROMETER) && input_bit(abs, nabs, ABS_X) && input_bit(abs, nabs, ABS_Y) &&
         input_bit(abs, nabs, ABS_Z))
@@ -708,6 +721,24 @@ static void trackpad_publish(struct droidvm_input *d) {
     droidvm_input_trackpad_reports = droidvm_input_trackpad_reports + 1;
 }
 
+// A mouse's frame to DroidVMPointerHid.inc's mouse (DROIDVM_INPUT_MOUSE): {buttons, x, y, wheel, horizontal wheel}, the motion and the
+// wheel turns since the last frame. Without the sink (no such device) the frame is dropped.
+static void (*droidvm_mouse_sink)(void *, const int32_t *);
+static void *droidvm_mouse_sink_context;
+void native_mouse_set_sink(void (*sink)(void *, const int32_t *), void *context) {
+    droidvm_mouse_sink_context = context;
+    __atomic_store_n(&droidvm_mouse_sink, sink, __ATOMIC_RELEASE);
+}
+
+static void mouse_publish(struct droidvm_input *d) {
+    const int32_t frame[5] = {d->mouse_buttons, d->mouse_motion[0], d->mouse_motion[1], d->mouse_motion[2], d->mouse_motion[3]};
+    memset(d->mouse_motion, 0, sizeof(d->mouse_motion));
+    void (*sink)(void *, const int32_t *) = __atomic_load_n(&droidvm_mouse_sink, __ATOMIC_ACQUIRE);
+    if (!sink) return;
+    sink(droidvm_mouse_sink_context, frame);
+    droidvm_input_mouse_reports = droidvm_input_mouse_reports + 1;
+}
+
 static bool input_event(struct droidvm_input *d, const struct droidvm_input_event *e) {
     droidvm_input_events = droidvm_input_events + 1;
     if (e->type == EV_SYN) return e->code == SYN_REPORT;
@@ -738,6 +769,14 @@ static bool input_event(struct droidvm_input *d, const struct droidvm_input_even
         if (e->type == EV_ABS && e->code == ABS_X) d->pointer_x = e->value;
         else if (e->type == EV_ABS && e->code == ABS_Y) d->pointer_y = e->value;
         else if (e->type == EV_KEY && (e->code == BTN_LEFT || e->code == BTN_TOUCH)) d->pointer_down = e->value != 0;
+    } else if (d->kind == KIND_MOUSE && e->type == EV_REL) {
+        if (e->code == REL_X) d->mouse_motion[0] += e->value;
+        else if (e->code == REL_Y) d->mouse_motion[1] += e->value;
+        else if (e->code == REL_WHEEL) d->mouse_motion[2] += e->value;
+        else if (e->code == REL_HWHEEL) d->mouse_motion[3] += e->value;
+    } else if (d->kind == KIND_MOUSE && e->type == EV_KEY && e->code >= BTN_LEFT && e->code <= BTN_EXTRA && e->value != 2) {
+        const uint8_t bit = (uint8_t)(1u << (e->code - BTN_LEFT));   // BTN_LEFT, RIGHT, MIDDLE, SIDE, EXTRA: HID buttons 1-5
+        d->mouse_buttons = e->value ? (uint8_t)(d->mouse_buttons | bit) : (uint8_t)(d->mouse_buttons & ~bit);
     } else if (d->kind == KIND_KEYBOARD && e->type == EV_KEY && e->value != 2) {
         keyboard_key(d, e->code, e->value != 0);
     } else if (d->kind == KIND_MOTION && e->type == EV_ABS && e->code <= ABS_RZ) {
@@ -783,6 +822,7 @@ static void input_poll(struct droidvm_input *d) {
                 else if (d->kind == KIND_MOTION) motion_publish(d);
                 else if (d->kind == KIND_PEN) pen_publish(d);
                 else if (d->kind == KIND_TRACKPAD) trackpad_publish(d);
+                else if (d->kind == KIND_MOUSE) mouse_publish(d);
                 else touch_frame();
             }
             available[2 + (head + returned) % d->size] = (uint16_t)id;
@@ -867,11 +907,15 @@ static void droidvm_input_worker(void *parameter, wait_result_t result) {
     }
 }
 
-static bool droidvm_motion_found, droidvm_pen_found;
+static bool droidvm_motion_found, droidvm_pen_found, droidvm_mouse_found;
 static const struct droidvm_input *droidvm_trackpad;
 
 // Whether the VM has a pen: HidInputProbe.cpp publishes the pen digitizer then (after droidvm_input_start, as for the motion
 // sensors).
+bool droidvm_mouse_present(void) {
+    return droidvm_mouse_found;
+}
+
 bool droidvm_pen_present(void) {
     return droidvm_pen_found;
 }
@@ -938,12 +982,13 @@ void droidvm_input_start(void) {
         }
         printf("droidvm input %s: %s, %s\n", path, droidvm_input_names[d->index], d->kind == KIND_TOUCH ? "touch" :
                d->kind == KIND_POINTER ? "pointer" : d->kind == KIND_MOTION ? "motion sensors" : d->kind == KIND_PEN ? "pen" :
-               d->kind == KIND_TRACKPAD ? "trackpad" : "keyboard");
+               d->kind == KIND_TRACKPAD ? "trackpad" : d->kind == KIND_MOUSE ? "mouse" : "keyboard");
         if (d->kind == KIND_MOTION) {
             droidvm_motion_register();
             droidvm_motion_found = true;
         }
         if (d->kind == KIND_PEN) droidvm_pen_found = true;
+        if (d->kind == KIND_MOUSE) droidvm_mouse_found = true;
         if (d->kind == KIND_TRACKPAD && !droidvm_trackpad) droidvm_trackpad = d;
         // The window's interrupt (DarwinBoot copies it from the FDT); without one the worker keeps polling.
         if (SecureDTGetProperty(node, "droidvm,intid", &value, &size) == kSuccess && size == sizeof(uint32_t)) {

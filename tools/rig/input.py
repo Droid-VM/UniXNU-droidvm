@@ -34,19 +34,22 @@ def adb(*command):
 
 
 def transform():
-    """(scale x, scale y, offset x, offset y) of the composited VM display surface; without one, the whole screen."""
+    """(scale x, scale y, offset x, offset y) of the composited VM display surface; without one, the whole screen. A surface the
+    guest has not drawn into yet (a display that is off, as a macOS guest's after its display sleep) has no visible buffer layer:
+    then its background layer, which SurfaceFlinger lays out on the same guest-pixel scale."""
     lines = adb('dumpsys', 'SurfaceFlinger').splitlines()
-    for at, line in enumerate(lines):
-        if not ('SurfaceView[cn.classfun.droidvm/' in line and 'VMNativeDisplayActivity' in line and '(BLAST)' in line
-                and line.lstrip().startswith('Layer [')):
-            continue
-        # The layer's block: its lines up to the next layer. Earlier instances of the activity leave invisible surfaces.
-        for following in lines[at + 1:at + 6]:
-            if following.lstrip().startswith('Layer [') or 'invisible' in following:
-                break
-            found = re.search(r'toDisplayTransform=\{ scale x=([\d.]+) y=([\d.]+)\s+tx=([-\d.]+) ty=([-\d.]+)', following)
-            if found:
-                return tuple(float(v) for v in found.groups())
+    for kind in ('(BLAST)', 'Background for '):
+        for at, line in enumerate(lines):
+            if not ('SurfaceView[cn.classfun.droidvm/' in line and 'VMNativeDisplayActivity' in line and kind in line
+                    and line.lstrip().startswith('Layer [')):
+                continue
+            # The layer's block: its lines up to the next layer. Earlier instances of the activity leave invisible surfaces.
+            for following in lines[at + 1:at + 6]:
+                if following.lstrip().startswith('Layer [') or 'invisible' in following:
+                    break
+                found = re.search(r'toDisplayTransform=\{ scale x=([\d.]+) y=([\d.]+)\s+tx=([-\d.]+) ty=([-\d.]+)', following)
+                if found:
+                    return tuple(float(v) for v in found.groups())
     width, height = map(int, adb('wm', 'size').split(':')[-1].strip().split('x'))
     return max(width, height) / GUEST_WIDTH, min(width, height) / GUEST_HEIGHT, 0.0, 0.0
 

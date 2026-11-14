@@ -112,14 +112,20 @@ using VirtioGpuHeader = DroidVMVirtioGpu::Header;
 using VirtioGpuEntry = DroidVMVirtioGpu::Entry;
 struct VirtioGpuRect {uint32_t x, y, width, height;};
 extern "C" volatile uint64_t droidvm_virtio_gpu_commands;
+// For the host rig (peek.py): why the last surface had no scanout resource -- 1 no slot free, 2 its size or memory, 3 its pages
+// (entries so far in [1]), 4 the host refused the blob -- and the pages of the last one described.
+extern "C" {volatile uint32_t droidvm_display_scanout_why[2], droidvm_display_scanout_pages;}
 // DroidVMVirtioGpu3D.cpp: the number of the latest fenced 3D submission of any client, and whether every one up to a number has finished.
 extern "C" uint64_t droidvm_virtgpu_submitted(void);
 extern "C" bool droidvm_virtgpu_finished(uint64_t);
 
 class VirtioGpu {
 public:
-    static constexpr uint32_t kRequestBytes = DroidVMVirtioGpu::MaxCommand;   // a blob's page list: 8 K entries
-    static constexpr uint32_t kMaxEntries = (kRequestBytes - 64) / sizeof(VirtioGpuEntry);
+    // A blob's page list, as long as the board's display takes (DroidVMVirtioGpu.h MaxEntries: 64 MiB in 4 KiB pages; the command
+    // goes in the transport's huge request). WindowServer's 2048x2732 'RGhA' surface is 42.7 MiB, up to 10928 pages: past the 8188 of
+    // a MaxCommand slot every frame took the CPU copy (140 ms) into the boot framebuffer, which the DroidVM app's display does not show.
+    static constexpr uint32_t kMaxEntries = DroidVMVirtioGpu::MaxEntries;
+    static_assert(64 + kMaxEntries * sizeof(VirtioGpuEntry) <= DroidVMVirtioGpu::HugeRequest, "a blob's entries fit the huge request");
     const char *start() {return DroidVMVirtioGpu::start() ? nullptr : "the transport did not start (see virtio-gpu: lines)";}
     bool ready() const {return DroidVMVirtioGpu::ready();}
     uint64_t features() const {return DroidVMVirtioGpu::features();}
@@ -850,13 +856,17 @@ DroidVMDisplay::ScanoutResource *DroidVMDisplay::scanoutResource(IOSurface *surf
         if (resource.id != fScanoutResource && (!slot || resource.used < slot->used))
             slot = &resource;
     }
-    if (!slot || !releaseResource(*slot))
+    if (!slot || !releaseResource(*slot)) {
+        droidvm_display_scanout_why[0] = 1;
         return nullptr;
+    }
     uint64_t pixelBytes = format == kVirtioFormatRGhA ? 8 : 4;
     uint64_t bytes = (offset + stride * height + 4095) & ~4095ULL;
     if (!memory || !width || !height || width > 16384 || height > 16384 || stride < width * pixelBytes || stride > 65536 ||
-        bytes > memory->getLength() || memory->prepare() != kIOReturnSuccess)
+        bytes > memory->getLength() || memory->prepare() != kIOReturnSuccess) {
+        droidvm_display_scanout_why[0] = 2;
         return nullptr;
+    }
     uint32_t count = 0;
     for (uint64_t at = 0; at < bytes;) {
         IOByteCount length = 0;
@@ -868,6 +878,8 @@ DroidVMDisplay::ScanoutResource *DroidVMDisplay::scanoutResource(IOSurface *surf
         } else {
             if (!pa || !length || length > UINT32_MAX || count == VirtioGpu::kMaxEntries || ((pa | length) & 4095)) {
                 memory->complete();
+                droidvm_display_scanout_why[0] = 3;
+                droidvm_display_scanout_why[1] = count;
                 return nullptr;
             }
             fEntries[count++] = {pa, static_cast<uint32_t>(length), 0};
@@ -879,9 +891,11 @@ DroidVMDisplay::ScanoutResource *DroidVMDisplay::scanoutResource(IOSurface *surf
         create = {{0x10c, 0, 0, 0, 0, {}}, id, 1 /* VIRTIO_GPU_BLOB_MEM_GUEST */, 8 /* crosvm: a guest handle */, count, 0, bytes};
     if (IOReturn status = fGpu.command(&create, sizeof(create), fEntries, count * sizeof(VirtioGpuEntry))) {
         IOLog("DroidVMDisplay: virtio-gpu blob of %llu bytes in %u entries: %#x\n", bytes, count, status);
+        droidvm_display_scanout_why[0] = 4;
         memory->complete();
         return nullptr;
     }
+    droidvm_display_scanout_pages = count;
     reinterpret_cast<OSObject *>(surface)->retain();
     *slot = {surface, memory, offset, ++fResourceClock, id, format, static_cast<uint32_t>(width), static_cast<uint32_t>(height),
              static_cast<uint32_t>(stride)};

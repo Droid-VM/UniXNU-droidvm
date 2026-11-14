@@ -300,6 +300,12 @@ kernel_args = [
   # the payload's GPU addon (build-droidvm-all.py step payload): its Metal plugin written to Data's /Library/GPUBundles and protected
   # for IOGPU's trust check (macos-gpu-bundles.patch)
   "gpu-addon=1",
+  # The HID devices of the input kext (HidInputProbe.cpp): the keyboard, the touch screen as an absolute pointer and the app's mouse
+  # as a mouse (DroidVMPointerHid.inc), the pen, the trackpad and the motion sensors. Without them the probe never runs and no input
+  # reaches macOS (IOHIDDevice is 208 bytes in macOS's IOHIDFamily too, the size the probe checks). No sheng-touch-hid: that puts
+  # iPadOS's touch collection on the keyboard device, whose service then gets the Digitizer/Touch Screen usage backboardd wants.
+  "offline-hid-input=1",
+  "offline-hid-home=1",
   "-v",
 ]
 

@@ -3,6 +3,7 @@
   "name": "DroidVMCpufreq",
   "bundle": "com.droidvm.driver.DroidVMCpufreq",
   "version": "1.0.0",
+  "targets": ["ios", "macosx"],
   "sources": [
     "DroidVMCpufreq.c"
   ],

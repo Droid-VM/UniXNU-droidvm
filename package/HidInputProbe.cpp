@@ -22,6 +22,10 @@ extern "C" bool droidvm_pen_present(void);
 // The trackpad's Magic Trackpad (DroidVMTrackpadHid.inc, in the iPadOS 27 board's staged NativeHidInput.cpp only).
 extern "C" IOService *droidvm_trackpad_hid_allocate(void) __attribute__((weak_import));
 extern "C" bool droidvm_trackpad_present(void);
+#if DROIDVM_INPUT_MOUSE
+extern "C" IOService *droidvm_pointer_hid_allocate(bool absolute);   // DroidVMPointerHid.inc (macOS)
+extern "C" bool droidvm_mouse_present(void);
+#endif
 extern "C" int droidvm_sensor_processor_register(void);
 extern "C" {
 extern kern_return_t OSKextLoadKextWithIdentifier(const char *);
@@ -214,6 +218,17 @@ void native_hid_input_probe(void) {
                         if(attached)device->detach(resource);
                         OSSafeReleaseNULL(device);native_hid_input_object=0;
                     }
+#if DROIDVM_INPUT_MOUSE
+                    // DroidVM (macOS): no digitizer. macOS makes no pointer of a touch screen, so the touch screen is an absolute pointer of
+                    // its own (DroidVMPointerHid.inc), and the device above stays a plain keyboard (no sheng-touch-hid: with the touch
+                    // collection it is Built-In and its service gets the Digitizer/Touch Screen usage below, for backboardd, and macOS
+                    // then took no key from it).
+                    if(started) {
+                        IOService *touch=droidvm_pointer_hid_allocate(true);
+                        bool touchStarted=touch && touch->metaCast("IOHIDDevice") && touch->init() && touch->attach(resource) && touch->start(resource);
+                        if(!touchStarted && touch){touch->detach(resource);OSSafeReleaseNULL(touch);}
+                    }
+#else
                     unsigned touchHid=0;
                     unsigned split=0;
                     PE_parse_boot_argn("sheng-touch-split",&split,sizeof(split));
@@ -223,6 +238,7 @@ void native_hid_input_probe(void) {
                         bool touchStarted=touch && touch->metaCast("IOHIDDevice") && touch->init() && touch->attach(resource) && touch->start(resource);
                         if(!touchStarted && touch){touch->detach(resource);OSSafeReleaseNULL(touch);}
                     }
+#endif
                     // DroidVM: the pen digitizer (Digitizer/Stylus, the staged NativeHidInput's third mode), when the VM has a pen
                     // (DroidVMVirtioInput.c).
                     if(started && droidvm_pen_present()) {
@@ -230,6 +246,14 @@ void native_hid_input_probe(void) {
                         bool penStarted=pen && pen->metaCast("IOHIDDevice") && pen->init() && pen->attach(resource) && pen->start(resource);
                         if(!penStarted && pen){pen->detach(resource);OSSafeReleaseNULL(pen);}
                     }
+#if DROIDVM_INPUT_MOUSE
+                    // DroidVM (macOS): the mouse (DroidVMPointerHid.inc), when the VM has one (the app's mouse mode).
+                    if(started && droidvm_mouse_present()) {
+                        IOService *mouse=droidvm_pointer_hid_allocate(false);
+                        bool mouseStarted=mouse && mouse->metaCast("IOHIDDevice") && mouse->init() && mouse->attach(resource) && mouse->start(resource);
+                        if(!mouseStarted && mouse){mouse->detach(resource);OSSafeReleaseNULL(mouse);}
+                    }
+#endif
                     // DroidVM: the trackpad as a Magic Trackpad 2 (DroidVMTrackpadHid.inc), when the VM has one (DroidVMVirtioInput.c).
                     // Its event driver is AppleTopCaseHIDEventDriver's, matched by AppleTopCaseDriverV2's personalities (the board's
                     // prelink roots): both loaded with their personalities first, as IOHIDEventDriver above.

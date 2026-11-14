@@ -1,5 +1,5 @@
 {
-  "_comment": "macOS: the input devices (keyboard, touch, pen, trackpad, motion) as on iPadOS -- NativeHidInput (build-droidvm-hid-input.py's staged ShengHidInput with the board's sinks) fed by the virtio-input transport -- linked by name against the collection's IOHIDFamily (no fixture: the macOS collection keeps its symbols); the linker checks the owned IOHIDDevice vtables against the family's.",
+  "_comment": "macOS: the input devices (keyboard, touch, pen, trackpad, motion) as on iPadOS -- NativeHidInput (build-droidvm-hid-input.py's staged ShengHidInput with the board's sinks) fed by the virtio-input transport -- linked by name against the collection's IOHIDFamily (no fixture: the macOS collection keeps its symbols); the linker checks the owned IOHIDDevice vtables against the family's. The touch screen is an absolute pointer and the app's mouse a mouse there (DroidVMPointerHid.inc): macOS makes no pointer of a digitizer.",
   "name": "DroidVMInput",
   "bundle": "com.droidvm.driver.DroidVMInput",
   "version": "1.0.0",
@@ -16,5 +16,6 @@
     "com.apple.kpi.mach": "18.0.0",
     "com.apple.kpi.unsupported": "18.0.0"
   },
-  "vtables": {"NativeHidInput": "IOHIDDevice", "DroidVMTrackpadHIDDevice": "IOHIDDevice", "AppleSPUHIDDevice": "IOHIDDevice"}
+  "vtables": {"NativeHidInput": "IOHIDDevice", "DroidVMTrackpadHIDDevice": "IOHIDDevice", "AppleSPUHIDDevice": "IOHIDDevice",
+              "DroidVMPointerHIDDevice": "IOHIDDevice"}
 }

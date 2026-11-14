@@ -3,6 +3,7 @@
   "name": "DroidVMBattery",
   "bundle": "com.droidvm.driver.DroidVMBattery",
   "version": "1.0.0",
+  "targets": ["ios", "macosx"],
   "sources": [
     "DroidVMBattery.cpp"
   ],

@@ -21,7 +21,9 @@ report.json.
 
 macOS (UNIXNU_XNU_TARGET=macosx; ipados27/kexts/DroidVMInput.macos.json): the macOS collection keeps its kexts' symbols, so the same
 objects link against IOHIDFamily's IOHIDDevice by name, as any kext, with no fixture and no bindings (fileset-add-kexts.py checks the
-owned vtables against the family's); kext objects only.
+owned vtables against the family's); kext objects only. macOS makes its pointer of mice and absolute pointers, not of a touch
+screen, so there (DROIDVM_INPUT_MOUSE) the touch screen is an absolute pointer and the app's mouse a mouse (DroidVMPointerHid.inc,
+appended as the others; DroidVMVirtioInput.c reads the mouse).
 """
 import hashlib
 import json
@@ -291,8 +293,16 @@ def stage_hid(original):
     text += ('\n// DroidVM (build-droidvm-hid-input.py): the pen digitizer, published by HidInputProbe.cpp when the VM has a pen.\n'
              'extern "C" IOService *native_hid_pen_allocate(void) {NativeHidInput *device=new NativeHidInput;'
              'if(device)device->setPenOnly();return device;}\n')
+    # macOS (DROIDVM_INPUT_MOUSE, the macOS input kext): the keyboard's HID country code, US (33). Without one macOS cannot tell an
+    # ANSI keyboard from an ISO or a JIS one and opens the Keyboard Setup Assistant at every login.
+    anchor = ('    OSString *newTransportString() const override {return OSString::withCString(touchOnly||penOnly?"SPI":"Virtual");}\n')
+    require(text.count(anchor) == 1, 'NativeHidInput.cpp no longer has exactly one ' + anchor.strip())
+    text = text.replace(anchor, anchor + '#if DROIDVM_INPUT_MOUSE\n'
+                        '    OSNumber *newCountryCodeNumber() const override {return OSNumber::withNumber(touchOnly||penOnly?0:33,32);}\n'
+                        '#endif\n')
     text += '\n' + (ROOT / 'kits/droidvm/DroidVMMotionHid.inc').read_text()
     text += '\n' + (ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc').read_text()
+    text += '\n' + (ROOT / 'kits/droidvm/DroidVMPointerHid.inc').read_text()   # macOS only (DROIDVM_INPUT_MOUSE)
     # the same file name: the late static initializer is named after it (__GLOBAL__sub_I_NativeHidInput.cpp)
     staged = OUT / 'droidvm/NativeHidInput.cpp'
     staged.parent.mkdir(exist_ok=True)
@@ -369,19 +379,20 @@ def main_macos():
         record('bsd/DEVELOPMENT/kern_exec.o.json')
     original = hid_source()
     staged = stage_hid(original)
-    kext = ('-DDROIDVM_NATIVE_KEXT=1', '-UTARGET_OS_OSX', '-DTARGET_OS_OSX=1', '-DDROIDVM_NO_LEGACY_DISPLAY=1')
+    kext = ('-DDROIDVM_NATIVE_KEXT=1', '-UTARGET_OS_OSX', '-DTARGET_OS_OSX=1', '-DDROIDVM_NO_LEGACY_DISPLAY=1', '-DDROIDVM_INPUT_MOUSE=1')
     hid_obj = OUT / 'NativeHidInput.o'
     command(cpp, staged, hid_obj, (*hid_includes, '-DNATIVE_HID_SOURCE_API=1', *kext))
     probe = ROOT / 'kits/droidvm/HidInputProbe.cpp'
     command(cpp, probe, OUT / 'HidInputProbe.kext.o', kext)
     transport = ROOT / 'kits/droidvm/DroidVMVirtioInput.c'
-    command(c_mach, transport, OUT / 'DroidVMVirtioInput.o', ('-DDROIDVM_INPUT_DYNAMIC=1',))
+    command(c_mach, transport, OUT / 'DroidVMVirtioInput.o', ('-DDROIDVM_INPUT_DYNAMIC=1', '-DDROIDVM_INPUT_MOUSE=1'))
     motion = ROOT / 'kits/droidvm/DroidVMMotion.c'
     command(c_bsd, motion, OUT / 'DroidVMMotion.o')
     kext_objects = [hid_obj, OUT / 'HidInputProbe.kext.o', OUT / 'DroidVMVirtioInput.o', OUT / 'DroidVMMotion.o']
     (OUT / 'objects.json').write_text('[]\n')   # nothing in the macOS kernel
     (OUT / 'kext-objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in kext_objects], indent=2) + '\n')
-    sources = [original, ROOT / 'kits/droidvm/DroidVMMotionHid.inc', ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc', probe, transport, motion]
+    sources = [original, ROOT / 'kits/droidvm/DroidVMMotionHid.inc', ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc',
+               ROOT / 'kits/droidvm/DroidVMPointerHid.inc', probe, transport, motion]
     (OUT / 'sources.json').write_text(json.dumps([str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p) for p in sources],
                                                  indent=2) + '\n')
     (OUT / 'report.json').write_text(json.dumps(dict(
@@ -498,7 +509,8 @@ def main():
 
     objects = [late, OUT / 'hid-bindings.o', OUT / 'hid-addresses.o', OUT / 'HidInputProbe.o', OUT / 'DroidVMVirtioInput.o',
                OUT / 'DroidVMMotion.o']
-    sources = [original, ROOT / 'kits/droidvm/DroidVMMotionHid.inc', ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc', probe, transport,
+    sources = [original, ROOT / 'kits/droidvm/DroidVMMotionHid.inc', ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc',
+               ROOT / 'kits/droidvm/DroidVMPointerHid.inc', probe, transport,
                motion, HERE / 'hid-device-24A446.json']
     (OUT / 'objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in objects], indent=2) + '\n')
     # The same driver as a kext of the collection: NativeHidInput with its static initializer, the kext form of the probe.

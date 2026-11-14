@@ -3,6 +3,7 @@
   "name": "DroidVMAudio",
   "bundle": "com.droidvm.driver.DroidVMAudio",
   "version": "1.0.0",
+  "targets": ["ios", "macosx"],
   "sources": [
     "DroidVMVirtioSnd.c",
     "DroidVMAudio.cpp"
