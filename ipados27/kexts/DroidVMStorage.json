@@ -6,6 +6,8 @@
   "object_lists": [
     "tree:build/droidvm-source-storage/kext-objects.json"
   ],
+  "vtables": {"IOBlockStorageDevice": "IOBlockStorageDevice", "NativeVirtioBlock": "IOBlockStorageDevice",
+              "NativeRamBlock": "IOBlockStorageDevice"},
   "attach": "native_source_storage_start",
   "builtin": [
     "DroidVMSourceStorage"

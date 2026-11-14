@@ -21,6 +21,8 @@ A source is a file of package/ (kits/droidvm), or tree:PATH, a path in the build
   builtin                 the build-droidvm-devices.py objects this kext replaces (left out of the kernel)
   libraries               OSBundleLibraries
   targets                 optional: the userspaces it serves, ["ios"] (the default), ["macosx"] or both (droidvm_kexts.py)
+  vtables                 optional: {class: the original class it derives from}; fileset-add-kexts.py checks that the
+                          original's slots keep their diversity, where the collection names the original (macOS)
 Each is compiled with the kernel's own compile records, as the built-in drivers are (build-droidvm-devices.py), with the starter
 package/DroidVMKextStarter.cpp, into TREE/build/droidvm-kexts/NAME/; manifest.json there lists them for fileset-add-kexts.py,
 which links them into the collection after the prelink (build-droidvm-all.py, step kernel).
@@ -134,6 +136,7 @@ def main():
             'objects': [str(o.relative_to(out)) if o.is_relative_to(out) else str(o) for o in objects],
             'start': '_droidvm_kext_start', 'stop': '_droidvm_kext_stop',
             'libraries': spec['libraries'],
+            'vtables': spec.get('vtables', {}),
             # The starter matches IOResources once BSD is up (IOBSD), where the board's late probe would have called the attach.
             'personalities': {name: {'CFBundleIdentifier': spec['bundle'], 'IOClass': starter, 'IOProviderClass': 'IOResources',
                                      'IOResourceMatch': 'IOBSD', 'IOMatchCategory': name}},

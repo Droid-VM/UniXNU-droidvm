@@ -200,6 +200,70 @@ class Collection:
         struct.pack_into('<II', self.data, 16, count + 1, size + len(command))
 
 
+def apple_symbols(collection):
+    """The defined symbols of the collection's own kexts (a macOS collection keeps them, at their addresses in it; an iPadOS one
+    has none): name -> address, and the sorted addresses."""
+    found, data = {}, collection.data
+    for name, (_, offset) in collection.root.entries.items():
+        if name == 'com.apple.kernel':
+            continue
+        ncmds, = struct.unpack_from('<I', data, offset + 16)
+        at = offset + 32
+        for _ in range(ncmds):
+            command, length = struct.unpack_from('<II', data, at)
+            if command == 0x2:                                  # LC_SYMTAB
+                symoff, nsyms, stroff, _ = struct.unpack_from('<4I', data, at + 8)
+                for index in range(nsyms):
+                    strx, ntype, _, _, value = struct.unpack_from('<IBBHQ', data, symoff + 16 * index)
+                    if ntype & 0xe0 or ntype & 0x0e != 0x0e or not value:
+                        continue
+                    end = data.index(b'\0', stroff + strx)
+                    found.setdefault(bytes(data[stroff + strx:end]).decode(errors='replace'), value)
+            at += length
+    return found, sorted(set(found.values()))
+
+
+def check_vtables(collection, checks, linked, symbols, addresses):
+    """Each of a kext's classes against the vtable of the original class it derives from ({class: parent}, the spec's
+    "vtables"): the parent's slots must keep their pointer authentication diversity in the kext's vtable, which a slot moved by
+    a header difference changes (macOS IOStorageFamily's TARGET_OS_OSX slots: IOBlockStorageDriver's call to reportRemovability
+    then failed authentication on another method's entry). Checked where the collection names the parent (macOS's); returns
+    the mismatches."""
+    def entries(vtable, count):
+        result = []
+        for index in range(count):
+            word, = struct.unpack_from('<Q', collection.data, collection.offset(vtable + 0x10 + 8 * index, 8))
+            if not word:            # past the last slot (the padding before the next symbol)
+                break
+            result.append(((word >> 32) & 0xffff) if word >> 63 else None)
+        return result
+    problems, checked = [], 0
+    for ours, parent in checks.items():
+        mine, theirs = f'__ZTV{len(ours)}{ours}', f'__ZTV{len(parent)}{parent}'
+        if theirs not in symbols:
+            if symbols:
+                problems.append(f'{ours}: the collection has no {theirs}')
+            continue
+        if mine not in linked:
+            problems.append(f'{ours}: the kext has no {mine}')
+            continue
+        start = symbols[theirs]
+        following = addresses[addresses.index(start) + 1] if addresses.index(start) + 1 < len(addresses) else start + 0x10
+        count = (following - start - 0x10) // 8
+        expected = entries(start, count)
+        count = len(expected)
+        got = entries(linked[mine], count)
+        wrong = [index for index in range(count) if index >= len(got) or expected[index] != got[index]]
+        if wrong:
+            first = wrong[0]
+            problems.append(f'{ours}: {len(wrong)} of {parent}\'s {count} slots differ, first at {8 * first:#x} (diversity '
+                            f'{got[first] if first < len(got) else "none"} for {expected[first]})')
+            continue
+        print(f'  {ours}: {parent}\'s {count} slots match')
+        checked += 1
+    return problems, checked
+
+
 def kext_header(collection, segs, linkedit, uuid_bytes):
     """MH_KEXT_BUNDLE with its four segments, the collection's shared __LINKEDIT and no symbols (macOS-DroidVM kc-build.py)."""
     prot = {'__TEXT': 1, '__TEXT_EXEC': 5, '__DATA': 3, '__DATA_CONST': 3}
@@ -353,6 +417,17 @@ def main():
                        'symbols': {n: hex(va) for n, va in sorted(linked['symbols'].items())}})
         print(f'{spec["bundle"]}: header {text_va:#x}, kmod_info {data_va:#x}, {len(sites)} pointers')
     collection.set_prelink_info(info)
+    # The kexts' classes against the original classes they derive from, where the collection names those (macOS).
+    checks = [(spec, item) for spec, item in zip(manifest['kexts'], report) if spec.get('vtables')]
+    if checks:
+        symbols, addresses = apple_symbols(collection)
+        for spec, item in checks:
+            linked = {n: int(v, 16) for n, v in item['symbols'].items()}
+            problems, checked = check_vtables(collection, spec['vtables'], linked, symbols, addresses)
+            if problems:
+                raise SystemExit(f'{spec["bundle"]}: ' + '; '.join(problems))
+            if checked:
+                print(f'{spec["bundle"]}: {checked} vtables match the original classes')
     args.output.write_bytes(bytes(collection.data))
     if args.report:
         args.report.write_text(json.dumps({'kexts': report, 'sites': bound, 'kmod_start_signing': {
