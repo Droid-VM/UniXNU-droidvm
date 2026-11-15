@@ -10,6 +10,8 @@
 //   vidcprobe FILE h264|hevc W H [-d] [-c udmabuf|heap] [-n BUFFERS] [-s STREAMON_AT] [-x]
 //     -d  decode order (DISPLAY_DELAY_ENABLE 1, DISPLAY_DELAY 0) as the DroidVM VideoToolbox host asks
 //     -x  a second SOURCE_CHANGE is followed (crosvm fails the session on one)
+//     -L  lockstep (with -d): the next access unit only once the frames are caught up, as a player feeding in real time does
+//     -P MS  poll timeout (default 100)
 //     -k  each frame read back through a mapping, without DMA_BUF_IOCTL_SYNC (as a guest reads it), and hashed: the same
 //         stream gives the same hashes into udmabufs as into dma-heap buffers when the device's writes reach the CPU
 #define _GNU_SOURCE
@@ -91,7 +93,7 @@ int main(int argc, char **argv) {
     t0 = now();
     const int hevc = !strcmp(argv[2], "hevc");
     const unsigned w = atoi(argv[3]), h = atoi(argv[4]);
-    int delay = 0, use_heap = 0, nbuf = 0, streamon_at = 0, follow = 0, check = 0;
+    int delay = 0, use_heap = 0, nbuf = 0, streamon_at = 0, follow = 0, check = 0, lockstep = 0, poll_ms = 100;
     for (int i = 5; i < argc; i++) {
         if (!strcmp(argv[i], "-d")) delay = 1;
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) use_heap = !strcmp(argv[++i], "heap");
@@ -99,6 +101,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) streamon_at = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-x")) follow = 1;
         else if (!strcmp(argv[i], "-k")) check = 1;
+        else if (!strcmp(argv[i], "-L")) lockstep = 1;
+        else if (!strcmp(argv[i], "-P") && i + 1 < argc) poll_ms = atoi(argv[++i]);
     }
     int f = open(argv[1], O_RDONLY); struct stat st; fstat(f, &st); size = st.st_size;
     data = malloc(size); if (read(f, data, size) != (ssize_t)size) return 1; close(f);
@@ -145,10 +149,10 @@ int main(int argc, char **argv) {
 
     int next = 0, fed = 0, frames = 0, errors = 0, capture_ready = 0, streaming = 0, changes = 0, drain_sent = 0, last = 0;
     unsigned min_capture = 1, ncap = 0, queued = 0; size_t caplen = 0;
-    double progress = now();
+    double progress = now(), started = now();
     while (now() - progress < 4.0 && !last) {
         struct pollfd p = { dev, POLLIN | POLLOUT | POLLPRI, 0 };
-        poll(&p, 1, 100);
+        poll(&p, 1, poll_ms);
         struct v4l2_event ev;
         while (!(r = x(VIDIOC_DQEVENT, &ev))) {
             progress = now();
@@ -209,7 +213,7 @@ int main(int argc, char **argv) {
             if (b.flags & V4L2_BUF_FLAG_ERROR) LOG("OUTPUT %u back with ERROR", b.index);
         }
         // Feed.
-        while (next < nau) {
+        while (next < nau && (!lockstep || !streaming || next <= frames + errors + 2)) {
             int slot = -1; for (unsigned i = 0; i < nbits; i++) if (!bits[i].queued) { slot = i; break; }
             if (slot < 0) break;
             size_t len = aus[next + 1] - aus[next];
@@ -270,6 +274,7 @@ int main(int argc, char **argv) {
         }
     }
 done:
+    LOG("%.1f ms for %d frames (%.1f fps)", (now() - started) * 1000, frames, frames / (now() - started));
     LOG("result: %d access units in, %d frames out, %d error frames, %d source changes%s", fed, frames, errors, changes,
         last ? ", drained" : (now() - progress >= 4.0 ? ", STALLED 4 s" : ""));
     // crosvm's teardown (Stream::drop): both queues off and emptied before the node closes.

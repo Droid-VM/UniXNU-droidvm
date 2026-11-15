@@ -13,6 +13,8 @@
 //         dma-heap buffers
 //     -q  list every control the driver has, then go on
 //     -S  stream headers in a buffer of their own (HEADER_MODE_SEPARATE; default joined with the first frame)
+//     -L  lockstep: one frame with the driver at a time, the next only after its coded frame is out (the per-frame latency)
+//     -P MS  poll timeout (default 100); -I poll for POLLIN only
 //     -2  after the drain, what crosvm's flush does (STREAMOFF + STREAMON(OUTPUT), ENC_CMD_START, the CAPTURE buffers in
 //         again), then the frames once more: the second round is written to OUT too
 #define _GNU_SOURCE
@@ -77,7 +79,7 @@ int main(int argc, char **argv) {
     t0 = now();
     const unsigned w = atoi(argv[2]), h = atoi(argv[3]);
     const int hevc = !strcmp(argv[4], "hevc");
-    int bitrate = 4000000, fps = 30, gop = 30, cbr = 0, mmapcap = 1, query = 0, separate = 0, rounds = 1;
+    int bitrate = 4000000, fps = 30, gop = 30, cbr = 0, mmapcap = 1, query = 0, separate = 0, rounds = 1, lockstep = 0, poll_ms = 100, poll_events = POLLIN | POLLOUT | POLLPRI;
     for (int i = 6; i < argc; i++) {
         if (!strcmp(argv[i], "-b") && i + 1 < argc) bitrate = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) fps = atoi(argv[++i]);
@@ -87,6 +89,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-q")) query = 1;
         else if (!strcmp(argv[i], "-S")) separate = 1;
         else if (!strcmp(argv[i], "-2")) rounds = 2;
+        else if (!strcmp(argv[i], "-L")) lockstep = 1;
+        else if (!strcmp(argv[i], "-P") && i + 1 < argc) poll_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-I")) poll_events = POLLIN;
     }
     int in = open(argv[1], O_RDONLY); struct stat st;
     if (in < 0 || fstat(in, &st)) { LOG("cannot open %s", argv[1]); return 1; }
@@ -202,8 +207,10 @@ int main(int argc, char **argv) {
     size_t bytes = 0; double first = 0, progress = now();
 again:
     while (now() - progress < 4.0 && !last) {
-        struct pollfd p = { dev, POLLIN | POLLOUT | POLLPRI, 0 };
-        poll(&p, 1, 100);
+        struct pollfd p = { dev, poll_events, 0 };
+        int pr = poll(&p, 1, poll_ms);
+        static int polls, timeouts; polls++; if (!pr) timeouts++;
+        if (lockstep && polls % 20 == 0) LOG("polls %d, %d timed out, last revents %#x", polls, timeouts, p.revents);
         struct v4l2_event ev;
         while (!x(VIDIOC_DQEVENT, &ev)) LOG("event %u", ev.type);
         for (;;) {
@@ -214,7 +221,7 @@ again:
             raws[b.index].queued = 0; progress = now();
             if (b.flags & V4L2_BUF_FLAG_ERROR) LOG("OUTPUT %u back with ERROR", b.index);
         }
-        while (next < base + nframes) {
+        while (next < base + nframes && (!lockstep || next - base == coded - (round - 1) * nframes)) {
             int slot = -1; for (unsigned i = 0; i < nraw; i++) if (!raws[i].queued) { slot = i; break; }
             if (slot < 0) break;
             const uint8_t *src = data + (size_t)(next - base) * frame;
