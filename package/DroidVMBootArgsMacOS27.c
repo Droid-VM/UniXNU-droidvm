@@ -4,8 +4,8 @@
 // takes this file instead of DroidVMBootArgs27.c for a macosx kernel). PE_parse_boot_argn and PE_parse_boot_arg_str look an argument up
 // here when the command line does not have it; the command line wins, so name=0 there turns a switch off for one boot.
 //
-// Only what does not depend on the userspace: the iPadOS file's GPU client list, App cryptex, owner data protection, VideoToolbox host
-// and staged apps are iPadOS's (macOS's equivalents come with the macOS bring-up, meta todo/macos-bringup.md).
+// Only what does not depend on the userspace, and the VideoToolbox host: the iPadOS file's App cryptex, owner data protection and
+// staged apps are iPadOS's (macOS's equivalents come with the macOS bring-up, meta todo/macos-bringup.md).
 char PE_builtin_boot_args[] =
     // the 24 MHz timebase user space expects on Apple silicon (the guest's counter runs at 19.2 MHz): DroidVMClock.c / timebase patch
     "droidvm-timebase-hz=24000000 "
@@ -17,5 +17,11 @@ char PE_builtin_boot_args[] =
     "serial=3 "
     // every process may open the GPU's accelerator, the sandbox deciding (DroidVMGpu.cpp grantedProcesses), as on iPadOS
     "droidvm-gpu-clients=* "
+    // VideoToolbox's H.264 and HEVC on the phone's codecs, as on iPadOS: Apple's paravirtualization driver published at boot
+    // (DroidVMVTParavirt.cpp; only when crosvm gives a virtio-media decoder or encoder), the guest kernel playing the host
+    // (DroidVMVTHost.cpp). Without it macOS's VideoToolbox never saw a host and decoded everything in software: the lock screen's
+    // Aerial (4096x2160 HEVC Main10, WallpaperAerials) opened no session at all after the merge. With it, 5566 11-15: the Aerial's
+    // sessions reach msm_vidc (crosvm backend=auto) in decode order and decode into the player's pool surfaces in place.
+    "droidvm-vt-paravirt=1 "
     // verbose boot: the console shows the kernel log until WindowServer takes the display
     "-v";
