@@ -88,12 +88,22 @@ extern "C" const OSMetaClass *native_source_storage_parent(void)
 #else
 #define STORAGE_BUNDLE
 #endif
+// The board's disks are its built-in ones, as a storage kext's personality says (IOStorageProtocolCharacteristics.h; the
+// personality becomes the driver's property table, where DiskArbitration looks up from each IOMedia). Without a location
+// macOS's DiskArbitration takes a disk for an external one: it defers its volumes until a console user logs in and unmounts
+// them when none is (DeferExternal), which took the App cryptex off /System/Volumes/Preboot/Cryptexes/App at the login window.
+#define STORAGE_INTERNAL \
+    "    'Protocol Characteristics' = {" \
+    "      'Physical Interconnect'          = \"Virtual Interface\";" \
+    "      'Physical Interconnect Location' = Internal;" \
+    "    };"
 static const char kPersonalities[] =
     "("
     "  {"
     "    'IOClass'         = NativeVirtioBlock;"
     "    'IOProviderClass' = IOPlatformDevice;"
     "    'IOProbeScore'    = 1000:32;"
+    STORAGE_INTERNAL
     STORAGE_BUNDLE
     "  },"
     "  {"
@@ -102,6 +112,7 @@ static const char kPersonalities[] =
     "    'IOProviderClass' = IOResources;"
     "    'IOResourceMatch' = IOBSD;"
     "    'IOProbeScore'    = 1000:32;"
+    STORAGE_INTERNAL
     STORAGE_BUNDLE
     "  }"
     ")";
