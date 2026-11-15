@@ -35,6 +35,8 @@ uint64_t returns();
 void awaitReturn(uint64_t seen, uint64_t deadlineUs);
 uint32_t resourceId();
 IOReturn unref(uint32_t);
+// The cursor plane of scanout 0: UPDATE_CURSOR with `resource` (0 hides it) when `image`, else MOVE_CURSOR; x, y on the scanout.
+IOReturn cursor(uint32_t resource, int32_t x, int32_t y, uint32_t hotX, uint32_t hotY, bool image);
 // vgpu-selftest=1: one DRM context through the host's drm2kgsl at boot (DroidVMVirtioGpu3D.cpp).
 void selftest3D();
 }

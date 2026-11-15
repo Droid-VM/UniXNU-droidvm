@@ -111,6 +111,9 @@ uint64_t negotiated, nextFence, lastReturnUs, lastIrqUs;
 uint32_t nextResource;
 uint16_t available, consumed;
 IOLock *lock;
+// The cursor queue (cursor()): one command at a time, posted and awaited under its own lock; the commands made so far.
+IOLock *cursorLock;
+uint16_t cursorAvailable;
 bool attempted;
 // Commands taken off the used ring so far: what a waiter (awaitReturn) watches for. With the lock held.
 uint64_t returned;
@@ -290,6 +293,7 @@ bool start() {
     }
     if (!physical(hugeRequest, HugeRequest, hugeRequestPA)) return fail("noncontiguous command buffers");
     lock = IOLockAlloc(); if (!lock) return fail("no lock");
+    cursorLock = IOLockAlloc(); if (!cursorLock) return fail("no cursor lock");
     // Reset the firmware's queues before replacing any descriptor addresses.
     wr(0x70, 0);
     for (unsigned i = 0; rd(0x70); ++i) { if (i == 1000) return fail("reset timeout"); IODelay(1000); }
@@ -536,6 +540,35 @@ IOReturn command(const void *data, uint32_t size, const void *extra, uint32_t ex
     result = wait(ticket, 5000000, reply, capacity, actual);
     if (result == kIOReturnTimeout) IOLog("virtio-gpu: command %x timed out\n", reinterpret_cast<const Header *>(data)->type);
     return result;
+}
+// UPDATE_CURSOR (image: the resource's pixels are new, or it is hidden) or MOVE_CURSOR on scanout 0, on the cursor queue: its one
+// descriptor at the queue's 512, the device's answer awaited (virtio-gpu has none for these, it returns the buffer). From
+// macOS-DroidVM's 0002-virtio-gpu-cursor-queue.patch (b29557d).
+IOReturn cursor(uint32_t resource, int32_t x, int32_t y, uint32_t hotX, uint32_t hotY, bool image) {
+    if (!ready()) return kIOReturnNotReady;
+    struct Command { Header h; uint32_t scanout; int32_t x, y; uint32_t padding, resource, hotX, hotY, padding2; };
+    IOLockLock(cursorLock);
+    auto used = reinterpret_cast<volatile uint16_t *>(queues[1] + 256);
+    const uint64_t begin = nowUs();
+    while (used[1] != cursorAvailable) {
+        if (nowUs() - begin >= 1000000) { IOLockUnlock(cursorLock); return kIOReturnTimeout; }
+        pause(begin);
+    }
+    Command command = {{image ? 0x300u : 0x301u, 0, 0, 0, 0, {}}, 0, x, y, 0, resource, hotX, hotY, 0};
+    memcpy(queues[1] + 512, &command, sizeof(command));
+    uint64_t pa;
+    if (!physical(queues[1], sizeof queues[1], pa)) { IOLockUnlock(cursorLock); return kIOReturnNoMemory; }
+    reinterpret_cast<Desc *>(queues[1])[0] = {pa + 512, sizeof(command), 0, 0};
+    auto avail = reinterpret_cast<volatile uint16_t *>(queues[1] + 128);
+    avail[2 + cursorAvailable % 4] = 0;
+    barrier(); avail[1] = ++cursorAvailable; barrier(); wr(0x50, 1);
+    while (used[1] != cursorAvailable) {
+        if (nowUs() - begin >= 1000000) { IOLockUnlock(cursorLock); return kIOReturnTimeout; }
+        pause(begin);
+    }
+    barrier();
+    IOLockUnlock(cursorLock);
+    return kIOReturnSuccess;
 }
 uint32_t resourceId() { IOLockLock(lock); uint32_t id = ++nextResource; IOLockUnlock(lock); return id; }
 IOReturn unref(uint32_t id) {

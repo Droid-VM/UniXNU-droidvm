@@ -86,6 +86,7 @@ uint64_t ioSurfaceHeight(const IOSurface *) __asm("__ZNK9IOSurface9getHeightEv")
 uint64_t ioSurfaceBytesPerRow(const IOSurface *) __asm("__ZNK9IOSurface14getBytesPerRowEv");
 uint64_t ioSurfaceBaseOffset(const IOSurface *) __asm("__ZNK9IOSurface13getBaseOffsetEv");
 uint32_t ioSurfacePixelFormat(const IOSurface *) __asm("__ZNK9IOSurface14getPixelFormatEv");
+uint32_t ioSurfaceUnlockSeed(const IOSurface *) __asm("__ZNK9IOSurface13getUnlockSeedEv");
 IOMemoryDescriptor *ioSurfaceMemory(const IOSurface *) __asm("__ZNK9IOSurface19getMemoryDescriptorEv");
 uint32_t ioSurfacePlaneCount(const IOSurface *) __asm("__ZNK9IOSurface13getPlaneCountEv");
 uint64_t ioSurfacePlaneOffset(const IOSurface *, uint32_t) __asm("__ZNK9IOSurface14getPlaneOffsetEj");
@@ -204,6 +205,7 @@ public:
     IOReturn notify_crc_ready_gated(unsigned int) override;
     bool are_timings_enabled() const override;
     IOReturn do_power_state_change_gated() override;
+    IOReturn set_parameter(IOMFBParameterName, const unsigned long long *, unsigned int) override;
 
 private:
     // The refresh rate of the timing published (boot-arg droidvm-display-hz, 30 to 240): the app's window shows 120 Hz (its gpu-0
@@ -214,6 +216,18 @@ private:
 
     bool clean_queue_gated();
     void program_hardware_gated();
+    // The pointer on virtio-gpu's cursor plane (CursorPlane): WindowServer swaps its image as layer 1 and moves it through
+    // set_parameter; the host draws it over the scanout (the DroidVM app's 64x64 cursor view). From macOS-DroidVM b29557d.
+    void updateCursor(IOSurface *, int32_t, int32_t);
+    IOReturn moveCursor(bool image);
+    IOBufferMemoryDescriptor *fCursorPixels;
+    IOSurface *fCursorSurface;
+    uint32_t fCursorSeed;
+    uint32_t fCursorResource, fCursorWidth, fCursorHeight;
+    int32_t fCursorX, fCursorY, fCursorOffsetX, fCursorOffsetY;
+    uint32_t fCursorCropX, fCursorCropY;
+    bool fCursorVisible;
+    uint64_t fCursorUpdates, fCursorMoves;
     void copySurface(IOSurface *, bool refresh = false);
     bool scanOut(IOSurface *);
     struct ScanoutResource;
@@ -378,6 +392,10 @@ bool DroidVMDisplay::start(IOService *provider)
         return false;
     }
     thread_deallocate(copier);
+    // With the cursor plane WindowServer sends the pointer apart (layer 1, set_parameter); without the property it still swapped a
+    // cursor layer after the login transition, which the scanout never showed (no pointer in the app's mouse mode).
+    if (fGpu.ready())
+        setProperty("CursorPlane", 1ULL, 32);
     if (!IOMobileFramebufferLegacy::start(provider)) {
         IOLog("DroidVMDisplay: IOMobileFramebufferLegacy::start failed\n");
         stopCopies();
@@ -410,6 +428,15 @@ void DroidVMDisplay::stop(IOService *provider)
     if (fShown)
         reinterpret_cast<OSObject *>(fShown)->release();
     fShown = nullptr;
+    if (fCursorResource) {
+        DroidVMVirtioGpu::cursor(0, 0, 0, 0, 0, true);
+        DroidVMVirtioGpu::unref(fCursorResource);
+    }
+    fCursorResource = 0;
+    OSSafeReleaseNULL(fCursorPixels);
+    if (fCursorSurface)
+        reinterpret_cast<OSObject *>(fCursorSurface)->release();
+    fCursorSurface = nullptr;
     OSSafeReleaseNULL(fScanoutMap);
     fScanout = nullptr;
 }
@@ -524,6 +551,9 @@ IOReturn DroidVMDisplay::swap_begin_gated()
         if (fFlushes)
             IOLog("DroidVMDisplay: %llu virtio-gpu flushes mean %llu us max %llu us, %llu commands; %llu frame gaps of 50-500 ms, longest %llu ms\n",
                   fFlushes, fFlushNs / fFlushes / 1000, fFlushMaxNs / 1000, fGpu.commands(), fHitches, fFrameGapMaxNs / 1000000);
+        if (fCursorUpdates)
+            IOLog("DroidVMDisplay: cursor %ux%u, %llu image updates, %llu moves, position %d,%d\n",
+                  fCursorWidth, fCursorHeight, fCursorUpdates, fCursorMoves, fCursorOffsetX, fCursorOffsetY);
         IOLog("DroidVMDisplay: at most %llu frames in a second\n", fPeakFps);
         if (fFenceWaits)
             IOLog("DroidVMDisplay: %llu swaps from submit to programmed mean %llu us max %llu us\n", fFenceWaits,
@@ -593,8 +623,125 @@ IOReturn DroidVMDisplay::do_power_state_change_gated()
     return kIOReturnSuccess;
 }
 
-// AppleParavirtDisplay::program_hardware_gated (its slot 473): show the swap, then complete it. There is no cursor plane (no
-// "CursorPlane" property), so WindowServer draws the cursor into the main surface.
+// AppleParavirtDisplay's private parameter -1: the pointer's timestamp, x, y and visibility in four words.
+IOReturn DroidVMDisplay::set_parameter(IOMFBParameterName name, const unsigned long long *values, unsigned int count)
+{
+    if (static_cast<uint32_t>(name) != UINT32_MAX)
+        return IOMobileFramebufferLegacy::set_parameter(name, values, count);
+    if (count != 4 || !values)
+        return kIOReturnBadArgument;
+    fCursorX = static_cast<uint16_t>(values[1]);
+    fCursorY = static_cast<uint16_t>(values[2]);
+    bool changed = fCursorVisible != !!values[3];
+    fCursorVisible = !!values[3];
+    fCursorMoves++;
+    return moveCursor(changed);
+}
+
+IOReturn DroidVMDisplay::moveCursor(bool image)
+{
+    if (!fCursorResource)
+        return kIOReturnSuccess;
+    // WindowServer places the pointer in the display mode, the surface shown can be scaled from it; the host draws the cursor in
+    // the scanout's coordinates. The image is at the surface's scale already.
+    int32_t x = fCursorX + fCursorOffsetX, y = fCursorY + fCursorOffsetY;
+    if (fShown) {
+        x = static_cast<int64_t>(x) * static_cast<int64_t>(ioSurfaceWidth(fShown)) / static_cast<int64_t>(fVideo.v_width);
+        y = static_cast<int64_t>(y) * static_cast<int64_t>(ioSurfaceHeight(fShown)) / static_cast<int64_t>(fVideo.v_height);
+    }
+    x += fCursorCropX;
+    y += fCursorCropY;
+    IOReturn status = DroidVMVirtioGpu::cursor(fCursorVisible ? fCursorResource : 0, x, y, 0, 0, image || !fCursorVisible);
+    if (status)
+        IOLog("DroidVMDisplay: cursor command failed %#x\n", status);
+    return status;
+}
+
+void DroidVMDisplay::updateCursor(IOSurface *surface, int32_t x, int32_t y)
+{
+    if (!surface) {
+        fCursorVisible = false;
+        moveCursor(true);
+        return;
+    }
+    uint32_t width = ioSurfaceWidth(surface), height = ioSurfaceHeight(surface);
+    IOMemoryDescriptor *memory = ioSurfaceMemory(surface);
+    if (!memory || ioSurfacePixelFormat(surface) != 'BGRA' || !width || !height || width > 256 || height > 256)
+        return;
+    fCursorOffsetX = x;
+    fCursorOffsetY = y;
+    uint32_t seed = ioSurfaceUnlockSeed(surface);
+    if (surface == fCursorSurface && seed == fCursorSeed) {
+        bool hidden = !fCursorVisible;
+        fCursorVisible = true;
+        fCursorMoves++;
+        moveCursor(hidden);
+        return;
+    }
+    // The host's cursor plane is 64x64; macOS draws the glyph inside a 128x128 canvas with transparent padding: the glyph goes at its
+    // own scale from its first opaque row and column, and the crop moves the position by as much.
+    constexpr uint32_t cursorSize = 64;
+    if (!fCursorResource) {
+        OSSafeReleaseNULL(fCursorPixels);
+        fCursorPixels = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+            static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous) | kIODirectionInOut, cursorSize * cursorSize * 4, 0xfffffffffffff000ULL);
+        if (!fCursorPixels)
+            return;
+        uint32_t id = DroidVMVirtioGpu::resourceId();
+        struct { VirtioGpuHeader h; uint32_t id, format, width, height; }
+            create = {{0x101, 0, 0, 0, 0, {}}, id, 1 /* B8G8R8A8_UNORM */, cursorSize, cursorSize};
+        if (fGpu.command(&create, sizeof(create)))
+            return;
+        IOByteCount length;
+        VirtioGpuEntry entry = {fCursorPixels->getPhysicalSegment(0, &length), cursorSize * cursorSize * 4, 0};
+        struct { VirtioGpuHeader h; uint32_t id, count; } attach = {{0x106, 0, 0, 0, 0, {}}, id, 1};
+        if (fGpu.command(&attach, sizeof(attach), &entry, sizeof(entry))) {
+            DroidVMVirtioGpu::unref(id);
+            return;
+        }
+        fCursorResource = id;
+        fCursorWidth = cursorSize;
+        fCursorHeight = cursorSize;
+    }
+    IOMemoryMap *map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
+    if (!map)
+        return;
+    const uint8_t *source = reinterpret_cast<const uint8_t *>(map->getVirtualAddress()) + ioSurfaceBaseOffset(surface);
+    uint32_t left = width, top = height;
+    uint64_t stride = ioSurfaceBytesPerRow(surface);
+    for (uint32_t row = 0; row < height; row++)
+        for (uint32_t column = 0; column < width; column++)
+            if (source[row * stride + column * 4 + 3]) {
+                if (column < left) left = column;
+                if (row < top) top = row;
+            }
+    if (left == width || top == height)   // a fully transparent image: nothing to crop to
+        left = top = 0;
+    auto *pixels = static_cast<uint8_t *>(fCursorPixels->getBytesNoCopy());
+    bzero(pixels, cursorSize * cursorSize * 4);
+    uint32_t copyWidth = width - left < cursorSize ? width - left : cursorSize;
+    uint32_t copyHeight = height - top < cursorSize ? height - top : cursorSize;
+    for (uint32_t row = 0; row < copyHeight; row++)
+        memcpy(pixels + row * cursorSize * 4, source + (row + top) * stride + left * 4, copyWidth * 4);
+    map->release();
+    fCursorCropX = left;
+    fCursorCropY = top;
+    struct { VirtioGpuHeader h; VirtioGpuRect rect; uint64_t offset; uint32_t id, padding; }
+        transfer = {{0x105, 0, 0, 0, 0, {}}, {0, 0, cursorSize, cursorSize}, 0, fCursorResource, 0};
+    if (fGpu.command(&transfer, sizeof(transfer)))
+        return;
+    reinterpret_cast<OSObject *>(surface)->retain();
+    if (fCursorSurface)
+        reinterpret_cast<OSObject *>(fCursorSurface)->release();
+    fCursorSurface = surface;
+    fCursorSeed = seed;
+    fCursorVisible = true;
+    fCursorUpdates++;
+    moveCursor(true);
+}
+
+// AppleParavirtDisplay::program_hardware_gated (its slot 473): show the swap, then complete it. Layer 1 is the pointer
+// (updateCursor); the largest surface is the screen, and a swap of the pointer alone leaves the scanout as it was.
 void DroidVMDisplay::program_hardware_gated()
 {
     IOMFBSwapIORequest *swap = at<IOMFBSwapIORequest *>(this, kCurrentSwap);
@@ -609,10 +756,10 @@ void DroidVMDisplay::program_hardware_gated()
         if (waited > fFenceWaitMaxNs)
             fFenceWaitMaxNs = waited;
     }
-    // Layer i's surface follows the main one (AppleParavirtDisplay: bit 1, the cursor, at main + 8). After the login transition
-    // WindowServer swaps a 128x128 BGRA cursor where the main surface is: the screen is the largest surface of the swap, smaller
-    // ones are not drawn over it (the screen keeps its last full frame).
+    // Layer i's surface follows the main one (AppleParavirtDisplay: bit 1, the cursor, at main + 8, its position at 97 and 101).
     uint8_t layers = at<uint8_t>(swap, kSwapLayers);
+    if ((layers & 2) && fGpu.ready())
+        updateCursor(at<IOSurface *>(swap, kSwapMainSurface + 8), at<int32_t>(swap, 97), at<int32_t>(swap, 101));
     IOSurface *surface = nullptr;
     uint64_t area = 0, shape = layers;
     for (unsigned layer = 0; layer < kSwapLayerCount; layer++) {
