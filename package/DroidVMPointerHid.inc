@@ -21,15 +21,23 @@ bool droidvm_mouse_present(void);
 // For the host rig (peek.py): [0] mouse reports sent, [1] pointer reports sent, [2] reports refused (handleReport), [3] right clicks
 // of a two-finger tap, [4] scroll reports of two or more fingers.
 volatile uint32_t droidvm_pointer_hid[5];
+// The fingers' travel, in the panel's pixels (of its 2732), per wheel step of the touch screen's scroll (poke.py; read as each
+// scroll report goes): its wheel is not accelerated (HIDSupportsScrollAcceleration false), and at 80 Safari's page moved as far as
+// the fingers did (400 pixels of travel, 400 of page; 40 moved it twice as far).
+volatile uint32_t droidvm_pointer_scroll_px = 80;
 }
 
 class DroidVMPointerHIDDevice : public IOHIDDevice {
     OSDeclareDefaultStructors(DroidVMPointerHIDDevice)
     // The touch seqlock's axes (DroidVMVirtioInput.c publishes the fingers on NativeHidInput's 30480 x 20320 panel axes).
     enum { kAxisX = 30480, kAxisY = 20320, kRange = 32767 };
-    // A wheel step per this many pointer units of the fingers' centre (about 40 of the panel's 2732 pixels), and the two-finger tap:
-    // at most this long (ms) and this far (pointer units, about 1.5% of the panel) from where it began.
-    enum { kScrollStep = kRange * 40 / 2732, kTapMS = 300, kTapSlop = kRange * 3 / 200, kPressMS = 80 };
+    // The two-finger tap: at most this long (ms) and this far (pointer units, about 1.5% of the panel) from where it began.
+    enum { kTapMS = 300, kTapSlop = kRange * 3 / 200, kPressMS = 80 };
+    // A wheel step per this many pointer units of the fingers' centre (droidvm_pointer_scroll_px of the panel's 2732 pixels).
+    static int32_t scrollStep() {
+        const uint32_t px = droidvm_pointer_scroll_px;
+        return (int32_t)((int64_t)kRange * (px ? px : 1) / 2732) ?: 1;
+    }
     IOWorkLoop *loop = nullptr;
     bool absolute = false;
     // The pointer: where it was last sent and the left button; the touch's gesture so far.
@@ -125,16 +133,20 @@ class DroidVMPointerHIDDevice : public IOHIDDevice {
         if (scrolling) {
             if (count < 2) return;                // one of them lifted: wait for the rest
             const int32_t cx = (int32_t)(sumX / count), cy = (int32_t)(sumY / count);
-            // The content follows the fingers, as on a trackpad with natural scrolling: fingers moving up scroll down.
+            // The content follows the fingers, as on a trackpad with natural scrolling (macOS's default). The system's scroll
+            // direction applies to a wheel as well, and natural scrolling turns it round, so the fingers go as the wheel turn
+            // that, turned round, moves the content with them: fingers moving up send the wheel towards the user (negative),
+            // which scrolls the content up, fingers moving right the horizontal wheel to the right. With natural scrolling
+            // off both go the other way, as a trackpad's do.
             carryY += cy - centreY;
             carryX += cx - centreX;
             centreX = cx;
             centreY = cy;
             if (cx - startX > kTapSlop || startX - cx > kTapSlop || cy - startY > kTapSlop || startY - cy > kTapSlop) moved = true;
-            const int32_t wheel = carryY / kScrollStep, pan = -(carryX / kScrollStep);
+            const int32_t step = scrollStep(), wheel = -(carryY / step), pan = carryX / step;
             if (!wheel && !pan) return;
-            carryY -= wheel * kScrollStep;
-            carryX += pan * kScrollStep;
+            carryY += wheel * step;
+            carryX -= pan * step;
             point(0, clamp8(wheel), clamp8(pan));
             droidvm_pointer_hid[4] = droidvm_pointer_hid[4] + 1;
             return;
@@ -225,6 +237,10 @@ public:
         loop = IOWorkLoop::workLoop();
         if (!loop) return false;
         setProperty("HIDDefaultBehavior", true);
+        // The touch screen's wheel is the fingers' travel (scrollStep), sent as precisely as they moved: the HID event system
+        // (IOHIDPointerScrollFilter, from the event service's ancestors) must not accelerate it, or a short swipe of 17 steps
+        // went through a whole page. The mouse's wheel is a real one and keeps the mouse's acceleration.
+        if (absolute) setProperty("HIDSupportsScrollAcceleration", false);
         if (!IOHIDDevice::start(provider)) return false;
         if (absolute) native_touch_set_sink(&DroidVMPointerHIDDevice::touchNotify, this);
         else native_mouse_set_sink(&DroidVMPointerHIDDevice::mouseNotify, this);
