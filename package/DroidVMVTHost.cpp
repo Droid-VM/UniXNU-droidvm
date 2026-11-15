@@ -162,9 +162,16 @@ constexpr uint32_t EvictDrainMs = 500;
 // has what it waited for -- a frame handed over after that ended the session inside the Demt, under the decoder's lock, and its
 // VTDecompressionSessionInvalidate took that lock again: os_unfair_lock_recursive_abort (11-04 on the phone, v6). After the
 // drain the device goes on (DEC_CMD_START) from the next frame, a few frames flagged ERROR (handed over dropped).
-// IdleDrainMs, EvictDrainMs and MaxBacklog are for display order only (a device without the display delay control: MediaCodec,
-// an older crosvm): in decode order every frame comes out as soon as decoded and a synchronous player waits for each (dfrm).
-constexpr uint32_t IdleDrainMs = 200;
+// EvictDrainMs and MaxBacklog are for display order only (a device without the display delay control: MediaCodec, an older
+// crosvm): in decode order every frame comes out as soon as decoded and a synchronous player waits for each (dfrm). IdleDrainMs
+// is for both: in decode order the last frame of macOS's lock-screen Aerial clip never came out of msm_vidc (5566, 11-15: 387 in,
+// 386 out, 1 pending), the player's synchronous dfrm for it waited 10 s, VideoToolbox gave the paravirtualized decoder up for the
+// process (err -19093) and the wallpaper stood still from then on. Drained, that frame comes out or is handed over dropped, and
+// the dfrm is answered. In decode order only after IdleDrainDecodeOrderMs, and only once the session has handed a frame over:
+// its first 4K frame comes after the device's SOURCE_CHANGE, its CAPTURE queue and the pool surfaces' Dbufs, past 200 ms, and a
+// drain then (before CAPTURE streamed) never came back -- the session stayed draining, fed nothing, and its 4096 inputs filled
+// (-12911 to the player, 10282 times). The player gives up a synchronous dfrm after 10 s.
+constexpr uint32_t IdleDrainMs = 200, IdleDrainDecodeOrderMs = 1000;
 constexpr unsigned EvictFrames = 16;
 // Frames waiting for an OUTPUT buffer (queueFrame): past MaxBacklog the session is behind (its worker waiting on the guest, the
 // device slower than the stream) and sheds one more temporal layer (keptLayer), at most every ShedMs -- never a frame another
@@ -1472,9 +1479,9 @@ void workerMain(void *argument, wait_result_t) {
             }
             AbsoluteTime deadline;
             clock_interval_to_deadline(IdleCloseMs, kMillisecondScale, &deadline);
-            if (!s->decodeOrder && sessionQuiet(s) && s->pendingFrames && s->captureStreaming && !s->idleDrained) {
+            if (sessionQuiet(s) && s->pendingFrames && s->captureStreaming && !s->idleDrained && (!s->decodeOrder || s->lastOutAt)) {
                 uint64_t idleFor;
-                nanoseconds_to_absolutetime(uint64_t(IdleDrainMs) * 1000000, &idleFor);
+                nanoseconds_to_absolutetime(uint64_t(s->decodeOrder ? IdleDrainDecodeOrderMs : IdleDrainMs) * 1000000, &idleFor);
                 if (mach_absolute_time() - s->lastInputAt >= idleFor) {
                     s->idleDrained = s->draining = true;
                     const unsigned pending = s->pendingFrames, outstanding = s->outstandingCount;

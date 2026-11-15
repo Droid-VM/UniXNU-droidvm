@@ -11,7 +11,9 @@
 //     -d  decode order (DISPLAY_DELAY_ENABLE 1, DISPLAY_DELAY 0) as the DroidVM VideoToolbox host asks
 //     -x  a second SOURCE_CHANGE is followed (crosvm fails the session on one)
 //     -L  lockstep (with -d): the next access unit only once the frames are caught up, as a player feeding in real time does
-//     -P MS  poll timeout (default 100)
+//     -P MS  poll timeout (default 100); -A N  with -L, access units given ahead of the frames out (default 2; 0: one at a time)
+//     -W MS  the drain (DEC_CMD_STOP) only MS after the last access unit: whether the last frames come out without one
+//     -N  each access unit without its delimiter (AUD), as an MP4/MOV sample is
 //     -k  each frame read back through a mapping, without DMA_BUF_IOCTL_SYNC (as a guest reads it), and hashed: the same
 //         stream gives the same hashes into udmabufs as into dma-heap buffers when the device's writes reach the CPU
 #define _GNU_SOURCE
@@ -93,7 +95,7 @@ int main(int argc, char **argv) {
     t0 = now();
     const int hevc = !strcmp(argv[2], "hevc");
     const unsigned w = atoi(argv[3]), h = atoi(argv[4]);
-    int delay = 0, use_heap = 0, nbuf = 0, streamon_at = 0, follow = 0, check = 0, lockstep = 0, poll_ms = 100;
+    int delay = 0, use_heap = 0, nbuf = 0, streamon_at = 0, follow = 0, check = 0, lockstep = 0, poll_ms = 100, ahead = 2, drain_wait_ms = 0, strip_aud = 0;
     for (int i = 5; i < argc; i++) {
         if (!strcmp(argv[i], "-d")) delay = 1;
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) use_heap = !strcmp(argv[++i], "heap");
@@ -103,6 +105,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-k")) check = 1;
         else if (!strcmp(argv[i], "-L")) lockstep = 1;
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) poll_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-A") && i + 1 < argc) ahead = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-W") && i + 1 < argc) drain_wait_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-N")) strip_aud = 1;
     }
     int f = open(argv[1], O_RDONLY); struct stat st; fstat(f, &st); size = st.st_size;
     data = malloc(size); if (read(f, data, size) != (ssize_t)size) return 1; close(f);
@@ -213,11 +218,19 @@ int main(int argc, char **argv) {
             if (b.flags & V4L2_BUF_FLAG_ERROR) LOG("OUTPUT %u back with ERROR", b.index);
         }
         // Feed.
-        while (next < nau && (!lockstep || !streaming || next <= frames + errors + 2)) {
+        while (next < nau && (!lockstep || !streaming || next <= frames + errors + ahead)) {
             int slot = -1; for (unsigned i = 0; i < nbits; i++) if (!bits[i].queued) { slot = i; break; }
             if (slot < 0) break;
             size_t len = aus[next + 1] - aus[next];
-            memcpy(bits[slot].map, data + aus[next], len);
+            const uint8_t *au = data + aus[next];
+            if (strip_aud) {   // the delimiter that starts the unit left out, as a container's samples have none
+                size_t i = 0;
+                while (i + 3 < len && !(au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1)) i++;
+                size_t j = i + 3;
+                while (j + 3 < len && !(au[j] == 0 && au[j + 1] == 0 && (au[j + 2] == 1 || (au[j + 2] == 0 && au[j + 3] == 1)))) j++;
+                if (j + 3 < len) { au += j; len -= j; }
+            }
+            memcpy(bits[slot].map, au, len);
             struct v4l2_plane pl = { .bytesused = len, .length = bits[slot].len, .m.fd = bits[slot].fd };
             struct v4l2_buffer b = { .index = slot, .type = OUT, .memory = V4L2_MEMORY_DMABUF, .m.planes = &pl, .length = 1 };
             long us = (long)next * STEP_US; b.timestamp.tv_sec = us / 1000000; b.timestamp.tv_usec = us % 1000000;
@@ -225,7 +238,10 @@ int main(int argc, char **argv) {
             if (r) { LOG("QBUF(OUTPUT) au %d %zu bytes: errno %d", next, len, r); goto done; }
             bits[slot].queued = 1; next++; fed++; progress = now();
         }
-        if (next >= nau && !drain_sent) {
+        static double all_in = 0;
+        if (next >= nau && !all_in) { all_in = now(); if (drain_wait_ms) LOG("all %d access units in, %d frames out; the drain waits %d ms", fed, frames, drain_wait_ms); }
+        if (next >= nau && !drain_sent && (now() - all_in) * 1000 >= drain_wait_ms) {
+            if (drain_wait_ms) LOG("%d frames out before the drain", frames);
             struct v4l2_decoder_cmd dc = { .cmd = V4L2_DEC_CMD_STOP };
             r = x(VIDIOC_DECODER_CMD, &dc); LOG("all %d access units in; DEC_CMD_STOP: %d", fed, r); drain_sent = 1;
         }
