@@ -9,7 +9,8 @@ leaves a stamp in the board's output (build-all/) with what it was built from --
 of their local changes), the Data seed, the chip id -- and runs again when that differs: after a git pull the same command
 builds what changed (the builds below the steps are incremental). setup, policies and a new Data seed run once; --from/--only
 run steps again whatever their stamps say. The result is release/ in the board's output: droidvm-disk.img (the boot disk: UniXNU.efi, DarwinBoot.efi,
-kernel collection, ADT, trust, root policies, Data seed), os.img and systemos.img (the read-only OS and SystemOS disks),
+kernel collection, ADT, trust, root policies, Data seed), os.img and systemos.img (the read-only OS and SystemOS disks; macOS's app.img, the
+application cryptex, when its profile names one),
 plugin/ (the Metal plugin as the seed holds it, for a VM that keeps its Data), kernel.native.macho (symbols) and release.json:
 every commit, pin and hash that went in. Nothing is taken from outside the two checkouts, the pinned sources they name and
 the IPSW; a checkout with local changes is refused unless --allow-dirty (the release then says so).
@@ -26,7 +27,7 @@ by the seed's volume UUID. So there are two kinds of build:
 Steps, in order:
   setup      unixnu defconfig + fetch + ipsw fetch (kernelcache, device tree, OS, SystemOS and App images, their trust caches),
              the two encrypted images decrypted, the build tree
-  policies   the owner root keys, the raw OS and SystemOS disks and the signed root policies over them
+  policies   the owner root keys, the raw OS and SystemOS disks (and macOS's App) and the signed root policies over them
   package    unixnu build package (UniXNU.efi) and DarwinBoot.efi
   tools      the debug shell (ownervisor with applebox, dropbear, zsh, debugserver, libimobiledevice) and the board's tools
              (toybox, gfxprobe, lsdiag, ipatool, MetalCheck), arm64e
@@ -254,8 +255,10 @@ class Build:
             openssl = subprocess.check_output(['brew', '--prefix', 'openssl@3'], text=True, env=self.env).strip()
             run(['python3', self.tree / 'kits/VerifiedRoot/tests/check.py', '--output', host, '--openssl-prefix', openssl],
                 cwd=self.tree, env=self.env, logfile=self.logs / 'verified-root-host.log')
+        # macOS: the application cryptex (Safari) as a third verified disk, when the profile names its volume.
+        app = ['--app', self.member('Cryptex1,AppOS')] if self.profile.get('root', {}).get('app_volume_uuid') else []
         self.script('build-droidvm-root-policies.py', '--tree', self.tree, '--profile', self.profile_path,
-                    '--os', self.member('OS'), '--systemos', self.member('Cryptex1,SystemOS'))
+                    '--os', self.member('OS'), '--systemos', self.member('Cryptex1,SystemOS'), *app)
 
     # package -------------------------------------------------------------------------------------------------------------
     def efi_dir(self):
@@ -515,6 +518,10 @@ class Build:
         self.release.mkdir(parents=True, exist_ok=True)
         for name in ('os', 'systemos'):
             clone(self.tree / f'build/droidvm-root-images/{name}.img', self.release / f'{name}.img')
+        if self.profile.get('root', {}).get('app_volume_uuid'):
+            clone(self.tree / 'build/droidvm-root-images/app.img', self.release / 'app.img')
+        else:
+            (self.release / 'app.img').unlink(missing_ok=True)
         shutil.copyfile(self.work / 'payload/droidvm-disk.img', self.release / 'droidvm-disk.img')
         shutil.copyfile(self.tree / NATIVE_KERNEL, self.release / 'kernel.native.macho')
         shutil.copyfile(self.work / 'kernel/kernel.macho', self.release / 'kernel.macho')
@@ -554,7 +561,8 @@ class Build:
             'owner_tools': tools,
             'checks': self.record('checks') or {},
             'files': {name: {'bytes': (self.release / name).stat().st_size, 'sha256': sha256(self.release / name)}
-                      for name in ('droidvm-disk.img', 'kernel.macho', 'kernel.native.macho', 'os.img', 'systemos.img', 'kexts.json')
+                      for name in ('droidvm-disk.img', 'kernel.macho', 'kernel.native.macho', 'os.img', 'systemos.img', 'app.img',
+                                   'kexts.json')
                       if (self.release / name).is_file()},
         }
         (self.release / 'release.json').write_text(json.dumps(release, indent=2) + '\n')

@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -135,6 +136,11 @@ def main():
             in_vm(args.lima, 'bash', tree / 'scripts/setup-lima-apfs.sh')
         shims = (args.shims or tree / 'build/droidvm-macos-shims/bootshim').resolve()
         installs = ['--install', f'{shims}:private/var/ngpu/bootshim'] if shims.is_dir() else []
+        # The VM's keyboard as an ANSI one (type 40): the input kext's keyboard has no vendor or product and says HID country code
+        # 33, which macOS cannot place, so without this its Keyboard Setup Assistant opened at the first login of every new seed.
+        keyboard = output / 'keyboardtype.plist'
+        keyboard.write_bytes(plistlib.dumps({'keyboardtype': {'0-0-33': 40}}))
+        installs += ['--file', f'{keyboard}:Library/Preferences/com.apple.keyboardtype.plist']
         in_vm(args.lima, 'python3', tree / 'scripts/make-macos-data-linux.py', '--os-image',
               tree / 'build/droidvm-root-images/os.img', '--scratch', shared['scratch'], '--data', shared['data'],
               *[o for o in options if o not in ('--volume-uuid', volume)], *installs)
@@ -143,7 +149,7 @@ def main():
         packed_ramdisk.pack(shared['data'], base)
         subprocess.run([sys.executable, tree / 'scripts/seed-data-grow.py', '--gib', str(args.gib), base, output / seed],
                        check=True)
-        for path in (base, shared['scratch'], shared['data']):
+        for path in (base, shared['scratch'], shared['data'], keyboard):
             path.unlink()
     record = {'build': build, 'volume_uuid': volume, 'seed': seed, 'seed_sha256': sha256(output / seed),
               'os_image': image.name, 'user': args.user.split(':', 1)[0] if args.user else None, 'auto_login': args.auto_login,

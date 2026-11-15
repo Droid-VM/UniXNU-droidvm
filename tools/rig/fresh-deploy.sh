@@ -43,7 +43,9 @@ fi
 
 echo "== release"
 scp -q "$MAC:$M/release/release.json" "$O/release/release.json" || { echo "no release in $MAC:$M/release (build-droidvm-all.py)"; exit 1; }
-for f in os.img systemos.img; do
+# The release's read-only disks: OS and SystemOS, and a macOS release's application cryptex (app.img).
+IMAGES=$(python3 -c "import json,sys;f=json.load(open(sys.argv[1]))['files'];print(' '.join(n for n in ('os.img','systemos.img','app.img') if n in f))" "$O/release/release.json")
+for f in $IMAGES; do
   want=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['files'][sys.argv[2]]['sha256'])" "$O/release/release.json" "$f")
   if [ -f "$O/release/$f" ] && [ "$(cat "$O/release/$f.sha256" 2>/dev/null)" = "$want" ]; then
     echo "$f: have it"
@@ -94,7 +96,7 @@ if [ $KEEP = 0 ]; then
 echo "== the new VM's files"
 $A shell "su -c 'rm -rf $MEDIA'"
 $A shell "mkdir -p $DIR"               # through the shared storage, which gives it the owner the app's other VM directories have
-for f in os.img systemos.img; do $A push "$O/release/$f" "$DIR/$f" | tail -1; done
+for f in $IMAGES; do $A push "$O/release/$f" "$DIR/$f" | tail -1; done
 $A push "$FD" "$DIR/edk2-virtio-gpu.fd" | tail -1
 "$RIG/deploy.sh"                       # the release's boot disk (payload/droidvm-disk.img), with the early probes, and kernel.nm
 "$RIG/make-data-store.sh" >/dev/null
@@ -115,15 +117,21 @@ nets = [n for n in json.load(sys.stdin)['networks'] if n.get('bridge_name') == '
 sys.exit('no br-wifi network in the app') if not nets else print(nets[0]['id'])")
 UID_=$($A shell "su -c 'stat -c %u /data/data/$APP'" | tr -dc 0-9)     # the app's uid: the sound and media helpers run as it
 ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
-python3 - "$RIG/unixnu-vm.template.json" "$RIG/unixnu-vm.config.json" "$ID" "$NET" "$UID_" "$DIR" "$MEDIA" <<'PY'
+python3 - "$RIG/unixnu-vm.template.json" "$RIG/unixnu-vm.config.json" "$ID" "$NET" "$UID_" "$DIR" "$MEDIA" "$IMAGES" <<'PY'
 import json, sys
-template, output, vm_id, net, uid, directory, media = sys.argv[1:]
+template, output, vm_id, net, uid, directory, media, images = sys.argv[1:]
 text = open(template).read()
 for key, value in (('@VM_ID@', vm_id), ('@NETWORK_ID@', net), ('@APP_UID@', uid), ('@MEDIA_DIR@', media), ('@DIR@', directory)):
     text = text.replace(key, value)
 if '@' in text:
     sys.exit('the template has a placeholder left: ' + text[text.index('@'):][:40])
-open(output, 'w').write(json.dumps(json.loads(text), indent=1) + '\n')
+config = json.loads(text)
+# The application cryptex (a macOS release): one more read-only disk, after SystemOS's.
+if 'app.img' in images.split():
+    options = config['config']['extra_options']
+    at = options.index(f'{media}/systemos.img,ro=true')
+    options[at + 1:at + 1] = ['--virtio-mmio-block', f'{media}/app.img,ro=true']
+open(output, 'w').write(json.dumps(config, indent=1) + '\n')
 PY
 python3 - "$O/vms.json.before" "$RIG/unixnu-vm.config.json" "$O/vms.json.new" "$NAME" <<'PY'
 import json, sys, time

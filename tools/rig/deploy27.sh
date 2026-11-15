@@ -9,7 +9,9 @@
 #     --build        build the release first, for this rig: its chip id (unique-chip-id.txt) and the Data seed its VM was made
 #                    from (BUILD_GENERATION, a directory on the Mac; see the build script)
 #     --allow-dirty  take a release built from checkouts with local changes (an experiment); --build passes it on
-#     --images       also the OS and SystemOS disks (a VM directory that has none yet)
+#     --images       also the OS and SystemOS disks (a VM directory that has none yet), and macOS's application cryptex (app.img)
+#                    when the release has it: a VM without that disk gets it in its configuration (vmdisk.py: the rig's, the
+#                    daemon's and the app's vms.json)
 #     --keep-plugin  leave the Metal plugin in the guest's Data as it is (the release must still trust it)
 #     --new-seed     take a release whose Data seed is not the one last deployed here (its store must be new: make-data-store.sh)
 #     --force-stop   stop the VM although the hugepage pool would be short afterwards
@@ -173,7 +175,9 @@ for name in droidvm-disk.img kernel.macho kernel.native.macho; do fetch "$name";
 # The board's kexts (fileset-add-kexts.py) and their symbols, when the release has any.
 rm -f "$R/kexts.json"
 [ -n "$(field "$R/release.json" "files.kexts.json.sha256")" ] && fetch kexts.json
-[ $IMAGES = 1 ] && for name in os.img systemos.img; do fetch "$name"; done
+# The release's read-only disks: OS and SystemOS, and a macOS release's application cryptex.
+images() { echo os.img systemos.img; [ -z "$(field "$R/release.json" "files.app.img.sha256")" ] || echo app.img; }
+[ $IMAGES = 1 ] && for name in $(images); do fetch "$name"; done
 rm -rf "$R/plugin.new" && mkdir -p "$R/plugin.new"
 ssh -o BatchMode=yes "$MAC" "cd $M/release/plugin && COPYFILE_DISABLE=1 tar --no-xattrs -cf - ." | tar xf - -C "$R/plugin.new"
 python3 - "$R/release.json" "$R/plugin.new" <<'PY'
@@ -224,7 +228,7 @@ config = json.load(open(sys.argv[1]))['config']
 print([d['path'] for d in config['disks'] if d['path'].endswith('/droidvm-disk.img')][0].rsplit('/', 1)[0])" "$FROM/unixnu-vm.config.json")
   FROM_MEDIA=/data/media/0/${FROM_DIR#/storage/emulated/0/}
   if [ $IMAGES = 0 ]; then
-    for name in os.img systemos.img; do
+    for name in $(images); do
       want=$(field "$R/release.json" "files.$name.sha256")
       got=$($A shell "su -c 'sha256sum $FROM_MEDIA/$name'" | cut -c1-64)
       [ "$want" = "$got" ] || { echo "$FROM_MEDIA/$name is not the release's ($got); --images pushes the release's"; exit 1; }
@@ -238,20 +242,27 @@ print([d['path'] for d in config['disks'] if d['path'].endswith('/droidvm-disk.i
   $A push "$O/droidvm-disk.img" "$DIR/droidvm-disk.img" | tail -1
   $A push "$R/release.json" "$DIR/release.json" | tail -1
   if [ $IMAGES = 1 ]; then
-    for name in os.img systemos.img; do $A push "$R/$name" "$DIR/$name" | tail -1; done
+    for name in $(images); do $A push "$R/$name" "$DIR/$name" | tail -1; done
   fi
-  ID=$(python3 - "$FROM/unixnu-vm.config.json" "$RIG/unixnu-vm.config.json" "$NAME" "$FROM_DIR" "$DIR" "$IMAGES" <<'PY'
+  ID=$(python3 - "$FROM/unixnu-vm.config.json" "$RIG/unixnu-vm.config.json" "$NAME" "$FROM_DIR" "$DIR" "$IMAGES" "$(images | tr '\n' ' ')" <<'PY'
 import json, secrets, sys, time, uuid
-source, output, name, old, new, images = sys.argv[1:]
+source, output, name, old, new, images, release_images = sys.argv[1:]
 old_media, new_media = (path.replace('/storage/emulated/0/', '/data/media/0/') for path in (old, new))
 config = json.load(open(source))['config']
 vm_id = str(uuid.uuid4())
 text = json.dumps(config)
-for mine in ('droidvm-disk.img', 'data-store.img') + (('os.img', 'systemos.img') if images == '1' else ()):
+for mine in ('droidvm-disk.img', 'data-store.img') + (('os.img', 'systemos.img', 'app.img') if images == '1' else ()):
     for a, b in ((old, new), (old_media, new_media)):
         text = text.replace(f'{a}/{mine}', f'{b}/{mine}')
 config = json.loads(text)
 config.update(id=vm_id, name=name, created_at=int(time.time() * 1000), auto_up=False)
+# A release with the application cryptex: its disk, read-only, after SystemOS's, when the source VM had none.
+options = config.get('extra_options', [])
+if 'app.img' in release_images.split() and not any(o.split(',')[0].endswith('/app.img') for o in options):
+    at = [i for i, o in enumerate(options) if o.split(',')[0].endswith('/systemos.img')]
+    if at:
+        media = options[at[0]].split(',')[0].rsplit('/', 1)[0]
+        options[at[0] + 1:at[0] + 1] = ['--virtio-mmio-block', f'{media}/app.img,ro=true']
 for index, network in enumerate(config.get('networks', [])):
     network['tap_name'] = f'vm{vm_id[:8]}-{index}'
     network['mac_address'] = '02:00:00:' + ':'.join(f'{byte:02x}' for byte in secrets.token_bytes(3))
@@ -310,7 +321,12 @@ $A shell "mkdir -p $DIR"
 $A push "$O/droidvm-disk.img" "$DIR/droidvm-disk.img" | tail -1
 $A push "$R/release.json" "$DIR/release.json" | tail -1
 if [ $IMAGES = 1 ]; then
-  for name in os.img systemos.img; do $A push "$R/$name" "$DIR/$name" | tail -1; done
+  for name in $(images); do $A push "$R/$name" "$DIR/$name" | tail -1; done
+fi
+# A release with the application cryptex (macOS): the VM reads it as one more read-only disk, after SystemOS's.
+if images | grep -q app.img && ! grep -q '/app.img' "$RIG/unixnu-vm.config.json"; then
+  [ $IMAGES = 1 ] || { echo "the release has app.img and the VM has no such disk: --images"; exit 1; }
+  python3 "$RIG/vmdisk.py" add "/data/media/0/${DIR#/storage/emulated/0/}/app.img" systemos.img
 fi
 cp "$R/release.json" "$R/deployed.json"
 

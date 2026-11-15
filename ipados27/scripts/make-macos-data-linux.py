@@ -2,7 +2,7 @@
 """The content of a macOS Data seed, written as root on Linux with the APFS driver (make-droidvm-macos-seed.py, in a lima VM).
 
   make-macos-data-linux.py --os-image OS.img --scratch SCRATCH.cdr --data DATA.cdr [--skip-setup] [--user NAME:PASSWORD
-                           [--auto-login]]
+                           [--auto-login]] [--install SRC:DEST]... [--file SRC:DEST]...
 
 Upstream UniXNU's make-macos-data-seed.py (beside this script) builds the seed on macOS as root, where ditto keeps the Data
 template's owners. The build Mac has no password-less sudo, and as another user it can neither read the template's root-only
@@ -149,6 +149,9 @@ def main():
     parser.add_argument('--install', action='append', default=[], metavar='SRC:DEST',
                         help='a directory tree put at DEST of the volume (below private/: kept as real files), owned by root:wheel '
                              '(the owner boot shims at private/var/ngpu/bootshim)')
+    parser.add_argument('--file', action='append', default=[], metavar='SRC:DEST',
+                        help='a file put at DEST of the volume after the template\'s files are linked, so a real file anywhere, '
+                             'root:wheel 0644 (the keyboard type of the VM\'s keyboard: Library/Preferences/com.apple.keyboardtype.plist)')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('run as root (the APFS driver, the template\'s owners)')
@@ -183,6 +186,15 @@ def main():
                     add_home(template, scratch, args.user.split(':', 1)[0])
                 if args.auto_login:
                     seed.add_auto_login(scratch, *args.user.split(':', 1))
+                for entry in args.file:
+                    source, _, destination = entry.partition(':')
+                    target = scratch / destination
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.is_symlink() or target.exists():
+                        target.unlink()
+                    run('cp', source, target)
+                    os.chown(target, 0, 0)
+                    target.chmod(0o644)
                 remove_volume_logs(scratch)
                 with Mounted(args.data.resolve(), work / 'data', True) as data:
                     copy_tree(scratch, data)

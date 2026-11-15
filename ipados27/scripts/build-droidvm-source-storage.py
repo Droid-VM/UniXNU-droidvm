@@ -39,9 +39,13 @@ def helper(name, path):
 
 
 def policy_bundle(policies, key, out):
-    """root-policies.bin from build/verified-root-<build>/{OS,SystemOS}, each checked against the OS profile's [root] image."""
+    """root-policies.bin from build/verified-root-<build>/{OS,SystemOS}, each checked against the OS profile's [root] image, and
+    macOS's App (the application cryptex) when the profile names one (UNIXNU_ROOT_APP_UUID). The kernel's storage gives each disk the
+    policy whose image size is the disk's, so the three images must differ in size (they do: 14.2 GB, 2.9 GB, 52 MiB)."""
     manifests = []
-    for name, prefix in (('OS', 'UNIXNU_ROOT_OS'), ('SystemOS', 'UNIXNU_ROOT_SYSTEMOS')):
+    names = (('OS', 'UNIXNU_ROOT_OS'), ('SystemOS', 'UNIXNU_ROOT_SYSTEMOS'),
+             *((('App', 'UNIXNU_ROOT_APP'),) if os.environ.get('UNIXNU_ROOT_APP_UUID') else ()))
+    for name, prefix in names:
         path = policies / name / 'manifest.bin'
         if not path.is_file():
             return None

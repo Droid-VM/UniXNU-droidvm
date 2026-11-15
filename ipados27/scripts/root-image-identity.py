@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """The [root] values of an OS profile from its IPSW's decrypted disk images: the raw disk's sha256 and its APFS volumes.
 
-  root-image-identity.py --tree TREE --os OS.dmg --systemos SYSTEMOS.dmg
+  root-image-identity.py --tree TREE --os OS.dmg --systemos SYSTEMOS.dmg [--app APP.dmg]
 
-Decodes each UDIF image to TREE/build/droidvm-root-images/<os|systemos>.img with the record build-droidvm-root-policies.py keeps
+Decodes each UDIF image to TREE/build/droidvm-root-images/<os|systemos|app>.img with the record build-droidvm-root-policies.py keeps
 beside it (so that step finds the raw disk written and pinned), and reads the APFS container in it -- a bare container or the APFS
 partition of a GPT -- to its volumes: name, role and UUID, by the container's object map. Prints the [root] table for the OS
-profile (os_volume_uuid: the system volume of the OS image; systemos_volume_uuid: the cryptex's volume) and the volumes found.
+profile (os_volume_uuid: the system volume of the OS image; systemos_volume_uuid: the cryptex's volume; app_volume_uuid: macOS's
+application cryptex, Cryptex1,AppOS, where Safari lives) and the volumes found.
 """
 import argparse
 import hashlib
@@ -119,6 +120,7 @@ def main():
     parser.add_argument('--tree', type=Path, required=True)
     parser.add_argument('--os', type=Path, required=True)
     parser.add_argument('--systemos', type=Path, required=True)
+    parser.add_argument('--app', type=Path, help='the application cryptex (Cryptex1,AppOS) of a macOS IPSW')
     args = parser.parse_args()
     tree = args.tree.resolve()
     sys.path.insert(0, str(tree / 'scripts'))
@@ -126,7 +128,7 @@ def main():
     images = tree / 'build/droidvm-root-images'
     images.mkdir(parents=True, exist_ok=True)
     table, report = {}, {}
-    for prefix, dmg in (('os', args.os), ('systemos', args.systemos)):
+    for prefix, dmg in (('os', args.os), ('systemos', args.systemos), *((('app', args.app),) if args.app else ())):
         raw = images / f'{prefix}.img'
         size, digest = raw_image(udif, dmg.resolve(), raw)
         found = volumes(raw)

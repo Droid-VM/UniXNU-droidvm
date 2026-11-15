@@ -86,6 +86,8 @@ def main():
     parser.add_argument('--profile', type=Path, required=True, help='the OS profile (UniXNU profiles/os/<name>/profile.toml)')
     parser.add_argument('--os', type=Path, required=True, help='the decrypted OS disk image (.dmg)')
     parser.add_argument('--systemos', type=Path, required=True, help='the decrypted Cryptex1,SystemOS disk image (.dmg)')
+    parser.add_argument('--app', type=Path, help='macOS: the application cryptex disk image (Cryptex1,AppOS, Safari), with the profile\'s '
+                        '[root] app_volume_uuid and app_image_sha256')
     args = parser.parse_args()
     tree = args.tree.resolve()
     profile = tomllib.loads(args.profile.read_text())
@@ -104,7 +106,10 @@ def main():
     native.vr_host_block.argtypes = [ctypes.POINTER(View), ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
     images = tree / 'build/droidvm-root-images'
     images.mkdir(parents=True, exist_ok=True)
-    for name, dmg, prefix in (('OS', args.os, 'os'), ('SystemOS', args.systemos, 'systemos')):
+    if args.app and not (root.get('app_volume_uuid') and root.get('app_image_sha256')):
+        raise SystemExit(f'{args.profile}: --app needs [root] app_volume_uuid and app_image_sha256')
+    for name, dmg, prefix in (('OS', args.os, 'os'), ('SystemOS', args.systemos, 'systemos'),
+                              *((('App', args.app, 'app'),) if args.app else ())):
         raw = images / f'{name.lower()}.img'
         size = raw_image(udif, dmg, raw, root[f'{prefix}_image_sha256'])
         policy(manifest_tool, native, raw, size, uuid.UUID(root[f'{prefix}_volume_uuid']), host / 'keys',
