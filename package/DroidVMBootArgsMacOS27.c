@@ -23,5 +23,10 @@ char PE_builtin_boot_args[] =
     // Aerial (4096x2160 HEVC Main10, WallpaperAerials) opened no session at all after the merge. With it, 5566 11-15: the Aerial's
     // sessions reach msm_vidc (crosvm backend=auto) in decode order and decode into the player's pool surfaces in place.
     "droidvm-vt-paravirt=1 "
+    // the hypervisor hidden from Weather (the shared arch series' zzyd-owner-hide-vmm.patch: kern.hv_vmm_present 0 for the processes
+    // named): under a VMM its VFX makes no argument encoder, so the materials bind no sampler or texture and its sky draws no cloud
+    // (Droid-VM/macOS-DroidVM f73fe08, whose own patch did the same for boot-arg vmm-hidden=, Weather by default). Every other
+    // process, WindowServer among them, still reads 1.
+    "owner-hide-vmm=Weather "
     // verbose boot: the console shows the kernel log until WindowServer takes the display
     "-v";

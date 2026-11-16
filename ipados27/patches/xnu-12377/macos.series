@@ -9,3 +9,4 @@ droidvm-macos-jetsam-floors.patch
 droidvm-macos-rootauth.patch
 droidvm-macos-owner-root-unverified.patch
 droidvm-macos-console-switch.patch
+droidvm-macos-gpu-bundles-sandbox-map.patch
