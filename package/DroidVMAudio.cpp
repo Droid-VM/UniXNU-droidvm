@@ -314,22 +314,35 @@ void DroidVMAudioDevice::run() {
         const uint64_t deadline = startTime + absolute(done + PeriodFrames);
         if (mach_absolute_time() > deadline + absolute(PeriodFrames)) droidvm_audio_late = droidvm_audio_late + 1;
         else clock_delay_until(deadline);
-        int16_t *at = buffer + uint32_t(done % RingFrames) * ch;
+        // A period need not divide the ring (240 into 8192): the one that straddles the end goes through a local copy, split at
+        // the end, so nothing reads, writes or erases past the ring.
+        const uint32_t head = uint32_t(done % RingFrames);
+        const uint32_t first = PeriodFrames < RingFrames - head ? PeriodFrames : RingFrames - head;
+        const uint32_t rest = PeriodFrames - first;
+        int16_t *at = buffer + head * ch;
+        int16_t period[PeriodFrames * OutputChannels];
+        int16_t *io = rest ? period : at;
         if (isInput) {
-            const uint32_t captured = droidvm_snd_capture(at, PeriodFrames);
-            if (captured < PeriodFrames) bzero(at + captured * ch, (PeriodFrames - captured) * 2 * ch);
+            const uint32_t captured = droidvm_snd_capture(io, PeriodFrames);
+            if (captured < PeriodFrames) bzero(io + captured * ch, (PeriodFrames - captured) * 2 * ch);
+            if (rest) { memcpy(at, period, first * 2 * ch); memcpy(buffer, period + first * ch, rest * 2 * ch); }
             droidvm_audio_captured = droidvm_audio_captured + captured;
         } else {
-            const uint32_t played = droidvm_snd_play(at, PeriodFrames);
-            bzero(at, PeriodFrames * 2 * ch);
+            if (rest) { memcpy(period, at, first * 2 * ch); memcpy(period + first * ch, buffer, rest * 2 * ch); }
+            const uint32_t played = droidvm_snd_play(io, PeriodFrames);
+            bzero(at, first * 2 * ch);
+            if (rest) bzero(buffer, rest * 2 * ch);
             droidvm_audio_played = droidvm_audio_played + played;
         }
         done += PeriodFrames;
-        if (done % RingFrames == 0) {
+        // The zero time stamp moves at every wrap this period crossed (done % RingFrames == 0 alone held only every 15th wrap,
+        // 240 frames into 8192).
+        if (done % RingFrames < PeriodFrames) {
+            const uint64_t wrap = done - done % RingFrames;
             EngineStatus *s = status();
-            s->hostTime = startTime + absolute(done);
+            s->hostTime = startTime + absolute(wrap);
             __asm__ volatile("dmb ish" ::: "memory");
-            s->sampleTime = done;
+            s->sampleTime = wrap;
             __asm__ volatile("dmb ish" ::: "memory");
         }
         droidvm_audio_periods = droidvm_audio_periods + 1;
