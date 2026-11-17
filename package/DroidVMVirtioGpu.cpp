@@ -105,7 +105,13 @@ alignas(16384) uint8_t hugeRequest[HugeRequest];
 #endif
 uint64_t hugeRequestPA;
 uint32_t hugeOwner = Slots;   // the slot the buffer is lent to; Slots when free
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+// From the heap as the device starts (allocateBuffers), as the buffers are: 24 KiB that a kext's __DATA pages are short of (the
+// macOS collection's room for the board's kexts is the holes the dropped Apple kexts leave). Nothing reads it before start().
+Slot *slots;
+#else
 Slot slots[Slots];
+#endif
 uintptr_t registers;
 uint64_t negotiated, nextFence, lastReturnUs, lastIrqUs;
 uint32_t nextResource;
@@ -244,6 +250,8 @@ uint64_t deadlineAfter(uint64_t us) { uint64_t abs; clock_interval_to_deadline(u
 // One physically contiguous, wired allocation for the queues and command buffers, each region 16 KiB aligned.
 bool allocateBuffers() {
     if (buffers) return true;
+    if (!slots) slots = IONewZero(Slot, Slots);
+    if (!slots) return false;
     const uint64_t sizes[] = {sizeof(*queues) * 2, sizeof(*requests) * Large, sizeof(*responses) * Large,
                               sizeof(*largeRequest) * LargeSlots, sizeof(*largeResponse) * LargeSlots, HugeRequest};
     uint64_t at[6], total = 0;
