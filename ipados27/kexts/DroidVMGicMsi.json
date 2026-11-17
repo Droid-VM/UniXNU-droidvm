@@ -1,0 +1,20 @@
+{
+  "_comment": "macOS: the MSI controller of crosvm's MBI SPIs (package/DroidVMGicMsi.cpp, from Droid-VM/macOS-DroidVM) on /arm-io/gic-mbi, the interrupt parent of Apple's PCIe bridge AppleVirtualPlatformPCIE on /arm-io/pcie (both nodes made by DarwinBoot from the FDT). The bridge's own personality wants an AppleARMIODevice nub; ArmDTPlatform's arm-io nubs are IOPlatformDevice.",
+  "name": "DroidVMGicMsi",
+  "bundle": "com.droidvm.driver.DroidVMGicMsi",
+  "version": "1.0.0",
+  "targets": ["macosx"],
+  "sources": ["DroidVMGicMsi.cpp"],
+  "builtin": [],
+  "personalities": {
+    "DroidVMGicMsi": {"IOClass": "DroidVMGicMsi", "IOProviderClass": "IOPlatformDevice", "IONameMatch": "droidvm,gic-mbi"}
+  },
+  "libraries": {
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "patch_personalities": {
+    "com.apple.driver.AppleVirtualPlatform": {"AppleVirtualPlatformPCIE": {"IOProviderClass": "IOPlatformDevice"}}
+  }
+}

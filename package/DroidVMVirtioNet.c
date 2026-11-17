@@ -35,6 +35,7 @@ extern int armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *),
 // The IOKit half (DroidVMVirtioNetIf.cpp).
 extern int droidvm_net_if_attach(const uint8_t mac[6]);
 extern void droidvm_net_if_input(const void *frame, unsigned length);
+extern void droidvm_net_if_without_mmio(void);
 
 enum {
     DROIDVM_NET_QUEUE = 64,          // descriptors per queue (<= crosvm's QueueNumMax)
@@ -288,6 +289,7 @@ static void droidvm_net_worker(void *parameter, wait_result_t result) {
     droidvm_net_stage = 4;
     if (droidvm_net_if_attach(droidvm_net.mac) != 0) {
         strlcpy(droidvm_net_status, "interface attach failed", sizeof(droidvm_net_status));
+        droidvm_net_if_without_mmio();
         return;
     }
     droidvm_net_stage = 5;
@@ -321,8 +323,23 @@ static void droidvm_net_worker(void *parameter, wait_result_t result) {
     }
 }
 
-// Called once from the late board probe (DroidVMStubs.c native_touch_probe), after the input devices.
+static void droidvm_net_without_mmio(void *parameter, wait_result_t result) {
+    (void)parameter; (void)result;
+    droidvm_net_if_without_mmio();
+}
+
+static bool net_start_mmio(void);
+
+// Called once from the late board probe (DroidVMStubs.c native_touch_probe), after the input devices. When no virtio-mmio network
+// comes up, droidvm_net_if_without_mmio runs on a thread of its own (it waits for another driver's interface).
 void droidvm_net_start(void) {
+    if (net_start_mmio()) return;
+    thread_t thread;
+    if (kernel_thread_start(droidvm_net_without_mmio, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+}
+
+// The virtio-mmio network at /arm-io/net brought up and its worker started (true), or none.
+static bool net_start_mmio(void) {
     uint32_t enabled = 1;
     PE_parse_boot_argn("droidvm-net", &enabled, sizeof(enabled));
     DTEntry armio, node;
@@ -330,29 +347,29 @@ void droidvm_net_start(void) {
     unsigned int size;
     uint64_t ranges[3], reg[2];
     if (!enabled || SecureDTLookupEntry(NULL, "/arm-io", &armio) != kSuccess ||
-        SecureDTGetProperty(armio, "ranges", &value, &size) != kSuccess || size < sizeof(ranges)) return;
+        SecureDTGetProperty(armio, "ranges", &value, &size) != kSuccess || size < sizeof(ranges)) return false;
     memcpy(ranges, value, sizeof(ranges));
-    if (SecureDTLookupEntry(NULL, "/arm-io/net", &node) != kSuccess) return;
+    if (SecureDTLookupEntry(NULL, "/arm-io/net", &node) != kSuccess) return false;
     droidvm_net_found = 1;
-    if (SecureDTGetProperty(node, "reg", &value, &size) != kSuccess || size != sizeof(reg)) return;
+    if (SecureDTGetProperty(node, "reg", &value, &size) != kSuccess || size != sizeof(reg)) return false;
     memcpy(reg, value, sizeof(reg));
-    if (reg[0] < ranges[0] || reg[1] < 0x108 || reg[1] > ranges[2] || reg[0] - ranges[0] > ranges[2] - reg[1]) return;
+    if (reg[0] < ranges[0] || reg[1] < 0x108 || reg[1] > ranges[2] || reg[0] - ranges[0] > ranges[2] - reg[1]) return false;
     droidvm_net_stage = 1;
     droidvm_net.registers = ml_io_map((vm_offset_t)(reg[0] - ranges[0] + ranges[1]), 0x1000);
     if (!droidvm_net.registers || net_read32(0x00) != 0x74726976 || net_read32(0x04) != 2 || net_read32(0x08) != 1) {
         strlcpy(droidvm_net_status, "no virtio-net at /arm-io/net", sizeof(droidvm_net_status));
-        return;
+        return false;
     }
     droidvm_net_stage = 2;
     if (!net_buffers()) {
         strlcpy(droidvm_net_status, "no memory for the queues", sizeof(droidvm_net_status));
-        return;
+        return false;
     }
     const char *why = net_bring_up();
     if (why) {
         strlcpy(droidvm_net_status, why, sizeof(droidvm_net_status));
         (void)net_reset();
-        return;
+        return false;
     }
     droidvm_net_stage = 3;
     droidvm_net.up = true;   // the transmit path is ready before the interface can call it
@@ -370,5 +387,7 @@ void droidvm_net_start(void) {
         struct { int importance; } precedence = {.importance = -40};
         thread_policy_set(thread, 3 /* THREAD_PRECEDENCE_POLICY */, (int *)&precedence, 1 /* THREAD_PRECEDENCE_POLICY_COUNT */);
         thread_deallocate(thread);
+        return true;
     }
+    return false;
 }

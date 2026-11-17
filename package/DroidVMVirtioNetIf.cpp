@@ -64,6 +64,7 @@ IOService *droidvm_wifi_create(const uint8_t mac[6], IOService *provider);
 void droidvm_ethernet_input(IOService *controller, const void *frame, unsigned length);
 int droidvm_net_if_attach(const uint8_t mac[6]);
 void droidvm_net_if_input(const void *frame, unsigned length);
+void droidvm_net_if_without_mmio(void);
 }
 
 static IOService *droidvm_net_nic;
@@ -168,4 +169,20 @@ int droidvm_net_if_attach(const uint8_t mac[6]) {
 
 void droidvm_net_if_input(const void *frame, unsigned length) {
     if (droidvm_net_nic) droidvm_ethernet_input(droidvm_net_nic, frame, length);
+}
+
+// No virtio-mmio network came up (none at /arm-io/net -- the VM's network is crosvm's virtio-net on PCI, which Apple's
+// AppleVirtIONetwork drives, or it has none -- or its bring-up failed). On macOS the resource IOTimeSyncRootService waits for is
+// published all the same, once some Ethernet interface is registered, or after 10 s without one, so that IOTimeSync (and with it
+// clocksyncd and WindowServer) does not wait for this driver forever. Called on a thread of its own: it blocks.
+void droidvm_net_if_without_mmio(void) {
+#if DROIDVM_NET_APPLE_FAMILY
+    if (OSDictionary *match = IOService::serviceMatching("IOEthernetInterface")) {
+        IOService *found = IOService::waitForMatchingService(match, 10000ULL * 1000 * 1000);
+        droidvm_net_if_stage = found ? 8 : 9;
+        OSSafeReleaseNULL(found);
+        match->release();
+    }
+    IOService::publishResource("DroidVMNetwork");
+#endif
 }
