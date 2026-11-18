@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Modern virtio-mmio GPU transport. No renderer or display policy belongs here.
+// On crosvm's PCI host (macOS, DROIDVM_VIRTIO_PCI): without /arm-io/virtio-gpu, the virtio-pci GPU function DroidVMVirtioPCI holds
+// (DroidVMVirtioPciNub.cpp), through DroidVMVirtioPci.c, which turns the virtio-mmio register accesses below into the PCI ones;
+// its MSI-X vector raises an MBI SPI of its own, set before the queues.
 #include "DroidVMVirtioGpu.h"
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
@@ -9,6 +12,9 @@
 #endif
 #include <machine/machine_routines.h>
 #include <pexpert/device_tree.h>
+#if DROIDVM_VIRTIO_PCI
+#include "DroidVMVirtioPci.h"
+#endif
 extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 // ArmCpu (the GIC): a handler for one SPI, run in the primary interrupt context before the EOI.
 extern "C" IOReturn armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback,
@@ -125,10 +131,19 @@ bool attempted;
 uint64_t returned;
 // A waiter watches the used ring for every waiter (awaitReturn); the others sleep on `returned` until it moves.
 bool watching;
+#if DROIDVM_VIRTIO_PCI
+struct droidvm_vio_pci *pci;   // a virtio-pci function (registers unused), or null
+#endif
 uint32_t rd(unsigned offset) {
+#if DROIDVM_VIRTIO_PCI
+    if (pci) return droidvm_vio_pci_read(pci, offset, 4);
+#endif
     uint32_t v; __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(registers + offset) : "memory"); return v;
 }
 void wr(unsigned offset, uint32_t v) {
+#if DROIDVM_VIRTIO_PCI
+    if (pci) { droidvm_vio_pci_write(pci, offset, v, 4); return; }
+#endif
     __asm__ volatile("str %w0, [%1]\n\tdsb oshst" :: "r"(v), "r"(registers + offset) : "memory");
 }
 void wr64(unsigned offset, uint64_t v) { wr(offset, uint32_t(v)); wr(offset + 4, uint32_t(v >> 32)); }
@@ -277,16 +292,26 @@ bool start() {
     if (attempted) return ready();
     attempted = true;
     DTEntry armio, node; const void *value; unsigned size; uint64_t ranges[3], reg[2];
-    if (SecureDTLookupEntry(nullptr, "/arm-io/virtio-gpu", &node) != kSuccess) return false;
+    const bool window = SecureDTLookupEntry(nullptr, "/arm-io/virtio-gpu", &node) == kSuccess;
+#if DROIDVM_VIRTIO_PCI
+    // the display starts before the PCI host has enumerated: take waits for it (up to 10 s)
+    if (!window && !(pci = droidvm_vio_pci_take(16, nullptr, 10000))) return false;
+#else
+    if (!window) return false;
+#endif
     droidvm_virtio_gpu_state = 1;
-    if (SecureDTLookupEntry(nullptr, "/arm-io", &armio) != kSuccess ||
-        SecureDTGetProperty(armio, "ranges", &value, &size) != kSuccess || size != sizeof ranges) return fail("no arm-io ranges");
-    memcpy(ranges, value, sizeof ranges);
-    if (SecureDTGetProperty(node, "reg", &value, &size) != kSuccess || size != sizeof reg) return fail("no reg");
-    memcpy(reg, value, sizeof reg);
-    if (reg[0] < ranges[0] || reg[1] < 0x100 || reg[1] > ranges[2] || reg[0] - ranges[0] > ranges[2] - reg[1]) return fail("invalid reg");
-    registers = ml_io_map(reg[0] - ranges[0] + ranges[1], 0x1000);
-    if (!registers || rd(0) != 0x74726976 || rd(4) != 2 || rd(8) != 16) return fail("not a modern virtio GPU");
+    if (window) {
+        if (SecureDTLookupEntry(nullptr, "/arm-io", &armio) != kSuccess ||
+            SecureDTGetProperty(armio, "ranges", &value, &size) != kSuccess || size != sizeof ranges) return fail("no arm-io ranges");
+        memcpy(ranges, value, sizeof ranges);
+        if (SecureDTGetProperty(node, "reg", &value, &size) != kSuccess || size != sizeof reg) return fail("no reg");
+        memcpy(reg, value, sizeof reg);
+        if (reg[0] < ranges[0] || reg[1] < 0x100 || reg[1] > ranges[2] || reg[0] - ranges[0] > ranges[2] - reg[1])
+            return fail("invalid reg");
+        registers = ml_io_map(reg[0] - ranges[0] + ranges[1], 0x1000);
+        if (!registers) return fail("not mapped");
+    }
+    if (rd(0) != 0x74726976 || rd(4) != 2 || rd(8) != 16) return fail("not a modern virtio GPU");
 #if DROIDVM_VIRTIO_GPU_DYNAMIC
     if (!allocateBuffers()) return fail("no contiguous command buffers");
 #endif
@@ -315,6 +340,14 @@ bool start() {
     negotiated = (uint64_t(high) << 32) | low;
     wr(0x24, 0); wr(0x20, low); wr(0x24, 1); wr(0x20, high); wr(0x70, 11);
     if (!(rd(0x70) & 8)) return fail("features refused");
+#if DROIDVM_VIRTIO_PCI
+    // MSI-X before the queues: each takes vector 0 as it is enabled
+    if (pci) {
+        const char *why = droidvm_vio_pci_interrupt(pci, interrupt, nullptr);
+        droidvm_virtio_gpu_irq_attach = why ? kIOReturnNotAttached : kIOReturnSuccess;
+        if (!why) droidvm_virtio_gpu_intid = pci->intid;
+    }
+#endif
     // The control queue holds every slot's two descriptors; the cursor queue stays as small as the device allows.
     const uint32_t sizes[2] = {QueueSize, 4}, availAt[2] = {AvailOffset, 128}, usedAt[2] = {UsedOffset, 256};
     for (unsigned q = 0; q < 2; ++q) {
@@ -328,7 +361,7 @@ bool start() {
     barrier(); wr(0x70, 15);
     if ((rd(0x70) & 0x4f) != 15) return fail("device not ready");
     // The window's interrupt (DarwinBoot copies it from the FDT): without one, the watch never sleeps on it and keeps polling.
-    if (SecureDTGetProperty(node, "droidvm,intid", &value, &size) == kSuccess && size == sizeof(uint32_t)) {
+    if (window && SecureDTGetProperty(node, "droidvm,intid", &value, &size) == kSuccess && size == sizeof(uint32_t)) {
         uint32_t intid; memcpy(&intid, value, sizeof intid);
         droidvm_virtio_gpu_irq_attach = armcpu_spi_attach(intid, false, interrupt, nullptr, nullptr, nullptr);
         if (droidvm_virtio_gpu_irq_attach == kIOReturnSuccess) droidvm_virtio_gpu_intid = intid;

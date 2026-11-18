@@ -7,6 +7,9 @@
 // and a GET_PARAM(GPU_ID) ccmd answered there. Its progress is droidvm_virtgpu_selftest, for peek.py: the stage it reached
 // and the status there, the capset's GPU id and context type, the shmem's pool offset, and the ccmd's return value and GPU id.
 #include "DroidVMVirtioGpu.h"
+#if DROIDVM_VIRTIO_PCI
+#include "DroidVMVirtioPci.h"
+#endif
 #include <IOKit/IOMemoryDescriptor.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
@@ -43,10 +46,17 @@ struct Shmem { uint32_t seqno, responseOffset; };
 // vdrm_ccmd_req, then msm_ccmd_ioctl_simple_req's ioctl and its drm_msm_param payload (at byte 20, so assembled bytewise).
 struct DrmMsmParam { uint32_t pipe, param; uint64_t value; uint32_t length, pad; };
 void stage(uint64_t reached, uint64_t status) { droidvm_virtgpu_selftest[0] = reached; droidvm_virtgpu_selftest[1] = status; }
+// The pool: the GPU window's drm-host-pool, or /arm-io/pcie's for a virtio-pci GPU (DroidVMVirtioGpu.cpp).
 bool pool(uint64_t &base, uint64_t &size) {
     DTEntry node; const void *value; unsigned length;
     if (SecureDTLookupEntry(nullptr, "/arm-io/virtio-gpu", &node) != kSuccess ||
-        SecureDTGetProperty(node, "drm-host-pool", &value, &length) != kSuccess || length != 16) return false;
+        SecureDTGetProperty(node, "drm-host-pool", &value, &length) != kSuccess || length != 16) {
+#if DROIDVM_VIRTIO_PCI
+        return droidvm_vio_pci_pool("drm-host-pool", &base, &size) && base;
+#else
+        return false;
+#endif
+    }
     memcpy(&base, value, 8); memcpy(&size, static_cast<const uint8_t *>(value) + 8, 8);
     return base && size;
 }

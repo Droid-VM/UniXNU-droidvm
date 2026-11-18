@@ -106,8 +106,11 @@ def main():
             # The macOS kernel compiles for arm64e-apple-ios and tells its own sources apart by XNU_TARGET_OS_OSX; Apple's family
             # headers ask TARGET_OS_OSX (macOS IOStorageFamily's IOBlockStorageDevice has three more slots under it).
             defines += ('-UTARGET_OS_OSX', '-DTARGET_OS_OSX=1')
+            # The board's drivers on crosvm's PCI host too (package/DroidVMVirtioPci.h): a spec's sources_macosx adds the transport.
+            defines += ('-DDROIDVM_VIRTIO_PCI=1',)
         objects = []
-        groups = [{'sources': spec.get('sources', []), 'flags': [], 'warnings': True}, *spec.get('groups', [])]
+        sources = spec.get('sources', []) + (spec.get('sources_macosx', []) if droidvm_kexts.target(args.target) == 'macosx' else [])
+        groups = [{'sources': sources, 'flags': [], 'warnings': True}, *spec.get('groups', [])]
         for group in groups:
             flags = [f.replace('{tree}', str(tree)) for f in group.get('flags', [])]
             for source in group['sources']:

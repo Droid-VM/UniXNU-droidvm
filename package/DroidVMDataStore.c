@@ -17,6 +17,10 @@
 // contiguous. A write is complete when crosvm has written it to the file, so it survives a stop or crash of the VM: the host's
 // page cache holds it. For a phone that loses power, a flusher thread asks crosvm to fsync the file DROIDVM_STORE_FLUSH_MS after
 // a write at the latest, and sync() flushes at once.
+//
+// On crosvm's PCI host (macOS, DROIDVM_VIRTIO_PCI): without the window, the virtio-pci block function DroidVMVirtioPCI holds as the
+// Data store -- the one whose block 0 carries the label (DroidVMVirtioPciNub.cpp reads it; the others are Apple's) -- through
+// DroidVMVirtioPci.c, which turns the virtio-mmio register accesses below into the PCI ones. Polled as the window is.
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -27,6 +31,10 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
+#if DROIDVM_VIRTIO_PCI
+#include "DroidVMVirtioPci.h"
+static struct droidvm_vio_pci *droidvm_store_pci;   // a virtio-pci function (the registers unused), or NULL
+#endif
 
 extern void IOSleep(unsigned milliseconds);
 
@@ -77,9 +85,15 @@ static lck_grp_t *droidvm_store_group;
 static lck_mtx_t *droidvm_store_lock;
 
 static uint32_t store_read32(unsigned offset) {
+#if DROIDVM_VIRTIO_PCI
+    if (droidvm_store_pci) return droidvm_vio_pci_read(droidvm_store_pci, offset, 4);
+#endif
     return *(volatile uint32_t *)(droidvm_store_registers + offset);
 }
 static void store_write32(unsigned offset, uint32_t value) {
+#if DROIDVM_VIRTIO_PCI
+    if (droidvm_store_pci) { droidvm_vio_pci_write(droidvm_store_pci, offset, value, 4); return; }
+#endif
     *(volatile uint32_t *)(droidvm_store_registers + offset) = value;
     __asm__ volatile("dsb oshst" ::: "memory");
 }
@@ -174,22 +188,29 @@ static bool store_request(uint32_t type, uint64_t sector, uint32_t bytes) {
     return valid;
 }
 
-// Finds /arm-io/data-store, maps it and brings the device up; returns the reason it cannot, or NULL.
+// Finds /arm-io/data-store (or, on the PCI host, the function held as the Data store), maps it and brings the device up; returns
+// the reason it cannot, or NULL.
 static const char *store_attach(unsigned mode) {
     DTEntry armio, node;
     const void *value;
     unsigned int size;
     uint64_t ranges[3], reg[2];
-    if (SecureDTLookupEntry(NULL, "/arm-io", &armio) != kSuccess ||
-        SecureDTGetProperty(armio, "ranges", &value, &size) != kSuccess || size < sizeof(ranges)) return "no /arm-io ranges";
-    memcpy(ranges, value, sizeof(ranges));
-    if (SecureDTLookupEntry(NULL, "/arm-io/data-store", &node) != kSuccess) return "no /arm-io/data-store";
-    if (SecureDTGetProperty(node, "reg", &value, &size) != kSuccess || size != sizeof(reg)) return "no data-store reg";
-    memcpy(reg, value, sizeof(reg));
-    if (reg[0] < ranges[0] || reg[1] < 0x108 || reg[1] > ranges[2] || reg[0] - ranges[0] > ranges[2] - reg[1])
-        return "data-store reg outside /arm-io";
-    droidvm_store_registers = ml_io_map((vm_offset_t)(reg[0] - ranges[0] + ranges[1]), 0x1000);
-    if (!droidvm_store_registers) return "cannot map the data-store registers";
+    if (SecureDTLookupEntry(NULL, "/arm-io/data-store", &node) == kSuccess) {
+        if (SecureDTLookupEntry(NULL, "/arm-io", &armio) != kSuccess ||
+            SecureDTGetProperty(armio, "ranges", &value, &size) != kSuccess || size < sizeof(ranges)) return "no /arm-io ranges";
+        memcpy(ranges, value, sizeof(ranges));
+        if (SecureDTGetProperty(node, "reg", &value, &size) != kSuccess || size != sizeof(reg)) return "no data-store reg";
+        memcpy(reg, value, sizeof(reg));
+        if (reg[0] < ranges[0] || reg[1] < 0x108 || reg[1] > ranges[2] || reg[0] - ranges[0] > ranges[2] - reg[1])
+            return "data-store reg outside /arm-io";
+        droidvm_store_registers = ml_io_map((vm_offset_t)(reg[0] - ranges[0] + ranges[1]), 0x1000);
+        if (!droidvm_store_registers) return "cannot map the data-store registers";
+    }
+#if DROIDVM_VIRTIO_PCI
+    else if ((droidvm_store_pci = droidvm_vio_pci_take(2, "data-store", 5000)) == NULL) return "no /arm-io/data-store, none on PCI";
+#else
+    else return "no /arm-io/data-store";
+#endif
     if (store_read32(0x00) != 0x74726976 || store_read32(0x04) != 2 || store_read32(0x08) != 2)
         return "data-store is no modern virtio-mmio block device";
 #if DROIDVM_DEVICE_DYNAMIC

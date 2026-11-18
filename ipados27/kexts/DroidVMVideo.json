@@ -9,6 +9,7 @@
     "DroidVMVTHost.cpp",
     "DroidVMVTParavirt.cpp"
   ],
+  "sources_macosx": ["DroidVMVirtioPci.c", "DroidVMVirtioPciWatch.cpp"],
   "attach": [
     "droidvm_media_start",
     "droidvm_vt_paravirt_attach"

@@ -5,7 +5,8 @@
   "version": "1.0.0",
   "targets": ["macosx"],
   "groups": [
-    {"sources": ["macos/DroidVMDisplay.cpp", "DroidVMVirtioGpu.cpp", "DroidVMVirtioGpu3D.cpp"],
+    {"sources": ["macos/DroidVMDisplay.cpp", "DroidVMVirtioGpu.cpp", "DroidVMVirtioGpu3D.cpp", "DroidVMVirtioPci.c",
+                 "DroidVMVirtioPciWatch.cpp"],
      "flags": ["-I", "{tree}/kits/droidvm", "-I", "{tree}/drivers/Adreno740", "-DDROIDVM_VIRTIO_GPU_DYNAMIC=1"]}
   ],
   "object_lists": ["tree:build/droidvm-gpu/kext-objects.json"],

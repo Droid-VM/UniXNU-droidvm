@@ -39,10 +39,26 @@ extern "C" int native_verified_block_volume_device(const char *, dev_t *, char *
 extern "C" int native_verified_block_manifest_sha384(dev_t, const char *, uint8_t[48]);
 extern "C" int native_ram_block_volume_seed(const char *, dev_t *, char *, size_t, uint64_t *, uint64_t *, uint8_t *);
 extern "C" int native_ram_block_gpu_addon(const uint8_t **, uint64_t *);
+// The Data volume, waited for: the kernel asks for it once the root is mounted (load_init_program), and NativeRamBlock, matched on
+// IOBSD beside the root's disks, can still be bringing its disk up then -- the root won the race on 5566 (macOS, its disks and the
+// Data store on PCI, 11-18: the root disk7s1 where a good boot has disk8s1, "offline scratch Data mount failed: 2"). MMIO boots had
+// the same race and won it. Up to 30 s, then the lookup's answer as before.
+static int volumeSeedWaiting(const char *uuid, dev_t *device, char *path, size_t size, uint64_t *base, uint64_t *bytes,
+                             uint8_t *digest)
+{
+    for (unsigned waited = 0;; waited += 100) {
+        if (native_ram_block_volume_seed(uuid, device, path, size, base, bytes, digest)) {
+            if (waited) IOLog("DroidVMSourceStorage: the Data volume came %u ms after it was asked for\n", waited);
+            return 1;
+        }
+        if (waited >= 30000) return 0;
+        IOSleep(100);
+    }
+}
 // The kext's own disks answer the kernel (these names resolve inside the kext first; the kernel's are DroidVMStorageHooks.c's).
 static const droidvm_storage_ops kStorageOps = {
     native_verified_block_root_authorized, native_verified_block_volume_device, native_verified_block_manifest_sha384,
-    native_ram_block_volume_seed, native_ram_block_gpu_addon,
+    volumeSeedWaiting, native_ram_block_gpu_addon,
 };
 #endif
 extern "C" bool native_source_root_policies_load(void);

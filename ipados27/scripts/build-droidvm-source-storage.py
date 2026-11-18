@@ -150,10 +150,15 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
         # call to reportRemovability (macOS slot 0x8f8) failed authentication on reportMediaState's entry (macOS-DroidVM
         # build-native-ram-block.py: 35 slots differ without it).
         flags += ['-UTARGET_OS_OSX', '-DTARGET_OS_OSX=1']
+        # The Data store on crosvm's PCI host too (package/DroidVMDataStore.c): the virtio-pci transport and the take of the function
+        # DroidVMVirtioPCI holds.
+        flags += ['-DDROIDVM_VIRTIO_PCI=1']
     late = {'IOBlockStorageDevice.cpp', 'NativeVirtioBlock.cpp', 'NativeRamBlock.cpp'}
     sources = [base, virtio, tree / 'drivers/RamBlock/NativeRamBlock.cpp',
                package / 'DroidVMSourceStorage.cpp', package / 'DroidVMSourceRootPolicies.cpp', package / 'DroidVMDataStore.c',
                tree / 'kits/VerifiedRoot/src/verified_root.c', tree / 'kits/VerifiedRoot/adapters/xnu_crypto.c', anchor]
+    if os.environ.get('UNIXNU_XNU_TARGET') == 'macosx':
+        sources += [package / 'DroidVMVirtioPci.c', package / 'DroidVMVirtioPciWatch.cpp']
     objects, inputs = [], {}
     objcopy = shutil.which('llvm-objcopy') or '/opt/homebrew/opt/llvm/bin/llvm-objcopy'
     for source in sources:

@@ -50,6 +50,7 @@
 #endif
 #if DROIDVM_VIRTIO_PCI
 #include "DroidVMVirtioPci.h"
+const char *droidvm_input_add_pci(struct droidvm_vio_pci *pci);
 #endif
 
 extern void IOSleep(unsigned milliseconds);
@@ -979,9 +980,6 @@ bool droidvm_motion_present(void) {
     return droidvm_motion_found;
 }
 
-#if DROIDVM_VIRTIO_PCI
-extern void droidvm_vio_pci_watch(void);     // DroidVMVirtioPciWatch.cpp
-#endif
 
 // Called once from the late board probe (DroidVMStubs.c native_touch_probe).
 void droidvm_input_start(void) {
@@ -989,7 +987,7 @@ void droidvm_input_start(void) {
     PE_parse_boot_argn("droidvm-input", &enabled, sizeof(enabled));
 #if DROIDVM_VIRTIO_PCI
     // the virtio-pci input functions, those held by now and those to come (handed over by droidvm_input_add_pci)
-    if (enabled) droidvm_vio_pci_watch();
+    if (enabled) droidvm_vio_pci_watch(18, droidvm_input_add_pci);
 #endif
     DTEntry armio;
     const void *value;

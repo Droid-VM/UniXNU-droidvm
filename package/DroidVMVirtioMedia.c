@@ -22,6 +22,11 @@
 // At start every device is checked once: OPEN, VIDIOC_ENUM_FMT on each of its queues, CLOSE; the result is in
 // droidvm_media_status[N] for the host rig (peek.py).
 //
+// On crosvm's PCI host (macOS, DROIDVM_VIRTIO_PCI): the virtio-pci virtio-media functions DroidVMVirtioPCI holds
+// (DroidVMVirtioPciNub.cpp) come after the windows, through DroidVMVirtioPci.c, which turns the virtio-mmio register accesses below
+// into the PCI ones; the pool is /arm-io/pcie's media-host-pool, and each function's MSI-X vector raises an MBI SPI of its own,
+// set before the queues.
+//
 // droidvm-media=0 leaves the devices alone.
 #include <stdint.h>
 #include <stdbool.h>
@@ -34,6 +39,9 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
+#if DROIDVM_VIRTIO_PCI
+#include "DroidVMVirtioPci.h"
+#endif
 #if DROIDVM_DEVICE_DYNAMIC
 #include "DroidVMDmaRegion.h"
 #endif
@@ -67,6 +75,9 @@ _Static_assert(sizeof(struct media_desc) == 16 && sizeof(struct v4l2_fmtdesc) ==
 
 struct media_device {
     uintptr_t registers;
+#if DROIDVM_VIRTIO_PCI
+    struct droidvm_vio_pci *pci;       // a virtio-pci function (registers unused), or NULL
+#endif
     uint64_t pool_base, pool_size;     // the media_host pool (absolute GPA)
     uint32_t device_caps, device_type;
     char card[33];
@@ -122,11 +133,17 @@ char droidvm_media_status[MEDIA_MAX][192];
 
 // A trapped MMIO access must be a single load/store with a plain base register (see DroidVMVirtioInput.c).
 static uint32_t media_read32(const struct media_device *d, unsigned offset) {
+#if DROIDVM_VIRTIO_PCI
+    if (d->pci) return droidvm_vio_pci_read(d->pci, offset, 4);
+#endif
     uint32_t value;
     __asm__ volatile("ldr %w0, [%1]" : "=r"(value) : "r"(d->registers + offset) : "memory");
     return value;
 }
 static void media_write32(const struct media_device *d, unsigned offset, uint32_t value) {
+#if DROIDVM_VIRTIO_PCI
+    if (d->pci) { droidvm_vio_pci_write(d->pci, offset, value, 4); return; }
+#endif
     __asm__ volatile("str %w0, [%1]\n\tdsb oshst" :: "r"(value), "r"(d->registers + offset) : "memory");
 }
 static void media_write64(const struct media_device *d, unsigned offset, uint64_t value) {
@@ -345,6 +362,10 @@ static const char *bring_up(struct media_device *d) {
     media_write32(d, 0x24, 1); media_write32(d, 0x20, high);
     media_write32(d, 0x70, 11);         // FEATURES_OK
     if (!(media_read32(d, 0x70) & 8)) return "features refused";
+#if DROIDVM_VIRTIO_PCI
+    // MSI-X before the queues: each takes vector 0 as it is enabled
+    if (d->pci) d->irq = !droidvm_vio_pci_interrupt(d->pci, media_interrupt, d);
+#endif
     for (unsigned q = 0; q < 2; ++q) {
         memset(media_rings[index_of(d)][q], 0, 4096);
         *(volatile uint16_t *)(media_rings[index_of(d)][q] + 1024) = 0;   // used-buffer interrupts
@@ -355,7 +376,7 @@ static const char *bring_up(struct media_device *d) {
         media_write64(d, 0x80, base); media_write64(d, 0x90, base + 1024); media_write64(d, 0xa0, base + 2048);
         media_write32(d, 0x44, 1);
     }
-    d->irq = d->interrupt_id && !armcpu_spi_attach(d->interrupt_id, false, media_interrupt, d, NULL, NULL);
+    if (!d->irq) d->irq = d->interrupt_id && !armcpu_spi_attach(d->interrupt_id, false, media_interrupt, d, NULL, NULL);
     media_barrier();
     media_write32(d, 0x70, 15);         // DRIVER_OK
     if ((media_read32(d, 0x70) & 0x4f) != 15) return "device not ready";
@@ -482,6 +503,35 @@ void droidvm_media_start(void) {
         snprintf(line, line_size, "%s: up, caps %#x type %u, pool %#llx+%#llx, %s", d->card, d->device_caps, d->device_type,
                  d->pool_base, d->pool_size, d->irq ? "interrupt" : "polled");
     }
+#if DROIDVM_VIRTIO_PCI
+    uint64_t pool_base = 0, pool_size = 0;
+    (void)droidvm_vio_pci_pool("media-host-pool", &pool_base, &pool_size);
+    struct droidvm_vio_pci *pci;
+    while (media_count < MEDIA_MAX && (pci = droidvm_vio_pci_take(VIRTIO_ID_MEDIA, NULL, 5000)) != NULL) {
+        const unsigned n = media_count;
+        struct media_device *d = &media[n];
+        char *line = droidvm_media_status[n];
+        const size_t line_size = sizeof(droidvm_media_status[0]);
+        ++media_count;
+        droidvm_media_found = media_count;
+        d->pci = pci;
+        d->pool_base = pool_base, d->pool_size = pool_size;
+        droidvm_media_stage[n] = 2;
+        if (!(d->lock = lck_mtx_alloc_init(media_group, LCK_ATTR_NULL))) { snprintf(line, line_size, "no lock"); continue; }
+        const char *why = bring_up(d);
+        if (why) {
+            snprintf(line, line_size, "PCI %02x:%02x.%x: %s", pci->bus, pci->slot, pci->function, why);
+            media_write32(d, 0x70, 0);
+            droidvm_vio_pci_quiet(pci);
+            continue;
+        }
+        d->up = true;
+        droidvm_media_up++;
+        droidvm_media_stage[n] = 3;
+        snprintf(line, line_size, "%s: up on PCI %02x:%02x.%x, caps %#x type %u, pool %#llx+%#llx, %s", d->card, pci->bus, pci->slot,
+                 pci->function, d->device_caps, d->device_type, d->pool_base, d->pool_size, d->irq ? "interrupt" : "polled");
+    }
+#endif
     if (droidvm_media_up) {
         thread_t thread;
         if (kernel_thread_start(media_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);

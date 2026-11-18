@@ -48,6 +48,17 @@ const char *droidvm_vio_pci_open(struct droidvm_vio_pci *p, uint8_t bus, uint8_t
 const char *droidvm_vio_pci_interrupt(struct droidvm_vio_pci *p, void (*handler)(void *), void *context);
 // The interrupt off again (a device the driver could not start): its SPI masked, MSI-X off.
 void droidvm_vio_pci_quiet(struct droidvm_vio_pci *p);
+// A host pool a virtio-mmio window's node carries (drm-host-pool, media-host-pool), which DarwinBoot puts on /arm-io/pcie for the
+// PCI devices: its guest-physical base and size. false without one.
+bool droidvm_vio_pci_pool(const char *name, uint64_t *base, uint64_t *size);
+
+// DroidVMVirtioPciWatch.cpp (C++, in each driver's kext): the functions DroidVMVirtioPCI holds (DroidVMVirtioPciNub.cpp).
+// The next one of virtio type `type` (and role, when given: "data-store" for the Data disk's virtio-blk) no driver has taken yet,
+// lowest PCI address first, opened (droidvm_vio_pci_open) and marked taken; NULL when there is none. When an untaken PCI
+// function of that type has no holder yet, waits up to wait_ms for it.
+struct droidvm_vio_pci *droidvm_vio_pci_take(uint32_t type, const char *role, uint32_t wait_ms);
+// Hands each function of `type` held now or later to add (NULL: it is the driver's now; otherwise why not).
+void droidvm_vio_pci_watch(uint32_t type, const char *(*add)(struct droidvm_vio_pci *));
 uint32_t droidvm_vio_pci_read(struct droidvm_vio_pci *p, unsigned offset, unsigned width);
 void droidvm_vio_pci_write(struct droidvm_vio_pci *p, unsigned offset, uint32_t value, unsigned width);
 #ifdef __cplusplus

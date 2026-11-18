@@ -13,6 +13,12 @@ char PE_builtin_boot_args[] =
     "ml-timeout-lock-panic-scale=40 "
     "ml-timeout-lock-scale=40 "
     "ml-timeout-debug-ack-scale=100 "
+    // no panic for a slow MMIO access: a development kernel times every ml_io_read/ml_io_write (Apple's PCI drivers' register
+    // accesses) against the interrupt-masked timeout, 500 us, and panics past it; in a VM each access traps to crosvm, which took
+    // 557 us for the xHCI driver's host controller reset once (5566, 11-18: "Write to IO vaddr ... paddr 0x2000020 (value: 0x2)
+    // timed out"). 0 here keeps the reports off instead of inheriting that timeout.
+    "ml-timeout-report-phy-read-delay=0 "
+    "ml-timeout-report-phy-write-delay=0 "
     // the console on the VM's UART and the serial keyboard (droidvm-serial-uarts.patch), as on iPadOS
     "serial=3 "
     // every process may open the GPU's accelerator, the sandbox deciding (DroidVMGpu.cpp grantedProcesses), as on iPadOS

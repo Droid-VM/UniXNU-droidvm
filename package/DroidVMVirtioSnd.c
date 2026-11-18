@@ -17,6 +17,10 @@
 //   droidvm_snd_capture(frames, count)      take one period of mono S16 from the microphone, if the device has one ready
 // Without the device the engine runs on its own clock and plays into silence.
 //
+// On crosvm's PCI host (macOS, DROIDVM_VIRTIO_PCI): without the window, the virtio-pci virtio-snd function DroidVMVirtioPCI holds
+// (DroidVMVirtioPciNub.cpp) is the device, through DroidVMVirtioPci.c, which turns the virtio-mmio register accesses below into
+// the PCI ones; its MSI-X vector raises an MBI SPI of its own, set before the queues.
+//
 // droidvm-snd=0 leaves the device alone.
 #include <stdint.h>
 #include <stdbool.h>
@@ -31,6 +35,9 @@
 #include <pexpert/device_tree.h>
 #if DROIDVM_DEVICE_DYNAMIC
 #include "DroidVMDmaRegion.h"
+#endif
+#if DROIDVM_VIRTIO_PCI
+#include "DroidVMVirtioPci.h"
 #endif
 
 extern int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);
@@ -89,6 +96,9 @@ static bool snd_buffers(void) { return true; }
 
 static struct {
     uintptr_t registers;
+#if DROIDVM_VIRTIO_PCI
+    struct droidvm_vio_pci *pci;      // a virtio-pci function (registers unused), or NULL
+#endif
     int32_t out_stream, in_stream;    // -1: none
     uint8_t in_channels;              // what the input stream takes (its minimum when that is above one)
     uint16_t avail[4], used[4];       // our indices into each queue's available and used rings
@@ -112,11 +122,17 @@ char droidvm_snd_status[64];
 
 // A trapped MMIO access must be a single load/store with a plain base register (see DroidVMVirtioInput.c).
 static uint32_t snd_read32(unsigned offset) {
+#if DROIDVM_VIRTIO_PCI
+    if (snd.pci) return droidvm_vio_pci_read(snd.pci, offset, 4);
+#endif
     uint32_t value;
     __asm__ volatile("ldr %w0, [%1]" : "=r"(value) : "r"(snd.registers + offset) : "memory");
     return value;
 }
 static void snd_write32(unsigned offset, uint32_t value) {
+#if DROIDVM_VIRTIO_PCI
+    if (snd.pci) { droidvm_vio_pci_write(snd.pci, offset, value, 4); return; }
+#endif
     __asm__ volatile("str %w0, [%1]\n\tdsb oshst" :: "r"(value), "r"(snd.registers + offset) : "memory");
 }
 static void snd_write64(unsigned offset, uint64_t value) {
@@ -384,6 +400,10 @@ static const char *snd_bring_up(void) {
     snd_write32(0x24, 1); snd_write32(0x20, high);
     snd_write32(0x70, 11);         // FEATURES_OK
     if (!(snd_read32(0x70) & 8)) return "features refused";
+#if DROIDVM_VIRTIO_PCI
+    // MSI-X before the queues: each takes vector 0 as it is enabled
+    if (snd.pci) snd.irq = !droidvm_vio_pci_interrupt(snd.pci, snd_interrupt, NULL);
+#endif
     for (unsigned q = 0; q < 4; ++q) {
         memset(snd_rings[q], 0, sizeof(snd_rings[q]));
         *(volatile uint16_t *)(snd_rings[q] + 1024) = 0;   // used-buffer interrupts
@@ -399,7 +419,7 @@ static const char *snd_bring_up(void) {
         post(SND_EVENT, i);
     }
     snd.tx_free = SND_SLOTS;
-    snd.irq = snd.interrupt_id && !armcpu_spi_attach(snd.interrupt_id, false, snd_interrupt, NULL, NULL, NULL);
+    if (!snd.irq) snd.irq = snd.interrupt_id && !armcpu_spi_attach(snd.interrupt_id, false, snd_interrupt, NULL, NULL, NULL);
     thread_t worker;
     if (kernel_thread_start(snd_worker, NULL, &worker) != KERN_SUCCESS) return "cannot start the worker";
     thread_deallocate(worker);
@@ -459,8 +479,32 @@ static void snd_selftest_thread(void *arg, wait_result_t result) {
     droidvm_snd_selftest_done = 1;
 }
 
+// The device at snd.registers (or snd.pci) brought up, with what happened in droidvm_snd_status.
+static void snd_open(const char *where) {
+    droidvm_snd_found = 1;
+    if (snd_read32(0x00) != 0x74726976 || snd_read32(0x04) != 2 || snd_read32(0x08) != 25) {
+        snprintf(droidvm_snd_status, sizeof(droidvm_snd_status), "no virtio-snd at %s", where);
+        return;
+    }
+    droidvm_snd_stage = 2;
+    const char *why = snd_bring_up();
+    if (why) {
+        strlcpy(droidvm_snd_status, why, sizeof(droidvm_snd_status));
+        snd_write32(0x70, 0);
+#if DROIDVM_VIRTIO_PCI
+        if (snd.pci) droidvm_vio_pci_quiet(snd.pci);
+#endif
+        return;
+    }
+    snd.up = true;
+    droidvm_snd_stage = 3;
+    snprintf(droidvm_snd_status, sizeof(droidvm_snd_status), "up: output stream %d, input stream %d x%u, %s",
+             snd.out_stream, snd.in_stream, snd.in_channels, snd.irq ? "interrupt" : "polled");
+}
+
 // Called once from the late board probe (DroidVMStubs.c native_touch_probe). The audio device is published either way: with
-// no virtio-snd window it runs on its own clock and plays into silence, so iOS's audio stack still has its built-in device.
+// no virtio-snd window or function it runs on its own clock and plays into silence, so iOS's audio stack still has its built-in
+// device.
 void droidvm_snd_start(void) {
     uint32_t enabled = 1;
     PE_parse_boot_argn("droidvm-snd", &enabled, sizeof(enabled));
@@ -468,14 +512,14 @@ void droidvm_snd_start(void) {
     const void *value;
     unsigned int size;
     uint64_t ranges[3], reg[2];
-    if (enabled && SecureDTLookupEntry(NULL, "/arm-io", &armio) == kSuccess &&
-        SecureDTGetProperty(armio, "ranges", &value, &size) == kSuccess && size >= sizeof(ranges) &&
-        SecureDTLookupEntry(NULL, "/arm-io/virtio-snd", &node) == kSuccess && snd_buffers()) {
-        memcpy(ranges, value, sizeof(ranges));
-        droidvm_snd_found = 1;
+    if (enabled && snd_buffers() && !snd.lock) {
         lck_grp_t *group = lck_grp_alloc_init("DroidVMSnd", LCK_GRP_ATTR_NULL);
         snd.lock = lck_mtx_alloc_init(group, LCK_ATTR_NULL);
-        if (!snd.lock) return;
+    }
+    if (enabled && snd.lock && SecureDTLookupEntry(NULL, "/arm-io", &armio) == kSuccess &&
+        SecureDTGetProperty(armio, "ranges", &value, &size) == kSuccess && size >= sizeof(ranges) &&
+        SecureDTLookupEntry(NULL, "/arm-io/virtio-snd", &node) == kSuccess) {
+        memcpy(ranges, value, sizeof(ranges));
         if ((SecureDTGetProperty(node, "droidvm,intid", &value, &size) == kSuccess ||
              SecureDTGetProperty(node, "gic-spi", &value, &size) == kSuccess) && size == sizeof snd.interrupt_id)
             memcpy(&snd.interrupt_id, value, size);
@@ -484,24 +528,16 @@ void droidvm_snd_start(void) {
             if (reg[0] >= ranges[0] && reg[1] >= 0x110 && reg[1] <= ranges[2] && reg[0] - ranges[0] <= ranges[2] - reg[1]) {
                 droidvm_snd_stage = 1;
                 snd.registers = ml_io_map((vm_offset_t)(reg[0] - ranges[0] + ranges[1]), 0x1000);
-                if (!snd.registers || snd_read32(0x00) != 0x74726976 || snd_read32(0x04) != 2 || snd_read32(0x08) != 25) {
-                    strlcpy(droidvm_snd_status, "no virtio-snd at /arm-io/virtio-snd", sizeof(droidvm_snd_status));
-                } else {
-                    droidvm_snd_stage = 2;
-                    const char *why = snd_bring_up();
-                    if (why) {
-                        strlcpy(droidvm_snd_status, why, sizeof(droidvm_snd_status));
-                        snd_write32(0x70, 0);
-                    } else {
-                        snd.up = true;
-                        droidvm_snd_stage = 3;
-                        snprintf(droidvm_snd_status, sizeof(droidvm_snd_status), "up: output stream %d, input stream %d x%u, %s",
-                                 snd.out_stream, snd.in_stream, snd.in_channels, snd.irq ? "interrupt" : "polled");
-                    }
-                }
+                if (snd.registers) snd_open("/arm-io/virtio-snd");
             }
         }
     }
+#if DROIDVM_VIRTIO_PCI
+    else if (enabled && snd.lock && (snd.pci = droidvm_vio_pci_take(25, NULL, 5000)) != NULL) {
+        droidvm_snd_stage = 1;
+        snd_open("PCI");
+    }
+#endif
     uint32_t audio = 1;
     PE_parse_boot_argn("droidvm-audio", &audio, sizeof(audio));
     if (audio && droidvm_audio_attach() != 0) strlcpy(droidvm_snd_status, "audio device attach failed", sizeof(droidvm_snd_status));

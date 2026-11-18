@@ -8,6 +8,7 @@
     "DroidVMVirtioSnd.c",
     "DroidVMAudio.cpp"
   ],
+  "sources_macosx": ["DroidVMVirtioPci.c", "DroidVMVirtioPciWatch.cpp"],
   "attach": "droidvm_snd_start",
   "builtin": [
     "DroidVMVirtioSnd",

@@ -141,6 +141,18 @@ const char *droidvm_vio_pci_interrupt(struct droidvm_vio_pci *p, void (*handler)
     return NULL;
 }
 
+bool droidvm_vio_pci_pool(const char *name, uint64_t *base, uint64_t *size) {
+    DTEntry node;
+    const void *value;
+    unsigned int length;
+    uint64_t pool[2];
+    if (SecureDTLookupEntry(NULL, "/arm-io/pcie", &node) != kSuccess ||
+        SecureDTGetProperty(node, name, &value, &length) != kSuccess || length != sizeof(pool)) return false;
+    memcpy(pool, value, sizeof(pool));
+    *base = pool[0], *size = pool[1];
+    return pool[1] != 0;
+}
+
 void droidvm_vio_pci_quiet(struct droidvm_vio_pci *p) {
     if (!p->intid) return;
     uint8_t at = msix_capability(p);
