@@ -1,13 +1,15 @@
 {
-  "_comment": "macOS: the MSI controller of crosvm's MBI SPIs (package/DroidVMGicMsi.cpp, from Droid-VM/macOS-DroidVM) on /arm-io/gic-mbi, the interrupt parent of Apple's PCIe bridge AppleVirtualPlatformPCIE on /arm-io/pcie (both nodes made by DarwinBoot from the FDT). The bridge's own personality wants an AppleARMIODevice nub; ArmDTPlatform's arm-io nubs are IOPlatformDevice.",
+  "_comment": "macOS: the MSI controller of crosvm's MBI SPIs (package/DroidVMGicMsi.cpp, from Droid-VM/macOS-DroidVM) on /arm-io/gic-mbi, the interrupt parent of Apple's PCIe bridge AppleVirtualPlatformPCIE on /arm-io/pcie (both nodes made by DarwinBoot from the FDT). The bridge's own personality wants an AppleARMIODevice nub; ArmDTPlatform's arm-io nubs are IOPlatformDevice. Also DroidVMVirtioPCI (package/DroidVMVirtioPciNub.cpp), which holds the virtio-pci functions the board's own drivers serve -- by PCI id, at a probe score above Apple's AppleVirtIOPCITransport, which matches every 0x1af4 function and whose probe sets its score to 10000 -- and publishes each one's place for its driver's kext (the input kext: DroidVMVirtioPciWatch.cpp), which starts later. Here, beside the MSI controller the PCIe bridge needs anyway, because a kext of its own did not fit the collection's __DATA. 0x1052: virtio-input.",
   "name": "DroidVMGicMsi",
   "bundle": "com.droidvm.driver.DroidVMGicMsi",
   "version": "1.0.0",
   "targets": ["macosx"],
-  "sources": ["DroidVMGicMsi.cpp"],
+  "sources": ["DroidVMGicMsi.cpp", "DroidVMVirtioPciNub.cpp"],
   "builtin": [],
   "personalities": {
-    "DroidVMGicMsi": {"IOClass": "DroidVMGicMsi", "IOProviderClass": "IOPlatformDevice", "IONameMatch": "droidvm,gic-mbi"}
+    "DroidVMGicMsi": {"IOClass": "DroidVMGicMsi", "IOProviderClass": "IOPlatformDevice", "IONameMatch": "droidvm,gic-mbi"},
+    "DroidVMVirtioPCI": {"IOClass": "DroidVMVirtioPCI", "IOProviderClass": "IOPCIDevice", "IOPCIPrimaryMatch": "0x10521af4",
+                         "IOProbeScore": 20000}
   },
   "libraries": {
     "com.apple.kpi.iokit": "18.0.0",

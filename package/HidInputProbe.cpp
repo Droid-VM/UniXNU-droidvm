@@ -240,8 +240,57 @@ static void hidWatchStart(void) {
 }
 #define HID_WATCH(device) hidWatchAdd(device)
 #else
-#define HID_WATCH(device) ((void)0)
+#define HID_WATCH(device) ((void)(device))
 #endif
+// The HID services of the input devices a VM may or may not have, each published once when its device is there: the pen digitizer
+// (Digitizer/Stylus, the staged NativeHidInput's third mode), the mouse (macOS, DroidVMPointerHid.inc; the app's mouse mode), the
+// trackpad as a Magic Trackpad 2 (DroidVMTrackpadHid.inc; its event driver is AppleTopCaseHIDEventDriver's, matched by
+// AppleTopCaseDriverV2's personalities, the board's prelink roots: both loaded with their personalities first, as IOHIDEventDriver
+// below), and the accelerometer, the gyroscope and the device orientation as the services locationd and backboardd look for
+// (DroidVMMotionHid.inc). Run by native_hid_input_probe once the keyboard's device started, and again by the virtio input driver
+// for each device it is handed after the start (a virtio-pci function, DroidVMVirtioInput.c); nothing before the first.
+static IOService *volatile native_hid_extras_resource;
+static volatile uint32_t native_hid_extras_busy;
+static bool native_hid_pen_done, native_hid_trackpad_done, native_hid_motion_done;
+#if DROIDVM_INPUT_MOUSE
+static bool native_hid_mouse_done;
+#endif
+static IOService *native_hid_extra_start(IOService *device,IOService *resource) {
+    bool started=device && device->metaCast("IOHIDDevice") && device->init() && device->attach(resource) && device->start(resource);
+    if(!started && device){device->detach(resource);OSSafeReleaseNULL(device);}
+    return device;
+}
+extern "C" void native_hid_input_extras(void) {
+    IOService *resource=__atomic_load_n(&native_hid_extras_resource,__ATOMIC_ACQUIRE);
+    if(!resource)return;
+    while(__atomic_exchange_n(&native_hid_extras_busy,1U,__ATOMIC_ACQUIRE))IOSleep(1);
+    if(!native_hid_pen_done && droidvm_pen_present()) {
+        native_hid_pen_done=true;
+        if(IOService *pen=native_hid_extra_start(native_hid_pen_allocate(),resource))HID_WATCH(pen);
+    }
+#if DROIDVM_INPUT_MOUSE
+    if(!native_hid_mouse_done && droidvm_mouse_present()) {
+        native_hid_mouse_done=true;
+        if(IOService *mouse=native_hid_extra_start(droidvm_pointer_hid_allocate(false),resource))HID_WATCH(mouse);
+    }
+#endif
+    if(!native_hid_trackpad_done && &droidvm_trackpad_hid_allocate && droidvm_trackpad_present()) {
+        native_hid_trackpad_done=true;
+        native_hid_trackpad_load_status[0]=OSKext::loadKextWithIdentifier("com.apple.driver.AppleTopCaseHIDEventDriver",
+            true,false,kOSKextExcludeNone,kOSKextExcludeNone,nullptr);
+        native_hid_trackpad_load_status[1]=OSKext::loadKextWithIdentifier("com.apple.driver.AppleTopCaseDriverV2",
+            true,false,kOSKextExcludeNone,kOSKextExcludeNone,nullptr);
+        if(IOService *trackpad=native_hid_extra_start(droidvm_trackpad_hid_allocate(),resource))HID_WATCH(trackpad);
+    }
+    if(!native_hid_motion_done && droidvm_motion_present()) {
+        native_hid_motion_done=true;
+        droidvm_sensor_processor_register();
+        for(unsigned kind=0;kind<3;++kind)
+            if(IOService *motion=native_hid_extra_start(droidvm_motion_hid_allocate(kind),resource))HID_WATCH(motion);
+    }
+    __atomic_store_n(&native_hid_extras_busy,0U,__ATOMIC_RELEASE);
+}
+
 void native_hid_input_probe(void) {
     unsigned enabled=0;
     if(!PE_parse_boot_argn("offline-hid-input",&enabled,sizeof(enabled)) || enabled!=1)return;
@@ -308,44 +357,12 @@ void native_hid_input_probe(void) {
                         if(!touchStarted && touch){touch->detach(resource);OSSafeReleaseNULL(touch);}
                     }
 #endif
-                    // DroidVM: the pen digitizer (Digitizer/Stylus, the staged NativeHidInput's third mode), when the VM has a pen
-                    // (DroidVMVirtioInput.c).
-                    if(started && droidvm_pen_present()) {
-                        IOService *pen=native_hid_pen_allocate();
-                        bool penStarted=pen && pen->metaCast("IOHIDDevice") && pen->init() && pen->attach(resource) && pen->start(resource);
-                        if(!penStarted && pen){pen->detach(resource);OSSafeReleaseNULL(pen);}
-                        if(penStarted)HID_WATCH(pen);
-                    }
-#if DROIDVM_INPUT_MOUSE
-                    // DroidVM (macOS): the mouse (DroidVMPointerHid.inc), when the VM has one (the app's mouse mode).
-                    if(started && droidvm_mouse_present()) {
-                        IOService *mouse=droidvm_pointer_hid_allocate(false);
-                        bool mouseStarted=mouse && mouse->metaCast("IOHIDDevice") && mouse->init() && mouse->attach(resource) && mouse->start(resource);
-                        if(!mouseStarted && mouse){mouse->detach(resource);OSSafeReleaseNULL(mouse);}
-                        if(mouseStarted)HID_WATCH(mouse);
-                    }
-#endif
-                    // DroidVM: the trackpad as a Magic Trackpad 2 (DroidVMTrackpadHid.inc), when the VM has one (DroidVMVirtioInput.c).
-                    // Its event driver is AppleTopCaseHIDEventDriver's, matched by AppleTopCaseDriverV2's personalities (the board's
-                    // prelink roots): both loaded with their personalities first, as IOHIDEventDriver above.
-                    if(started && &droidvm_trackpad_hid_allocate && droidvm_trackpad_present()) {
-                        native_hid_trackpad_load_status[0]=OSKext::loadKextWithIdentifier("com.apple.driver.AppleTopCaseHIDEventDriver",
-                            true,false,kOSKextExcludeNone,kOSKextExcludeNone,nullptr);
-                        native_hid_trackpad_load_status[1]=OSKext::loadKextWithIdentifier("com.apple.driver.AppleTopCaseDriverV2",
-                            true,false,kOSKextExcludeNone,kOSKextExcludeNone,nullptr);
-                        IOService *trackpad=droidvm_trackpad_hid_allocate();
-                        bool trackpadStarted=trackpad && trackpad->metaCast("IOHIDDevice") && trackpad->init() && trackpad->attach(resource) && trackpad->start(resource);
-                        if(!trackpadStarted && trackpad){trackpad->detach(resource);OSSafeReleaseNULL(trackpad);}
-                        if(trackpadStarted)HID_WATCH(trackpad);
-                    }
-                    // DroidVM: the accelerometer, the gyroscope and the device orientation, as the services locationd and
-                    // backboardd look for (DroidVMMotionHid.inc), when the VM has motion sensors (DroidVMVirtioInput.c).
-                    if(started && droidvm_motion_present())droidvm_sensor_processor_register();
-                    for(unsigned kind=0;started && kind<3 && droidvm_motion_present();++kind) {
-                        IOService *motion=droidvm_motion_hid_allocate(kind);
-                        bool motionStarted=motion && motion->metaCast("IOHIDDevice") && motion->init() && motion->attach(resource) && motion->start(resource);
-                        if(!motionStarted && motion){motion->detach(resource);OSSafeReleaseNULL(motion);}
-                        if(motionStarted)HID_WATCH(motion);
+                    // DroidVM: the services of the input devices a VM may have -- pen, mouse, trackpad, motion sensors --
+                    // for those found by now; native_hid_input_extras publishes the ones found later (a virtio-pci device).
+                    if(started) {
+                        resource->retain();
+                        __atomic_store_n(&native_hid_extras_resource,resource,__ATOMIC_RELEASE);
+                        native_hid_input_extras();
                     }
                     // The offline devices live for this bounded boot. Its
                     // service attachment and timer remain genuine live objects.

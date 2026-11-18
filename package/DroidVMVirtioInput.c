@@ -28,6 +28,12 @@
 // macOS input kext, whose pointer is a mouse's): each of its frames -- the buttons held and the motion and wheel turns since the last --
 // goes to the mouse sink, which DroidVMPointerHid.inc publishes as a mouse's report. iPadOS leaves it alone, as before.
 //
+// On crosvm's PCI host (macOS, DROIDVM_VIRTIO_PCI): a virtio-pci input function, held by DroidVMVirtioPCI (in the DroidVMGicMsi
+// kext), is handed over by the start's watch (DroidVMVirtioPciWatch.cpp, droidvm_input_add_pci) and read through DroidVMVirtioPci.c,
+// which turns the virtio-mmio register accesses below into the PCI ones; its MSI-X vector raises an MBI SPI of its own. The worker
+// starts with the first device, whichever transport it is on, and the HID services a newly found pen, mouse, trackpad or motion
+// sensors need are published then (native_hid_input_extras, HidInputProbe.cpp).
+//
 // droidvm-input=0 leaves the devices alone.
 #include <stdint.h>
 #include <stdbool.h>
@@ -41,6 +47,9 @@
 #include <pexpert/device_tree.h>
 #if DROIDVM_INPUT_DYNAMIC
 #include <vm/vm_kern_xnu.h>
+#endif
+#if DROIDVM_VIRTIO_PCI
+#include "DroidVMVirtioPci.h"
 #endif
 
 extern void IOSleep(unsigned milliseconds);
@@ -132,6 +141,9 @@ _Static_assert(DROIDVM_INPUT_BUFFERS * sizeof(struct droidvm_input_event) <= 409
 
 struct droidvm_input {
     uintptr_t registers;
+#if DROIDVM_VIRTIO_PCI
+    struct droidvm_vio_pci *pci;       // a virtio-pci function (registers unused), or NULL
+#endif
     unsigned kind, index;
     uint16_t size, used;
     int32_t min_x, span_x, min_y, span_y;
@@ -186,19 +198,31 @@ extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[1
 // from the syndrome, and a post-indexed or paired access (what a byte loop compiles to) has none -- the guest gets a
 // synchronous external abort instead.
 static uint32_t input_read32(const struct droidvm_input *d, unsigned offset) {
+#if DROIDVM_VIRTIO_PCI
+    if (d->pci) return droidvm_vio_pci_read(d->pci, offset, 4);
+#endif
     uint32_t value;
     __asm__ volatile("ldr %w0, [%1]" : "=r"(value) : "r"(d->registers + offset) : "memory");
     return value;
 }
 static uint8_t input_read8(const struct droidvm_input *d, unsigned offset) {
+#if DROIDVM_VIRTIO_PCI
+    if (d->pci) return (uint8_t)droidvm_vio_pci_read(d->pci, offset, 1);
+#endif
     uint32_t value;
     __asm__ volatile("ldrb %w0, [%1]" : "=r"(value) : "r"(d->registers + offset) : "memory");
     return (uint8_t)value;
 }
 static void input_write32(const struct droidvm_input *d, unsigned offset, uint32_t value) {
+#if DROIDVM_VIRTIO_PCI
+    if (d->pci) { droidvm_vio_pci_write(d->pci, offset, value, 4); return; }
+#endif
     __asm__ volatile("str %w0, [%1]\n\tdsb oshst" :: "r"(value), "r"(d->registers + offset) : "memory");
 }
 static void input_write8(const struct droidvm_input *d, unsigned offset, uint8_t value) {
+#if DROIDVM_VIRTIO_PCI
+    if (d->pci) { droidvm_vio_pci_write(d->pci, offset, value, 1); return; }
+#endif
     __asm__ volatile("strb %w0, [%1]\n\tdsb oshst" :: "r"((uint32_t)value), "r"(d->registers + offset) : "memory");
 }
 static void input_write64(const struct droidvm_input *d, unsigned offset, uint64_t value) {
@@ -876,16 +900,20 @@ static void input_interrupts_on(bool on) {
 
 static void droidvm_input_worker(void *parameter, wait_result_t result) {
     (void)parameter; (void)result;
-    bool interrupts = droidvm_input_count > 0, guarded = false, on = false;
-    for (unsigned k = 0; k < droidvm_input_count; ++k) interrupts = interrupts && droidvm_inputs[k].interrupt;
+    bool guarded = false, on = false;
+    unsigned flagged = 0;   // the devices whose flag was set last
     for (;;) {
+        // every device's interrupt attached: the devices there now (a virtio-pci one is added after the start)
+        const unsigned count = __atomic_load_n(&droidvm_input_count, __ATOMIC_ACQUIRE);
+        bool interrupts = count > 0;
+        for (unsigned k = 0; k < count; ++k) interrupts = interrupts && droidvm_inputs[k].interrupt;
         // Before the look: a frame the device returned before the flag changed raised no interrupt, and the look takes it.
         const bool want = interrupts && droidvm_input_irq;
-        if (want != on) input_interrupts_on(on = want);
+        if (want != on || count != flagged) input_interrupts_on(on = want), flagged = count;
         // The interrupt count before the look: one taken during it, or after it but before the sleep is armed, makes the sleep
         // end at once.
         const uint64_t seen = __atomic_load_n(&droidvm_input_irq_counts[0], __ATOMIC_RELAXED), frames = droidvm_input_frames;
-        for (unsigned k = 0; k < droidvm_input_count; ++k) input_poll(&droidvm_inputs[k]);
+        for (unsigned k = 0; k < count; ++k) input_poll(&droidvm_inputs[k]);
         if (guarded && droidvm_input_frames != frames) droidvm_input_irq_counts[3] = droidvm_input_irq_counts[3] + 1;
         touch_still();
         if (!on) {
@@ -908,6 +936,21 @@ static void droidvm_input_worker(void *parameter, wait_result_t result) {
 }
 
 static bool droidvm_motion_found, droidvm_pen_found, droidvm_mouse_found;
+// Held while devices are added: the start's scan and a virtio-pci function's (IOKit can start those before the kext's starter runs
+// the scan, on threads of their own).
+static volatile uint32_t droidvm_input_adding;
+static void input_adding(bool hold) {
+    if (!hold) __atomic_store_n(&droidvm_input_adding, 0U, __ATOMIC_RELEASE);
+    else while (__atomic_exchange_n(&droidvm_input_adding, 1U, __ATOMIC_ACQUIRE)) IOSleep(1);
+}
+
+// The worker, once: with the first device found, by the start or later (a virtio-pci one).
+static void input_worker_start(void) {
+    static volatile uint32_t started;
+    if (__atomic_exchange_n(&started, 1U, __ATOMIC_ACQ_REL)) return;
+    thread_t thread;
+    if (kernel_thread_start(droidvm_input_worker, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+}
 static const struct droidvm_input *droidvm_trackpad;
 
 // Whether the VM has a pen: HidInputProbe.cpp publishes the pen digitizer then (after droidvm_input_start, as for the motion
@@ -936,10 +979,18 @@ bool droidvm_motion_present(void) {
     return droidvm_motion_found;
 }
 
+#if DROIDVM_VIRTIO_PCI
+extern void droidvm_vio_pci_watch(void);     // DroidVMVirtioPciWatch.cpp
+#endif
+
 // Called once from the late board probe (DroidVMStubs.c native_touch_probe).
 void droidvm_input_start(void) {
     uint32_t enabled = 1;
     PE_parse_boot_argn("droidvm-input", &enabled, sizeof(enabled));
+#if DROIDVM_VIRTIO_PCI
+    // the virtio-pci input functions, those held by now and those to come (handed over by droidvm_input_add_pci)
+    if (enabled) droidvm_vio_pci_watch();
+#endif
     DTEntry armio;
     const void *value;
     unsigned int size;
@@ -947,7 +998,8 @@ void droidvm_input_start(void) {
     if (!enabled || SecureDTLookupEntry(NULL, "/arm-io", &armio) != kSuccess ||
         SecureDTGetProperty(armio, "ranges", &value, &size) != kSuccess || size < sizeof(ranges)) return;
     memcpy(ranges, value, sizeof(ranges));
-    for (unsigned n = 0; n < DROIDVM_INPUT_DEVICES; ++n) {
+    input_adding(true);
+    for (unsigned n = 0; n < DROIDVM_INPUT_DEVICES && droidvm_input_count < DROIDVM_INPUT_DEVICES; ++n) {
         char path[32];
         snprintf(path, sizeof(path), "/arm-io/input-%u", n);
         DTEntry node;
@@ -999,10 +1051,68 @@ void droidvm_input_start(void) {
                 droidvm_input_irq_counts[4] = droidvm_input_irq_counts[4] + 1;
             }
         }
-        droidvm_input_count++;
+        __atomic_store_n(&droidvm_input_count, droidvm_input_count + 1, __ATOMIC_RELEASE);   // the worker may run already
     }
     droidvm_input_started = droidvm_input_count;
-    thread_t thread;
-    if (droidvm_input_count && kernel_thread_start(droidvm_input_worker, NULL, &thread) == KERN_SUCCESS)
-        thread_deallocate(thread);
+    input_adding(false);
+    if (droidvm_input_count) input_worker_start();
 }
+
+#if DROIDVM_VIRTIO_PCI
+extern void native_hid_input_extras(void);   // HidInputProbe.cpp
+
+static const char *input_add_pci_locked(struct droidvm_vio_pci *pci) {
+    const unsigned n = droidvm_input_count;
+    if (n >= DROIDVM_INPUT_DEVICES) return "too many input devices";
+    struct droidvm_input *d = &droidvm_inputs[n];
+    droidvm_input_found = droidvm_input_found + 1;
+    *d = (struct droidvm_input){.index = n, .slot = 0, .pci = pci};
+    for (unsigned s = 0; s < DROIDVM_INPUT_SLOTS; ++s) d->slots[s].id = -1;
+    d->kind = input_identify(d);
+    if (d->kind == KIND_NONE) {
+        (void)input_reset(d);
+        return "not a device this driver uses";
+    }
+    // MSI-X before the start: each queue takes vector 0 as it is enabled (DroidVMVirtioPci.c), and one enabled without it raises
+    // nothing.
+    const char *irq = droidvm_vio_pci_interrupt(pci, input_interrupt, d);
+    const char *why = input_start(d);
+    if (why) {
+        (void)input_reset(d);
+        droidvm_vio_pci_quiet(pci);
+        return why;
+    }
+    droidvm_input_kinds[n] = d->kind;
+    printf("droidvm input pci %02x:%02x.%x: %s, kind %u\n", pci->bus, pci->slot, pci->function, droidvm_input_names[n], d->kind);
+    if (d->kind == KIND_MOTION && !droidvm_motion_found) {
+        droidvm_motion_register();
+        droidvm_motion_found = true;
+    }
+    if (d->kind == KIND_PEN) droidvm_pen_found = true;
+    if (d->kind == KIND_MOUSE) droidvm_mouse_found = true;
+    if (d->kind == KIND_TRACKPAD && !droidvm_trackpad) droidvm_trackpad = d;
+    if (irq) {
+        printf("droidvm input pci %02x:%02x.%x: polled (%s)\n", pci->bus, pci->slot, pci->function, irq);
+    } else {
+        d->interrupt = true;
+        droidvm_input_irq_counts[4] = droidvm_input_irq_counts[4] + 1;
+    }
+    __atomic_store_n(&droidvm_input_count, n + 1, __ATOMIC_RELEASE);
+    droidvm_input_started = n + 1;
+    input_worker_start();
+    return NULL;
+}
+
+// A virtio-pci input function (DroidVMVirtioPciWatch.cpp): set up as the virtio-mmio ones are, with its MSI-X vector as its
+// interrupt, then the worker's. NULL when the device is the driver's now; otherwise why not, and the function is left reset.
+const char *droidvm_input_add_pci(struct droidvm_vio_pci *pci) {
+    uint32_t enabled = 1;
+    PE_parse_boot_argn("droidvm-input", &enabled, sizeof(enabled));
+    if (!enabled) return "droidvm-input=0";
+    input_adding(true);
+    const char *why = input_add_pci_locked(pci);
+    input_adding(false);
+    if (!why) native_hid_input_extras();
+    return why;
+}
+#endif

@@ -385,14 +385,23 @@ def main_macos():
     probe = ROOT / 'kits/droidvm/HidInputProbe.cpp'
     command(cpp, probe, OUT / 'HidInputProbe.kext.o', kext)
     transport = ROOT / 'kits/droidvm/DroidVMVirtioInput.c'
-    command(c_mach, transport, OUT / 'DroidVMVirtioInput.o', ('-DDROIDVM_INPUT_DYNAMIC=1', '-DDROIDVM_INPUT_MOUSE=1'))
+    command(c_mach, transport, OUT / 'DroidVMVirtioInput.o', ('-DDROIDVM_INPUT_DYNAMIC=1', '-DDROIDVM_INPUT_MOUSE=1',
+                                                              '-DDROIDVM_VIRTIO_PCI=1'))
     motion = ROOT / 'kits/droidvm/DroidVMMotion.c'
     command(c_bsd, motion, OUT / 'DroidVMMotion.o')
-    kext_objects = [hid_obj, OUT / 'HidInputProbe.kext.o', OUT / 'DroidVMVirtioInput.o', OUT / 'DroidVMMotion.o']
+    # virtio-input on crosvm's PCI host: the virtio-pci transport and the watch for the functions DroidVMVirtioPCI holds
+    # (in the DroidVMGicMsi kext, ipados27/kexts/DroidVMGicMsi.json)
+    pci = ROOT / 'kits/droidvm/DroidVMVirtioPci.c'
+    command(c_mach, pci, OUT / 'DroidVMVirtioPci.o')
+    watch = ROOT / 'kits/droidvm/DroidVMVirtioPciWatch.cpp'
+    command(cpp, watch, OUT / 'DroidVMVirtioPciWatch.o', kext)
+    kext_objects = [hid_obj, OUT / 'HidInputProbe.kext.o', OUT / 'DroidVMVirtioInput.o', OUT / 'DroidVMMotion.o',
+                    OUT / 'DroidVMVirtioPci.o', OUT / 'DroidVMVirtioPciWatch.o']
     (OUT / 'objects.json').write_text('[]\n')   # nothing in the macOS kernel
     (OUT / 'kext-objects.json').write_text(json.dumps([str(p.relative_to(ROOT)) for p in kext_objects], indent=2) + '\n')
     sources = [original, ROOT / 'kits/droidvm/DroidVMMotionHid.inc', ROOT / 'kits/droidvm/DroidVMTrackpadHid.inc',
-               ROOT / 'kits/droidvm/DroidVMPointerHid.inc', probe, transport, motion]
+               ROOT / 'kits/droidvm/DroidVMPointerHid.inc', probe, transport, motion, pci, watch,
+               ROOT / 'kits/droidvm/DroidVMVirtioPci.h']
     (OUT / 'sources.json').write_text(json.dumps([str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p) for p in sources],
                                                  indent=2) + '\n')
     (OUT / 'report.json').write_text(json.dumps(dict(
