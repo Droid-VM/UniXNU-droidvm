@@ -33,6 +33,7 @@ the hypervisor); --timebase supplies it, 19.2 MHz on every Qualcomm host seen so
 from pathlib import Path
 import argparse
 import os
+import re
 import struct
 import zlib
 
@@ -162,8 +163,25 @@ def describe(fdt):
     for address, size in virtio:
         if not ARMIO_BASE <= address < address + size <= ARMIO_BASE + ARMIO_SIZE:
             raise SystemExit(f'virtio-mmio window {address:#x}+{size:#x} lies outside the arm-io window')
+    # The serial ports (Droid-VM/UniXNU-droidvm 77bb46b). The SBSA UART (crosvm --serial hardware=sbsa, "arm,pl011") is
+    # /arm-io/uart0, the 16550 COM ports (ns16550a, always four in crosvm, the unconnected ones writing nowhere) are com1..com4 in
+    # the FDT's order, crosvm's num; they lie below the arm-io base, so their reg offset wraps (the kernel's serial driver adds it
+    # to the base). /defaults droidvm,serial-device names the console (patches/xnu-12377 droidvm-serial-uarts): the UART /chosen
+    # stdout-path names (crosvm's console serial port), else the SBSA UART. Not the standard serial-device, which xnu-12377
+    # panics on when it has no driver for the UART.
+    pl011 = [reg_pairs(props['reg'])[0] for path, props in fdt.items()
+             if 'arm,pl011' in strings_of(props.get('compatible', b''))]
+    sbsa_uart = pl011[0] if pl011 else None
+    if sbsa_uart and not (ARMIO_BASE <= sbsa_uart[0] < sbsa_uart[0] + sbsa_uart[1] <= ARMIO_BASE + ARMIO_SIZE):
+        raise SystemExit(f'pl011 window {sbsa_uart[0]:#x}+{sbsa_uart[1]:#x} lies outside the arm-io window')
+    coms = [reg_pairs(props['reg'])[0] for path, props in fdt.items()
+            if 'ns16550a' in strings_of(props.get('compatible', b''))][:4]
+    stdout = fdt.get('/chosen', {}).get('stdout-path', b'').rstrip(b'\0').decode()
+    unit = re.match(r'[0-9a-fA-F]+', stdout.split('@', 1)[1]) if '@' in stdout else None
+    stdout_address = int(unit.group(0), 16) if unit else None
     return dict(cpu_regs=[reg for reg, _ in cpus], gic=(dist, dist_size, redist, redist_size),
-                psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size, virtio_mmio=virtio)
+                psci_method=method or 'hvc', dram_base=dram_base, dram_size=dram_size, virtio_mmio=virtio,
+                sbsa_uart=sbsa_uart, coms=coms, stdout_address=stdout_address)
 
 
 def main():
@@ -259,6 +277,14 @@ def main():
         input_bases = [int(value, 0) for value in args.input_mmio.split(',') if value]
     except ValueError:
         parser.error('--input-mmio takes comma-separated addresses')
+    # The serial console (/defaults droidvm,serial-device): the UART stdout-path names, else the SBSA UART.
+    uart_phandle = 0x44560000
+    console_phandle = uart_phandle if vm['sbsa_uart'] else None
+    for index, (address, _) in enumerate(vm['coms']):
+        if address == vm['stdout_address']:
+            console_phandle = uart_phandle + 1 + index
+    if vm['sbsa_uart'] and vm['sbsa_uart'][0] == vm['stdout_address']:
+        console_phandle = uart_phandle
     virtio_mmio = [window for window in vm['virtio_mmio']
                    if window[0] not in (args.data_store_mmio, args.gpu_mmio) and window[0] not in input_bases]
     data_store = [window for window in vm['virtio_mmio'] if window[0] == args.data_store_mmio]
@@ -315,7 +341,8 @@ def main():
         # the BCM2837 configuration this 4K kernel is built from clips the limit to its CONFIG_VNODES (1024, a Raspberry Pi 3), and the
         # vnode jetsam then kills every idle process, an app's prewarmed instance among them, as soon as the system holds ~2000 vnodes.
         node('defaults', [('sleep-disabled', struct.pack('<I', 1)), ('vmm-present', struct.pack('<I', 1)),
-                          ('kern.maxvnodes', struct.pack('<I', kernel_memory // 0x10000 + 1024))]),
+                          ('kern.maxvnodes', struct.pack('<I', kernel_memory // 0x10000 + 1024)),
+                          *([('droidvm,serial-device', struct.pack('<I', console_phandle))] if console_phandle is not None else [])]),
         node('options', []),
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
                             ('button-names', b'hold\0voldown\0volup\0'),
@@ -336,6 +363,15 @@ def main():
              [node('intc', [('compatible', b'arm,gic-v3\0'),
                             ('reg', struct.pack('<4Q', dist - ARMIO_BASE, dist_size, redist - ARMIO_BASE, redist_size)),
                             ('redistributor-stride', struct.pack('<Q', GIC_REDIST_STRIDE))]),
+              # The serial ports (see describe), each with the AAPL,phandle /defaults droidvm,serial-device may name.
+              *([node('uart0', [('compatible', b'arm,pl011\0'),
+                                ('reg', struct.pack('<QQ', vm['sbsa_uart'][0] - ARMIO_BASE, vm['sbsa_uart'][1])),
+                                ('AAPL,phandle', struct.pack('<I', uart_phandle))])]
+                if vm['sbsa_uart'] else []),
+              *[node('com%d' % (index + 1), [('compatible', b'ns16550a\0'),
+                                             ('reg', struct.pack('<QQ', (address - ARMIO_BASE) % (1 << 64), size)),
+                                             ('AAPL,phandle', struct.pack('<I', uart_phandle + 1 + index))])
+                for index, (address, size) in enumerate(vm['coms'])],
               *[node('virtio-mmio-%d' % index, [('compatible', b'virtio,mmio\0'),
                                                  ('reg', struct.pack('<QQ', address - ARMIO_BASE, size)),
                                                  ('dma-coherent', b'')])
