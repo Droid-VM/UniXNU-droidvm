@@ -11,6 +11,8 @@
   export.py put LOCAL /private/var/ngpu/... [MODE]  (write a file, root-owned, default mode 0644; only under /private/var/ngpu/)
   export.py stackshot PID|-1 OUTPUT                (the guest kernel's stackshot, kcdata; decode with stackshot.py)
   export.py page ADDRESS [perm]                    (the vm_page at ADDRESS: object, pager, file; perm: a stackshot PageBusy context)
+  export.py ioreg [FILTER] OUTPUT                  (the IORegistry's service plane as text, `ioreg`'s shape; the properties of the
+                                                    entries whose name or class contains FILTER and of those below them, * all)
 
 The request is written into droidvm_export_box through crosvm's /proc/<pid>/mem; the droidvm-monitor worker answers
 within ~100 ms. Paths are in the guest's namespace (Data is mounted at /private/var)."""
@@ -97,7 +99,7 @@ def request(kind, path, offset=0, length=0, total=0, payload=b''):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=['ls', 'tree', 'cat', 'get', 'ps', 'kill', 'mem', 'put', 'stackshot', 'page'])
+    parser.add_argument('command', choices=['ls', 'tree', 'cat', 'get', 'ps', 'kill', 'mem', 'put', 'stackshot', 'page', 'ioreg'])
     parser.add_argument('path', nargs='?', default='')
     parser.add_argument('output', nargs='?')
     parser.add_argument('length', nargs='?')
@@ -147,6 +149,19 @@ def main():
                 if not body or offset >= total:
                     break
         print(f'{args.output}: {offset} bytes')
+    elif args.command == 'ioreg':   # ioreg [FILTER] OUTPUT: the service plane (kind 9), taken whole at offset 0 and read on
+        target, wanted = (args.output, args.path) if args.output else (args.path, '')
+        if not target:
+            sys.exit('ioreg needs an OUTPUT file')
+        with open(target, 'wb') as out:
+            offset = 0
+            while True:
+                body, total = request(9, wanted, offset)
+                out.write(body)
+                offset += len(body)
+                if not body or offset >= total:
+                    break
+        print(f'{target}: {offset} bytes')
     elif args.command == 'cat':
         body, total = request(0, args.path, args.offset)
         sys.stdout.buffer.write(body)

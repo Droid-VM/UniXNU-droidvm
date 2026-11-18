@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The board's own part of the iPadOS 27 / macOS 27 kernel that is not a device driver: the droidvm-monitor worker and the
 board's late probe hook (native_touch_probe, generated as DroidVMMonitor27.c), the calendar clock (DroidVMClock.c), the launch
-policy (DroidVMLaunchPolicy.c), the built-in boot arguments (DroidVMBootArgs27.c), the host's file mailbox (DroidVMFileExport.c),
+policy (DroidVMLaunchPolicy.c), the built-in boot arguments (DroidVMBootArgs27.c), the host's file mailbox (DroidVMFileExport.c,
+its IORegistry text DroidVMRegistryExport.cpp),
 the page description (DroidVMPageInfo.c), the guest's restart and shutdown through PSCI (DroidVMReset.c), the board support code the drivers and the monitor share (DroidVMBoardSupport27.cpp,
 generated) and the kernel's side of the late probe when the display is a kext (DroidVMLateProbe.c).
 
@@ -220,7 +221,10 @@ bootargs_source = ROOT / 'kits/droidvm' / ('DroidVMBootArgsMacOS27.c' if MACOS e
 compile_c(bootargs_source, OUT / 'DroidVMBootArgs27.o', 'bsd/DEVELOPMENT/kern_exec.o.json')
 export_source = ROOT / 'kits/droidvm/DroidVMFileExport.c'
 compile_c(export_source, OUT / 'DroidVMFileExport.o', 'bsd/DEVELOPMENT/kern_exec.o.json',
-          ('-DDROIDVM_EXPORT_DYNAMIC=1', '-DDROIDVM_EXPORT_BYTES=(4u<<20)'))
+          ('-DDROIDVM_EXPORT_DYNAMIC=1', '-DDROIDVM_EXPORT_BYTES=(4u<<20)', '-DDROIDVM_EXPORT_REGISTRY=1'))
+# The mailbox's IORegistry (kind 9, export.py ioreg): the service plane as text, for a guest with no user space to run ioreg.
+registry_source = ROOT / 'kits/droidvm/DroidVMRegistryExport.cpp'
+compile_cpp(registry_source, OUT / 'DroidVMRegistryExport.o')
 # The mailbox's description of one vm_page (kind 8), with the VM's own flags: its object, pager and file.
 page_info_source = ROOT / 'kits/droidvm/DroidVMPageInfo.c'
 compile_c(page_info_source, OUT / 'DroidVMPageInfo.o', 'osfmk/DEVELOPMENT/vm_dyld_pager.o.json')
@@ -229,8 +233,10 @@ compile_c(late_probe_source, OUT / 'DroidVMLateProbe.o', extra=kext_flags)
 reset_source = ROOT / 'kits/droidvm/DroidVMReset.c'
 compile_c(reset_source, OUT / 'DroidVMReset.o')
 objects = [OUT / name for name in ('DroidVMBoardSupport27.o', 'DroidVMMonitor27.o', 'DroidVMClock.o', 'DroidVMLaunchPolicy.o',
-                                   'DroidVMBootArgs27.o', 'DroidVMFileExport.o', 'DroidVMPageInfo.o', 'DroidVMReset.o')]
-sources = [clock_source, policy_source, bootargs_source, export_source, page_info_source, late_probe_source, reset_source]
+                                   'DroidVMBootArgs27.o', 'DroidVMFileExport.o', 'DroidVMRegistryExport.o', 'DroidVMPageInfo.o',
+                                   'DroidVMReset.o')]
+sources = [clock_source, policy_source, bootargs_source, export_source, registry_source, page_info_source, late_probe_source,
+           reset_source]
 (OUT / 'objects.json').write_text(json.dumps(dict(objects=[str(p.relative_to(ROOT)) for p in objects],
                                                   late_probe=str((OUT / 'DroidVMLateProbe.o').relative_to(ROOT)),
                                                   sources=[str(p.relative_to(ROOT)) for p in sources]), indent=2) + '\n')

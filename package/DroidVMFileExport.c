@@ -39,7 +39,9 @@
 // <path>>\n" lines depth-first (a regular file's size, 0 for anything else), from entry offset (total = entries listed):
 // one request where kind 1 and a size read per file took thousands, for the unified log's uuidtext; kind 7 reads a stackshot
 // (droidvm_export_stackshot) from offset (total = its size); kind 8 describes the vm_page at address `offset`, given as a
-// stackshot's PageBusy wait context (permuted by vm_kernel_addrperm) when `length` is 1 (DroidVMPageInfo.c; length = bytes).
+// stackshot's PageBusy wait context (permuted by vm_kernel_addrperm) when `length` is 1 (DroidVMPageInfo.c; length = bytes);
+// kind 9 reads the IORegistry's service plane as text from offset, <path> naming the entries whose properties go along ("" none,
+// "*" all; DroidVMRegistryExport.cpp, a board that builds it with -DDROIDVM_EXPORT_REGISTRY=1; total = its size).
 struct droidvm_export {
 	volatile uint32_t request, done;
 	uint32_t kind;
@@ -331,6 +333,9 @@ static int droidvm_export_stackshot(const char *path, uint64_t offset, uint64_t 
 }
 
 extern size_t droidvm_page_info(uint64_t address, bool permuted, char *out, size_t size);
+#if DROIDVM_EXPORT_REGISTRY
+extern int droidvm_export_registry(const char *filter, uint64_t offset, char *out, uint64_t room, uint64_t *length, uint64_t *total);
+#endif
 
 void droidvm_export_poll(void) {
 	if (!droidvm_export_buffer()) return;
@@ -367,6 +372,10 @@ void droidvm_export_poll(void) {
 		    DROIDVM_EXPORT_BYTES);
 		total = length;
 		status = 0;
+#if DROIDVM_EXPORT_REGISTRY
+	} else if (droidvm_export_box.kind == 9) {
+		status = droidvm_export_registry(path, droidvm_export_box.offset, droidvm_export_data, DROIDVM_EXPORT_BYTES, &length, &total);
+#endif
 	} else if (droidvm_export_box.kind == 5) {
 		status = droidvm_export_write(path, droidvm_export_box.offset, droidvm_export_box.length, droidvm_export_box.total);
 		length = status ? 0 : droidvm_export_box.length;
