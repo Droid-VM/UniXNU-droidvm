@@ -247,9 +247,10 @@ archives = [
 # and the keyboard's event drivers. The PCI side: Apple's PCIe bridge of the virtual Mac (AppleVirtualPlatformPCIE) and AppleVirtIO,
 # whose AppleVirtIOPCITransport takes any virtio-pci device crosvm puts on its PCI host (block, net, console, entropy, input, sound);
 # the bridge starts only on the /arm-io/pcie DarwinBoot makes when the FDT has an MBI frame (kexts/DroidVMGicMsi.json), so a VM
-# without PCI devices or MSI runs on its virtio-mmio devices as before. Not the xHCI driver yet: AppleUSBXHCIPCI's start waits for
-# IOUSBHostFamily's AppleUSBHostResources, which never registers here, and that matching thread held the PCI network card's driver
-# back too (no en0, so IOTimeSync and WindowServer waited); without the driver a VM's xHCI is left alone.
+# without PCI devices or MSI runs on its virtio-mmio devices as before. USB on a VM's xHCI: AppleUSBXHCIPCI and the drivers of what
+# is passed through (composite devices, hubs, HID, mass storage). IOUSBHostFamily is a root of its own: the collection keeps the
+# personalities of its roots only (XnuPrelink drops those of a kext that is only a library), and without its AppleUSBHostResources
+# (an IOResources match) AppleUSBXHCIPCI's start waits forever.
 [os_overrides."macos-27.0.1-26A434".kernel.prelink]
 roots = [
   "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib", "com.apple.AppleFSCompression.AppleFSCompressionTypeDataless",
@@ -270,7 +271,10 @@ roots = [
   "com.apple.iokit.IOHIDFamily", "com.apple.iokit.IOHIDEventDriver", "com.apple.driver.AppleMultitouchDriver",
   "com.apple.driver.AppleHIDKeyboard", "com.apple.driver.AppleInputDeviceSupport", "com.apple.driver.AppleTopCaseHIDEventDriver",
   "com.apple.driver.driverkit.serial", "com.apple.UVCService",
-  "com.apple.driver.AppleVirtualPlatform", "com.apple.driver.AppleVirtIO"
+  "com.apple.driver.AppleVirtualPlatform", "com.apple.driver.AppleVirtIO",
+  "com.apple.iokit.IOUSBHostFamily", "com.apple.driver.usb.AppleUSBXHCIPCI", "com.apple.driver.usb.AppleUSBHostCompositeDevice",
+  "com.apple.driver.usb.AppleUSBHub", "com.apple.driver.usb.IOUSBHostHIDDeviceSafeBoot", "com.apple.iokit.IOUSBMassStorageDriver",
+  "com.apple.iokit.IOSCSIBlockCommandsDevice"
 ]
 
 # The macOS payload: its kernel arguments (no iPadOS display, HID, key store or GPU switches: those drivers are iPadOS's), the
