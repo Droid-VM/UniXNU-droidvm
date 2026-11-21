@@ -258,7 +258,12 @@ config = json.loads(text)
 config.update(id=vm_id, name=name, created_at=int(time.time() * 1000), auto_up=False)
 # A release with the application cryptex: its disk, read-only, after SystemOS's, when the source VM had none.
 options = config.get('extra_options', [])
-if 'app.img' in release_images.split() and not any(o.split(',')[0].endswith('/app.img') for o in options):
+disks = config.get('disks', [])
+if 'app.img' in release_images.split() and not any(o.split(',')[0].endswith('/app.img') for o in options) \
+        and not any(d.get('path', '').endswith('/app.img') for d in disks):
+    at = [i for i, d in enumerate(disks) if d.get('path', '').endswith('/systemos.img')]
+    if at:   # a VM the app describes (vmportable.py)
+        disks.insert(at[0] + 1, {'path': disks[at[0]]['path'].rsplit('/', 1)[0] + '/app.img', 'bus': 'virtio', 'readonly': True})
     at = [i for i, o in enumerate(options) if o.split(',')[0].endswith('/systemos.img')]
     if at:
         media = options[at[0]].split(',')[0].rsplit('/', 1)[0]

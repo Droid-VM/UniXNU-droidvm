@@ -6,8 +6,10 @@
 // host phone: crosvm --virtio-mmio-block, which make-droidvm-adt.py (--data-store-mmio) publishes as /arm-io/data-store with
 // compatible "droidvm,data-store", so the read-only, verified NativeVirtioBlock leaves it alone.
 //
-// Disk layout: block 0 is the label the host writes when it makes the file (tools/rig/make-data-store.sh): "DroidVMDataStore"
-// and version 1 (u32, little endian). The window is blocks 1 .. 1+N and must fit the disk.
+// Disk layout: block 0 is the label "DroidVMDataStore" and version 1 (u32, little endian); the window is blocks 1 .. 1+N and
+// must fit the disk. The label is written by whoever makes the disk (tools/rig/make-data-store.sh, a vmpkg), or here on the first
+// boot of a blank one (block 0 all zeros, read-write mode): a new raw disk the app made, attached as the first writable
+// virtio-mmio disk, is a store. On the PCI host a disk is the store only with its label (DroidVMVirtioPciNub.cpp).
 //
 // droidvm-data-persist=<0|1|2>, like sheng-data-persist: 0 (or absent) keeps Data volatile; 1 opens the window read-only
 // (NativeRamBlock copies the stored pages into RAM, and writes stay volatile); 2 reads and writes it, and NativeRamBlock serves
@@ -294,6 +296,26 @@ static unsigned store_mode(void) {
 
 unsigned native_ufs_store_mode(void) { return store_mode(); }
 
+// A disk whose block 0 (in the stage) is all zeros: one that was never written, as a new raw disk is.
+static bool store_blank(void) {
+    for (unsigned i = 0; i < DROIDVM_STORE_BLOCK; ++i)
+        if (droidvm_store_stage[i]) return false;
+    return true;
+}
+
+// Writes the label to block 0 of a blank disk, which makes it what tools/rig/make-data-store.sh makes: the label, then a window
+// of zeros, the state of a store nothing has been kept in yet. NULL, or why not.
+static const char *store_label(void) {
+    memset(droidvm_store_stage, 0, DROIDVM_STORE_BLOCK);
+    memcpy(droidvm_store_stage, "DroidVMDataStore", 16);
+    const uint32_t version = 1;
+    memcpy(droidvm_store_stage + 16, &version, sizeof(version));
+    if (!store_request(VIRTIO_BLK_T_OUT, 0, DROIDVM_STORE_BLOCK)) return "cannot write the label";
+    if (droidvm_store_can_flush && !store_request(VIRTIO_BLK_T_FLUSH, 0, 0)) return "cannot flush the label";
+    printf("droidvm data store: a blank disk, labelled as the Data store\n");
+    return NULL;
+}
+
 // Returns 1 and the first 4096-byte block of the window on the disk, 0 on refusal (the reason in *why, which may be null).
 int native_ufs_store_open(uint64_t blocks, uint64_t *first, const char **why) {
     const char *reason = NULL;
@@ -314,7 +336,11 @@ int native_ufs_store_open(uint64_t blocks, uint64_t *first, const char **why) {
         else {
             uint32_t version;
             memcpy(&version, droidvm_store_stage + 16, sizeof(version));
-            if (memcmp(droidvm_store_stage, "DroidVMDataStore", 16) || version != 1) reason = "no DroidVMDataStore label";
+            if (memcmp(droidvm_store_stage, "DroidVMDataStore", 16) || version != 1) {
+                // A blank disk becomes the store on its first boot, so the store can be any new disk the app makes; one with
+                // anything in block 0 (a partition table, a file system, another store's version) is never written.
+                reason = mode == 2 && store_blank() ? store_label() : "no DroidVMDataStore label";
+            }
         }
     }
     if (reason) {
