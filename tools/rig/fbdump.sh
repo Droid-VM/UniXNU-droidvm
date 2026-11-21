@@ -6,7 +6,7 @@ set -euo pipefail
 OUT=$1; W=${2:-1280}; H=${3:-800}; STRIDE=${4:-5120}; OFF=${5:-ffc00000}
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}
 cat > /tmp/fbdump-phone.sh <<PHONE_EOF
-pid=\$(for p in \$(pidof crosvm); do tr '\0' ' ' < /proc/\$p/cmdline | grep -q 'UniXNU' && echo \$p; done | head -1)
+pid=\$(for p in \$(pidof crosvm); do tr '\0' ' ' < /proc/\$p/cmdline | grep -q ${VM_MATCH:-UniXNU} && echo \$p; done | head -1)
 [ -n "\$pid" ] || { echo "no UniXNU crosvm" >&2; exit 1; }
 start=\$(grep "rw-s $OFF .*crosvm_guest" /proc/\$pid/maps | head -1 | cut -d- -f1)
 [ -n "\$start" ] || { echo "no fb mapping" >&2; exit 1; }

@@ -10,6 +10,7 @@ Guest PA -> host address goes through the crosvm_guest memfd mapping whose file 
 import argparse
 import re
 import shlex
+import os
 import struct
 import subprocess
 import sys
@@ -36,7 +37,9 @@ def adb(command):
 
 
 def crosvm_maps():
-    pid = adb("for p in $(pidof crosvm); do tr '\\0' ' ' < /proc/$p/cmdline | grep -q UniXNU && echo $p; done").split()[0].decode()
+    # the VM's crosvm: its command line names UniXNU, or VM_MATCH (rig.env) for a VM named otherwise (one a vmpkg made)
+    match = os.environ.get('VM_MATCH', 'UniXNU')
+    pid = adb(f"for p in $(pidof crosvm); do tr '\\0' ' ' < /proc/$p/cmdline | grep -q '{match}' && echo $p; done").split()[0].decode()
     maps = []
     for line in adb(f'grep crosvm_guest /proc/{pid}/maps').decode().splitlines():
         span, perms, offset = line.split()[:3]

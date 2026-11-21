@@ -27,7 +27,7 @@ PY
 W=$FB_WIDTH; H=$FB_HEIGHT; S=$FB_STRIDE; OFF=$(printf '0x%x' $(( FB_BASE - 0x80000000 )))
 mkdir -p "$OUT"; rm -f "$OUT"/f*.png
 cat > out/burst-phone.sh <<PH
-pid=\$(for p in \$(pidof crosvm); do tr '\0' ' ' < /proc/\$p/cmdline | grep -q UniXNU && echo \$p; done | head -1)
+pid=\$(for p in \$(pidof crosvm); do tr '\0' ' ' < /proc/\$p/cmdline | grep -q ${VM_MATCH:-UniXNU} && echo \$p; done | head -1)
 fd=\$(for f in /proc/\$pid/fd/*; do case "\$(readlink \$f)" in *crosvm_guest*) echo \$f; break;; esac; done)
 rm -rf /data/local/tmp/burst; mkdir -p /data/local/tmp/burst
 i=0; while [ \$i -lt $N ]; do [ \$i = $PRE ] && { $CMD & }; /data/local/tmp/memgrab \$fd $OFF $((S*H)) /data/local/tmp/burst/f\$i.raw; date +%s.%N >> /data/local/tmp/burst/t; i=\$((i+1)); done

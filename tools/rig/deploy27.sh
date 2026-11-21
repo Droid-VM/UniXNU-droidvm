@@ -219,7 +219,7 @@ if [ $NEWVM = 1 ]; then
   MEDIA=/data/media/0/${DIR#/storage/emulated/0/}
   [ -z "$($A shell "su -c 'ls -d $MEDIA 2>/dev/null'")" ] || { echo "$DIR exists on the phone: not touched (a new VM takes a new directory)"; exit 1; }
   [ -f "$FROM/unixnu-vm.config.json" ] || { echo "no $FROM/unixnu-vm.config.json to copy the VM's configuration from"; exit 1; }
-  [ -z "$($A shell "su -c 'for p in \$(pidof crosvm); do tr \"\\0\" \" \" < /proc/\$p/cmdline | grep -q UniXNU && echo \$p; done'" | tr -dc 0-9)" ] ||
+  [ -z "$($A shell "su -c 'for p in \$(pidof crosvm); do tr \"\\0\" \" \" < /proc/\$p/cmdline | grep -q ${VM_MATCH:-UniXNU} && echo \$p; done'" | tr -dc 0-9)" ] ||
     { echo "a UniXNU VM is running: stop it first (its rig's vm.sh stop)"; exit 1; }
   # the directory of FROM's VM, from its configuration's boot disk
   FROM_DIR=$(python3 -c "

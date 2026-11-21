@@ -9,7 +9,7 @@ W=${2:-${FB_WIDTH:-1280}}; H=${3:-${FB_HEIGHT:-800}}; STRIDE=${4:-${FB_STRIDE:-5
 OFF=${5:-$(printf '0x%x' $(( ${FB_BASE:-0x17fc00000} - 0x80000000 )))}
 PHONE=${PHONE:?set PHONE to the adb serial of the phone}
 cat > /tmp/fbgrab-phone.sh <<PHONE_EOF
-pid=\$(for p in \$(pidof crosvm); do tr '\0' ' ' < /proc/\$p/cmdline | grep -q UniXNU && echo \$p; done | head -1)
+pid=\$(for p in \$(pidof crosvm); do tr '\0' ' ' < /proc/\$p/cmdline | grep -q ${VM_MATCH:-UniXNU} && echo \$p; done | head -1)
 fd=\$(for f in /proc/\$pid/fd/*; do case "\$(readlink \$f)" in *crosvm_guest*) echo \$f; break;; esac; done)
 /data/local/tmp/memgrab \$fd $OFF $((STRIDE * H)) /data/local/tmp/fb.raw
 PHONE_EOF

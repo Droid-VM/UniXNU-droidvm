@@ -84,7 +84,7 @@ if [ $YES = 0 ]; then
   read -r -p "$what? [y/N] " answer
   [ "$answer" = y ] || exit 1
 fi
-if [ -n "$(adb -s "$PHONE" shell "su -c 'for p in \$(pidof crosvm); do tr \"\\0\" \" \" < /proc/\$p/cmdline | grep -q UniXNU && echo \$p; done'" | tr -dc 0-9)" ]; then
+if [ -n "$(adb -s "$PHONE" shell "su -c 'for p in \$(pidof crosvm); do tr \"\\0\" \" \" < /proc/\$p/cmdline | grep -q ${VM_MATCH:-UniXNU} && echo \$p; done'" | tr -dc 0-9)" ]; then
   VM=${VM:-${OLD%% *}} "$RIG/vm.sh" stop       # through its control socket, then the hugepage pool's settle time
 fi
 for id in $OLD; do ipc vm_delete "{\"vm_id\":\"$id\"}" | grep -E '"(success|existed)"' | tr -d ' \n'; echo " deleted $id from the daemon"; done

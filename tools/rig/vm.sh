@@ -87,7 +87,7 @@ ensure_pool() {
 }
 
 crosvm_pid() {
-  $A shell "su -c 'for p in \$(pidof crosvm); do tr \"\\0\" \" \" < /proc/\$p/cmdline | grep -q UniXNU && echo \$p; done'" | tr -dc '0-9\n' | head -1
+  $A shell "su -c 'for p in \$(pidof crosvm); do tr \"\\0\" \" \" < /proc/\$p/cmdline | grep -q ${VM_MATCH:-UniXNU} && echo \$p; done'" | tr -dc '0-9\n' | head -1
 }
 
 stop() {
