@@ -195,15 +195,18 @@ unique_chip_id = "required"
 chip_id = "8142"                     # iPad17,3 (the OS profile's [ipsw] chip_id 33090)
 # The J820's identity from the IPSW's own device tree (unixnu ipsw fetch DeviceTree, copied to .cache/firmware here).
 # --boot-video-mib: DarwinBoot's BLT-only boot screen in RAM, 2048x2732 at 4 bytes a pixel (21.3 MiB).
-# --text-fixup: the UI scale for a phone's GPU. QuartzCore's -[CADisplayMode preferredScale] gives a mode without a preferred UI
-# scale (an internal panel's) @2x in a virtual device, and @2x on any other taller than 1080 pixels, so half of a 12.9- or 13-inch
-# iPad's pixels laid out as an iPad mini's. The two fixups (24A446 dyld_shared_cache_arm64e.01, the native-text-fixup patch,
-# applied only where the original bytes match) send a virtual device to the height rule and raise its limit to 1920: a VM display
-# up to 1920 pixels tall is @1x (1032x1376, the 13-inch iPad's points at a quarter of its pixels), a taller one @2x as before.
+# ui_scale_max_height: the UI scale for a phone's GPU. QuartzCore's -[CADisplayMode preferredScale] gives a mode without a preferred
+# UI scale (an internal panel's) @2x in a virtual device, and @2x on any other taller than 1080 pixels, so half of a 12.9- or
+# 13-inch iPad's pixels laid out as an iPad mini's. Two fixups of that method (the native-text-fixup patch, applied only where the
+# original bytes match) send a virtual device to the height rule and raise its limit to this height: a VM display up to 1920
+# pixels tall is @1x (1032x1376, the 13-inch iPad's points at a quarter of its pixels), a taller one @2x as before. They are not
+# kept here: build-droidvm-all.py finds them in the build's own shared cache (scripts/find-ui-scale-fixups.py, by what the code
+# does) and writes build/ui-scale-fixups.txt, which --text-fixups-file takes; for 24A446 they are the two of 11-03,
+# dyld_shared_cache_arm64e.01 0x40b17a0 (ldr w8,[x9,#0x24] -> b to the height rule) and 0x40b17b8 (cmp x8,#1080 -> #1920).
+ui_scale_max_height = 1920
 tool_args = ["--dynamic", "--boot-video-mib", "24", "--reclaim-memory", "--display-gamut", "sRGB",
              "--identity-tree", ".cache/firmware/DeviceTree.j820ap.im4p", "--kernel-ctrr-to-be-enabled", "0",
-             "--text-fixup", "dyld_shared_cache_arm64e.01,40b17a0,282540b9,05000014",   # ldr w8,[x9,#0x24] -> b to the height rule
-             "--text-fixup", "dyld_shared_cache_arm64e.01,40b17b8,1fe110f1,1f011ef1"]   # cmp x8,#1080 -> cmp x8,#1920
+             "--text-fixups-file", "build/ui-scale-fixups.txt"]
 
 
 # macOS 27.0.1 (VirtualMac2,1 26A434, the system macOS-DroidVM runs) on this board, from the same XNU source and through the same
@@ -329,6 +332,8 @@ chip_id = "FE00"                     # VirtualMac2,1 (the OS profile's [ipsw] ch
 # volume without the iBoot-forwarded root hash (apfs: "could not retrieve system-volume-auth-blob"); boot-uuid stays for
 # kern.bootuuid and kern.apfsprebootuuid.
 root_match_volume_uuid = "C73696D4-CAC4-40A0-90CB-7D0463E4E3E6"
+# No UI-scale fixups: macOS sizes its UI from its display modes (the board's [payload.adt] ui_scale_max_height is iPadOS's).
+ui_scale_max_height = 0
 tool_args = ["--dynamic", "--boot-video-mib", "24", "--reclaim-memory", "--display-gamut", "sRGB",
              "--identity-tree", ".cache/firmware/DeviceTree.vma2macosap.im4p", "--kernel-ctrr-to-be-enabled", "0",
              "--adt-table", "kits/droidvm/../ipados27/adt/macos-27.0.1-26A434.json"]

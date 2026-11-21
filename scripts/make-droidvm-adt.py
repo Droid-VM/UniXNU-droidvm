@@ -443,10 +443,18 @@ def main():
     parser.add_argument('--text-fixup', action='append', default=[], metavar='FILE,OFFSET,ORIGINAL,REPLACEMENT',
                         help="A fixup of signed text for the kernel's native-text-fixup (/chosen/text-fixups, as UniXNU's "
                              "[payload] text_fixups): the file's name, the offset in it and the bytes, in hex; repeatable")
+    parser.add_argument('--text-fixups-file', type=Path, default=None, metavar='FILE',
+                        help='more --text-fixup values, one a line (blank lines and #-comments skipped): build-droidvm-all.py '
+                             'writes the UI-scale ones it finds in the build\'s shared cache to build/ui-scale-fixups.txt')
     parser.add_argument('--reclaim-memory', action='store_true',
                         help='/chosen/darwinboot-memory-limit: DarwinBoot also hands the kernel the RAM after its window that the '
                              'firmware frees at ExitBootServices, up to the panic region (or the end of guest RAM)')
     args = parser.parse_args()
+    if args.text_fixups_file:
+        if not args.text_fixups_file.is_file():
+            parser.error(f'--text-fixups-file {args.text_fixups_file}: no such file')
+        args.text_fixup += [line.split('#', 1)[0].strip() for line in args.text_fixups_file.read_text().splitlines()
+                            if line.split('#', 1)[0].strip()]
     for value in args.text_fixup:
         if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,63},[0-9a-fA-F]{1,16},(?:[0-9a-fA-F]{2}){1,16},(?:[0-9a-fA-F]{2}){1,16}', value) or len(value) >= 160:
             parser.error(f'malformed --text-fixup {value}')

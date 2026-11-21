@@ -29,7 +29,7 @@ class Cache:
             if data[:15] not in (b'dyld_v1   arm64', b'dyld_v1  arm64e'):
                 continue
             if path.name in ('dyld_shared_cache_arm64', 'dyld_shared_cache_arm64e'):
-                self.main = data
+                self.main, main_name = data, path.name
             offset, count = struct.unpack_from('<II', data, 0x10)
             for index in range(count):
                 address, size, file_offset = struct.unpack_from('<QQQ', data, offset + index * 32)
@@ -46,7 +46,9 @@ class Cache:
             self.images.append((address, self.main[path_offset:end].decode()))
         self.images.sort()
         self.starts = [image[0] for image in self.images]
-        self.symbols_file = Path(directory) / 'dyld_shared_cache_arm64.symbols'
+        # the local symbols of the main cache's name: dyld_shared_cache_arm64e.symbols on iPadOS 27 (before 11-21 only the arm64
+        # name was looked for, so no Objective-C method or static function was ever found in a 27 cache)
+        self.symbols_file = Path(directory) / (main_name + '.symbols')
         self.local_entries = None
         self.parsed = {}
 

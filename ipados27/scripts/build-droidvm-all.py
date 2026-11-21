@@ -35,7 +35,8 @@ Steps, in order:
   data       the Data seed (or the generation's), and its volume UUID into the kernel configuration
   kernel     unixnu build kernel, the reviewed fileset pairings, unixnu build prelink
   trust      the owner trust bundle (plugin, tools, the generation's records, the IPSW's own modules)
-  payload    unixnu build payload around that trust and seed, then the boot disk
+  payload    unixnu build payload around that trust and seed (and the UI-scale fixups found in this build's shared cache,
+             find-ui-scale-fixups.py), then the boot disk
   release    release/ and release.json
 """
 import argparse
@@ -506,11 +507,59 @@ class Build:
             self.script('make-gpu-addon.py', '--publish', '--no-daemon', '--prefix', 'GPUBundles', addon_file,
                         logfile=self.logs / 'gpu-addon.log', env=dict(self.env, ADRENO_PLUGIN_DIR=str(self.plugin)))
             addon = ['--gpu-addon', addon_file]
+        fixups = self.ui_scale_fixups()
         self.unixnu_cmd('build', 'payload', '--unique-chip-id', chip, '--data-ramdisk', self.data / self.seed()['seed'],
                         '--trust-cache', bundle, *addon, logfile=self.logs / 'payload.log')
         run(['bash', REPO / 'scripts/make-droidvm-disk.sh', self.work / 'payload/payload.img', self.efi_dir(),
              self.work / 'payload/droidvm-disk.img'], env=self.env, logfile=self.logs / 'disk.log')
-        self.record('payload', {'unique_chip_id': chip})
+        self.record('payload', {'unique_chip_id': chip, 'ui_scale_fixups': fixups})
+
+    def payload_adt(self):
+        """The board's [payload.adt] for this OS profile (its os_overrides table merged over it, as unixnu merges it)."""
+        adt = dict(self.board.get('payload', {}).get('adt', {}))
+        adt.update(self.board.get('os_overrides', {}).get(self.os_name, {}).get('payload', {}).get('adt', {}))
+        return adt
+
+    def ui_scale_fixups(self):
+        """The UI-scale fixups of this build's QuartzCore (find-ui-scale-fixups.py over the SystemOS cryptex's shared cache) in
+        tree/build/ui-scale-fixups.txt, where board.toml's --text-fixups-file takes them: [payload.adt] ui_scale_max_height, the
+        tallest display that is @1x (0 or none: no fixups). Found once per OS build, finder and height: kept beside the IPSW's
+        members. The image is attached from a copy on the system volume (hdiutil refuses one on the data volume over ssh)."""
+        out = self.tree / 'build/ui-scale-fixups.txt'
+        out.parent.mkdir(parents=True, exist_ok=True)
+        height = int(self.payload_adt().get('ui_scale_max_height') or 0)
+        if not height:
+            out.write_text('')
+            return []
+        finder = BOARD / 'scripts/find-ui-scale-fixups.py'
+        cached = self.ipsw / f'ui-scale-fixups-{sha256(finder)[:12]}-{height}.txt'
+        if not cached.is_file():
+            image = self.member('Cryptex1,SystemOS')
+            scratch = Path('/tmp') / f'droidvm-ui-scale-{os.environ.get("USER", "build")}'
+            mount = scratch / 'mount'
+            if scratch.exists():
+                run(['hdiutil', 'detach', mount], check=False)
+                shutil.rmtree(scratch)
+            mount.mkdir(parents=True)
+            log(f'UI-scale fixups: {image.name} ({image.stat().st_size >> 20} MiB) copied to {scratch} to look in its shared cache')
+            shutil.copyfile(image, scratch / image.name)
+            run(['hdiutil', 'attach', '-readonly', '-nobrowse', '-noverify', '-owners', 'off', '-mountpoint', mount,
+                 scratch / image.name], logfile=self.logs / 'ui-scale-attach.log')
+            try:
+                caches = [p for p in (mount / 'System/Library/Caches/com.apple.dyld', mount / 'System/Library/dyld') if p.is_dir()]
+                if not caches:
+                    sys.exit(f'{image.name}: no shared cache directory in it')
+                partial = cached.with_name(cached.name + '.partial')
+                run(['python3', finder, caches[0], '--max-height', height, '--out', partial],
+                    logfile=self.logs / 'ui-scale-fixups.log')
+                partial.rename(cached)
+            finally:
+                run(['hdiutil', 'detach', mount], check=False)
+                shutil.rmtree(scratch, ignore_errors=True)
+        shutil.copyfile(cached, out)
+        fixups = cached.read_text().split()
+        log(f'UI-scale fixups (@1x up to {height} pixels tall): ' + ' '.join(fixups))
+        return fixups
 
     # release -------------------------------------------------------------------------------------------------------------
     def step_release(self):
@@ -546,7 +595,7 @@ class Build:
         lock = BOARD / 'unixnu.lock'
         release = {
             'built': time.strftime('%Y-%m-%d %H:%M:%S %z'),
-            'board': f'{self.board["board"]["name"]} {self.board["board"]["os_profile"]}',
+            'board': f'{self.board["board"]["name"]} {self.os_name}',
             'clean': not dirty and not (self.record('gpu-sources') or {}).get('mesa_edited_in_place'),
             'commits': {name: state['commit'] for name, state in checkouts.items()},
             'changed': {name: state['changed'] for name, state in checkouts.items() if state['changed']},
@@ -554,6 +603,7 @@ class Build:
             'gpu_sources': self.record('gpu-sources'),
             'seed': self.seed(),
             'unique_chip_id': (self.record('payload') or {}).get('unique_chip_id'),
+            'ui_scale_fixups': (self.record('payload') or {}).get('ui_scale_fixups'),
             'trust_sha256': sha256(self.trust_bundle()),
             'trust_records': [str(path) for path in self.trust_records()],
             'plugin': {'cdhashes': {k: trust[k] for k in ('cdhash', 'daemon_cdhash', 'turnip_cdhash') if k in trust},
