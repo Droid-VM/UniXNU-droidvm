@@ -5,7 +5,7 @@
   vmportable.py apply [--keep-debug]     change it, the VM stopped: the daemon (vm_modify), the rig's unixnu-vm.config.json and the
                                          app's store (vmpersist.py, files/vms.json.bak-<date> kept)
   vmportable.py template OUT             OUT: the same configuration with nothing of this phone in it (no id, no network, no CPU
-                                         affinity; each disk named by its file alone), the VM template a vmpkg is made from
+                                         affinity or GPU worker cores; each disk named by its file alone), the VM template a vmpkg is made from
 
 The UniXNU VMs were made by the rig before the app could say what they need, so their extra options carry it: the OS, SystemOS
 (and macOS's App) images and the Data store as --virtio-mmio-block with this phone's paths, the sound card and the video unit with
@@ -132,12 +132,17 @@ def portable(source, keep_debug=False):
 
 
 def template(source):
-    """Nothing of this phone: the id, the network attachments, the CPU affinity, the files' directories."""
+    """Nothing of this phone: the id, the network attachments, the CPU affinity (pinned on the phone it lands on instead) and GPU
+    worker cores, the files' directories."""
     config, _ = portable(source)
     for key in ('id', 'created_at'):
         config.pop(key, None)
     config['networks'] = [{} for _ in config.get('networks', [])]
+    # No cores of this phone's; the app pins one host core per vCPU on the phone the VM lands on (cpu_pin_auto, app
+    # CpuPlacementPlan.autoAffinity): an XNU guest must not float on Gunyah (local TLB flushes stay on the old core).
     config['cpu_affinity'] = ''
+    config['cpu_pin_auto'] = True
+    config['gpu_cgroup_cpus'] = ''    # the app's default: no cores of this phone's named for the GPU worker
     for disk in config['disks']:
         disk['path'] = disk['path'].rsplit('/', 1)[-1]
     uefi = config.get('boot', {}).get('uefi', {})

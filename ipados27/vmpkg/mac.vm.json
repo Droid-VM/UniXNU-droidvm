@@ -1,0 +1,206 @@
+{
+ "config": {
+  "gpu_drm2kgsl_pool_mb": 8,
+  "usb": false,
+  "gpu_provider": "drm2kgsl",
+  "shared_dirs": [],
+  "gpu_cgroup_path": "/dev/cpuset/gpuworker",
+  "vpu_enabled": true,
+  "gpu_cgroup_enabled": true,
+  "xhci_next": 7,
+  "environment_variables": [
+   "DRM2KGSL_PRIORITIES=3"
+  ],
+  "cpu_affinity": "",
+  "gpu_rt_prio": "",
+  "protected_vm": "pseudo_unprotected",
+  "gunyah_dynamic_share": false,
+  "gpu_pool_blob_max_kb": 4096,
+  "native_display_enabled": true,
+  "pmu": true,
+  "display_blit_provider": "TURNIP",
+  "swiotlb_mb": 256,
+  "gpu_udmabuf": true,
+  "camera_keep_screen_on": true,
+  "vpu_codec_enabled": true,
+  "vnc_enabled": false,
+  "peripherals": [
+   {
+    "correct": true,
+    "type": "virtio_gyroscope"
+   },
+   {
+    "type": "virtio_sound",
+    "underrun": "silence",
+    "buffer": "normal",
+    "endpoints": [
+     {
+      "mode": "speaker",
+      "host_label": "",
+      "host_device": "DEFAULT|system default"
+     },
+     {
+      "mode": "microphone",
+      "host_label": "",
+      "host_device": "DEFAULT|system default"
+     }
+    ]
+   },
+   {
+    "type": "goldfish_battery"
+   }
+  ],
+  "rng": true,
+  "gpu_mode": "native",
+  "gpu_host_pool_mb": 64,
+  "name": "UniXNU-macOS27",
+  "vpu_guest_pool_mb": 128,
+  "serial_ports": [
+   {
+    "console": false,
+    "num": 1,
+    "backend": "app_console",
+    "fixed": true,
+    "hardware": "serial"
+   },
+   {
+    "console": false,
+    "num": 2,
+    "backend": "sink",
+    "fixed": true,
+    "hardware": "serial"
+   },
+   {
+    "console": false,
+    "num": 3,
+    "backend": "sink",
+    "fixed": true,
+    "hardware": "serial"
+   },
+   {
+    "console": false,
+    "num": 4,
+    "backend": "sink",
+    "fixed": true,
+    "hardware": "serial"
+   },
+   {
+    "console": true,
+    "num": 1,
+    "usb_slot": 0,
+    "backend": "app_console",
+    "hardware": "sbsa"
+   }
+  ],
+  "gpu_guest_pool_mb": 0,
+  "gpu_guest_step_mb": 0,
+  "extra_options": [],
+  "cpu_topology_auto": true,
+  "disks": [
+   {
+    "path": "droidvm-disk.img",
+    "bus": "virtio",
+    "readonly": true
+   },
+   {
+    "path": "os.img",
+    "bus": "virtio",
+    "readonly": true
+   },
+   {
+    "path": "systemos.img",
+    "bus": "virtio",
+    "readonly": true
+   },
+   {
+    "path": "app.img",
+    "bus": "virtio",
+    "readonly": true
+   },
+   {
+    "path": "data-store.img",
+    "bus": "virtio",
+    "readonly": false
+   }
+  ],
+  "gpu_backend": "gpu_virglrenderer",
+  "gpu_vram_quota_mb": 2048,
+  "vpu_host_pool_mb": 64,
+  "display_enabled": true,
+  "networks": [
+   {}
+  ],
+  "gpu_venus_pool_mb": 256,
+  "gpu_dynamic_vram": false,
+  "cpu_count": 6,
+  "display_backend": "simplefb",
+  "auto_up": false,
+  "screens": {
+   "simplefb": {
+    "transport_cap": "gpu",
+    "exporter": "native",
+    "width": 2048,
+    "poll_hz": 60,
+    "vnc": {
+     "port": -1,
+     "host": "",
+     "password_auth": false
+    },
+    "enabled": false,
+    "input_enabled": true,
+    "height": 2732
+   },
+   "gpu-0": {
+    "dpi_v": 160,
+    "transport_cap": "gpu",
+    "exporter": "native",
+    "dpi_h": 160,
+    "width": 2048,
+    "refresh_rate": 120,
+    "enabled": true,
+    "input_enabled": true,
+    "height": 2732
+   }
+  },
+  "prepare_lend_mthp": "single",
+  "hypervisor": "gunyah",
+  "gpu_api": "drm2kgsl",
+  "backend": "crosvm",
+  "smt": true,
+  "boot": {
+   "protocol": "uefi",
+   "uefi": {
+    "vars_enabled": false,
+    "vars": "",
+    "firmware": ""
+   },
+   "linux": {
+    "image": {
+     "disk": 0,
+     "wait": 2,
+     "cmdline": "",
+     "vdafix": true
+    },
+    "cmdline": "",
+    "kernel": "",
+    "source": "manual",
+    "initrd": ""
+   }
+  },
+  "cpu_capacity": "",
+  "balloon": false,
+  "gpu_cgroup_cpus": "",
+  "virtio_transport": "mmio",
+  "strace": false,
+  "sandbox": false,
+  "gpu_vram_folio_threshold_kb": 1024,
+  "cpu_clusters": "",
+  "gpu_guest_prealloc_mb": 0,
+  "hugepages": true,
+  "memory_mb": 6144,
+  "gpu_guest_max_grants": 0,
+  "vpu_decoder_backend": "auto",
+  "vpu_encoder_backend": "auto",
+  "cpu_pin_auto": true
+ }
+}
